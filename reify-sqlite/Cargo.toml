@@ -1,0 +1,10 @@
+[package]
+name = "reify-sqlite"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reify-core = { path = "../reify-core", version = "0.1.0" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"

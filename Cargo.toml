@@ -1,0 +1,7 @@
+[workspace]
+members = ["reify", "reify-core", "reify-macros", "reify-postgres", "reify-mysql", "reify-sqlite", "reify-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"

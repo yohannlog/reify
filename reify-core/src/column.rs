@@ -1,0 +1,329 @@
+use std::marker::PhantomData;
+
+use crate::condition::Condition;
+use crate::query::{Expr, SelectBuilder};
+use crate::table::Table;
+use crate::value::IntoValue;
+
+/// A typed column reference: `Column<Model, FieldType>`.
+///
+/// Generated as associated constants by `#[derive(Table)]`.
+/// Provides type-safe filter methods that depend on `T`.
+pub struct Column<M, T> {
+    pub name: &'static str,
+    _model: PhantomData<M>,
+    _type: PhantomData<T>,
+}
+
+impl<M, T> Column<M, T> {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            _model: PhantomData,
+            _type: PhantomData,
+        }
+    }
+
+    /// `COUNT(col)` aggregate expression.
+    pub fn count(&self) -> Expr {
+        Expr::Count(Some(self.name))
+    }
+
+    /// `MIN(col)` aggregate expression.
+    pub fn min_expr(&self) -> Expr {
+        Expr::Min(self.name)
+    }
+
+    /// `MAX(col)` aggregate expression.
+    pub fn max_expr(&self) -> Expr {
+        Expr::Max(self.name)
+    }
+}
+
+// ── Numeric aggregate helpers ──────────────────────────────────────
+
+impl<M: 'static, T: Numeric + 'static> Column<M, T> {
+    /// `SUM(col)` aggregate expression (numeric columns only).
+    pub fn sum(&self) -> Expr {
+        Expr::Sum(self.name)
+    }
+
+    /// `AVG(col)` aggregate expression (numeric columns only).
+    pub fn avg(&self) -> Expr {
+        Expr::Avg(self.name)
+    }
+}
+
+// ── Operators available on all columns ──────────────────────────────
+
+impl<M: 'static, T: IntoValue + 'static> Column<M, T> {
+    pub fn eq(&self, val: impl IntoValue) -> Condition {
+        Condition::Eq(self.name, val.into_value())
+    }
+
+    pub fn neq(&self, val: impl IntoValue) -> Condition {
+        Condition::Neq(self.name, val.into_value())
+    }
+
+    pub fn in_list(&self, vals: Vec<impl IntoValue>) -> Condition {
+        Condition::In(
+            self.name,
+            vals.into_iter().map(|v| v.into_value()).collect(),
+        )
+    }
+
+    /// `col IN (SELECT ...)` — filter using a subquery.
+    pub fn in_subquery<S: Table>(&self, sub: SelectBuilder<S>) -> Condition {
+        let (sql, params) = sub.build();
+        Condition::InSubquery(self.name, sql, params)
+    }
+}
+
+// ── Numeric operators ───────────────────────────────────────────────
+
+/// Trait marker for numeric column types.
+pub trait Numeric: IntoValue {}
+impl Numeric for i16 {}
+impl Numeric for i32 {}
+impl Numeric for i64 {}
+impl Numeric for f32 {}
+impl Numeric for f64 {}
+
+impl<M: 'static, T: Numeric + 'static> Column<M, T> {
+    pub fn gt(&self, val: impl IntoValue) -> Condition {
+        Condition::Gt(self.name, val.into_value())
+    }
+
+    pub fn lt(&self, val: impl IntoValue) -> Condition {
+        Condition::Lt(self.name, val.into_value())
+    }
+
+    pub fn gte(&self, val: impl IntoValue) -> Condition {
+        Condition::Gte(self.name, val.into_value())
+    }
+
+    pub fn lte(&self, val: impl IntoValue) -> Condition {
+        Condition::Lte(self.name, val.into_value())
+    }
+
+    pub fn between(&self, a: impl IntoValue, b: impl IntoValue) -> Condition {
+        Condition::Between(self.name, a.into_value(), b.into_value())
+    }
+}
+
+// ── String operators ────────────────────────────────────────────────
+
+impl<M: 'static> Column<M, String> {
+    pub fn like(&self, pattern: &str) -> Condition {
+        Condition::Like(self.name, pattern.to_owned())
+    }
+
+    pub fn contains(&self, sub: &str) -> Condition {
+        Condition::Like(self.name, format!("%{sub}%"))
+    }
+
+    pub fn starts_with(&self, prefix: &str) -> Condition {
+        Condition::Like(self.name, format!("{prefix}%"))
+    }
+
+    pub fn ends_with(&self, suffix: &str) -> Condition {
+        Condition::Like(self.name, format!("%{suffix}"))
+    }
+
+    /// Case-insensitive LIKE (PostgreSQL `ILIKE`).
+    #[cfg(feature = "postgres")]
+    pub fn ilike(&self, pattern: &str) -> Condition {
+        Condition::ILike(self.name, pattern.to_owned())
+    }
+
+    /// Case-insensitive contains (PostgreSQL `ILIKE '%sub%'`).
+    #[cfg(feature = "postgres")]
+    pub fn icontains(&self, sub: &str) -> Condition {
+        Condition::ILike(self.name, format!("%{sub}%"))
+    }
+
+    /// Case-insensitive starts-with (PostgreSQL `ILIKE 'prefix%'`).
+    #[cfg(feature = "postgres")]
+    pub fn istarts_with(&self, prefix: &str) -> Condition {
+        Condition::ILike(self.name, format!("{prefix}%"))
+    }
+
+    /// Case-insensitive ends-with (PostgreSQL `ILIKE '%suffix'`).
+    #[cfg(feature = "postgres")]
+    pub fn iends_with(&self, suffix: &str) -> Condition {
+        Condition::ILike(self.name, format!("%{suffix}"))
+    }
+}
+
+// ── Temporal operators (PostgreSQL & MySQL) ────────────────────────
+
+/// Trait marker for temporal column types.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub trait Temporal: IntoValue {}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl Temporal for chrono::NaiveDateTime {}
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl Temporal for chrono::NaiveDate {}
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl Temporal for chrono::NaiveTime {}
+#[cfg(feature = "postgres")]
+impl Temporal for chrono::DateTime<chrono::Utc> {}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl<M: 'static, T: Temporal + 'static> Column<M, T> {
+    pub fn before(&self, val: impl IntoValue) -> Condition {
+        Condition::Lt(self.name, val.into_value())
+    }
+
+    pub fn after(&self, val: impl IntoValue) -> Condition {
+        Condition::Gt(self.name, val.into_value())
+    }
+
+    pub fn between_times(&self, a: impl IntoValue, b: impl IntoValue) -> Condition {
+        Condition::Between(self.name, a.into_value(), b.into_value())
+    }
+}
+
+// ── Range operators (PostgreSQL) ────────────────────────────────────
+
+#[cfg(feature = "postgres")]
+impl<M: 'static, T: crate::range::RangeElement + 'static> Column<M, crate::range::Range<T>>
+where
+    crate::range::Range<T>: IntoValue,
+{
+    /// Range contains an element: `@>` operator.
+    ///
+    /// ```ignore
+    /// Event::duration.contains_element(5i32)
+    /// // → duration @> 5
+    /// ```
+    pub fn contains_element(&self, val: impl IntoValue) -> Condition {
+        Condition::RangeContains(self.name, val.into_value())
+    }
+
+    /// Range contains another range: `@>` operator.
+    ///
+    /// ```ignore
+    /// Event::duration.contains_range(Range::closed(5, 10))
+    /// // → duration @> '[5,10]'
+    /// ```
+    pub fn contains_range(&self, val: crate::range::Range<T>) -> Condition {
+        Condition::RangeContains(self.name, val.into_value())
+    }
+
+    /// Range is contained by another range: `<@` operator.
+    pub fn contained_by(&self, val: crate::range::Range<T>) -> Condition {
+        Condition::RangeContainedBy(self.name, val.into_value())
+    }
+
+    /// Ranges overlap: `&&` operator.
+    pub fn overlaps(&self, val: crate::range::Range<T>) -> Condition {
+        Condition::RangeOverlaps(self.name, val.into_value())
+    }
+
+    /// Range is strictly left of: `<<` operator.
+    pub fn left_of(&self, val: crate::range::Range<T>) -> Condition {
+        Condition::RangeLeftOf(self.name, val.into_value())
+    }
+
+    /// Range is strictly right of: `>>` operator.
+    pub fn right_of(&self, val: crate::range::Range<T>) -> Condition {
+        Condition::RangeRightOf(self.name, val.into_value())
+    }
+
+    /// Range is adjacent to: `-|-` operator.
+    pub fn adjacent(&self, val: crate::range::Range<T>) -> Condition {
+        Condition::RangeAdjacent(self.name, val.into_value())
+    }
+
+    /// Range is empty: `isempty(column)`.
+    pub fn is_empty_range(&self) -> Condition {
+        Condition::RangeIsEmpty(self.name)
+    }
+}
+
+// ── JSONB operators (PostgreSQL) ───────────────────────────────────
+
+#[cfg(feature = "postgres")]
+impl<M: 'static> Column<M, serde_json::Value> {
+    /// JSONB field access: `column->key`.
+    ///
+    /// ```ignore
+    /// User::metadata.json_get("role")
+    /// // → metadata->'role'
+    /// ```
+    pub fn json_get(&self, key: &str) -> Condition {
+        Condition::JsonGet(self.name, key.to_owned())
+    }
+
+    /// JSONB contains: `column @> value`.
+    ///
+    /// ```ignore
+    /// User::metadata.json_contains(serde_json::json!({"active": true}))
+    /// // → metadata @> '{"active": true}'
+    /// ```
+    pub fn json_contains(&self, val: impl crate::value::IntoValue) -> Condition {
+        Condition::JsonContains(self.name, val.into_value())
+    }
+
+    /// JSONB key exists: `column ? key`.
+    ///
+    /// ```ignore
+    /// User::metadata.json_has_key("email")
+    /// // → metadata ? 'email'
+    /// ```
+    pub fn json_has_key(&self, key: &str) -> Condition {
+        Condition::JsonHasKey(self.name, key.to_owned())
+    }
+}
+
+// ── Array operators (PostgreSQL) ────────────────────────────────────
+
+#[cfg(feature = "postgres")]
+impl<M: 'static, T: IntoValue + Clone + 'static> Column<M, Vec<T>>
+where
+    Vec<T>: IntoValue,
+{
+    /// Array contains element: `@>` operator.
+    ///
+    /// ```ignore
+    /// Post::tags.contains(vec!["rust".to_string()])
+    /// // → tags @> ARRAY['rust']
+    /// ```
+    pub fn contains(&self, val: Vec<T>) -> Condition {
+        Condition::ArrayContains(self.name, val.into_value())
+    }
+
+    /// Array is contained by: `<@` operator.
+    ///
+    /// ```ignore
+    /// Post::tags.contained_by(vec!["rust".to_string(), "python".to_string()])
+    /// // → tags <@ ARRAY['rust','python']
+    /// ```
+    pub fn contained_by(&self, val: Vec<T>) -> Condition {
+        Condition::ArrayContainedBy(self.name, val.into_value())
+    }
+
+    /// Arrays overlap: `&&` operator.
+    ///
+    /// ```ignore
+    /// Post::tags.overlaps(vec!["rust".to_string(), "go".to_string()])
+    /// // → tags && ARRAY['rust','go']
+    /// ```
+    pub fn overlaps(&self, val: Vec<T>) -> Condition {
+        Condition::ArrayOverlaps(self.name, val.into_value())
+    }
+}
+
+// ── Option (nullable) operators ─────────────────────────────────────
+
+impl<M: 'static, T: 'static> Column<M, Option<T>> {
+    pub fn is_null(&self) -> Condition {
+        Condition::IsNull(self.name)
+    }
+
+    pub fn is_not_null(&self) -> Condition {
+        Condition::IsNotNull(self.name)
+    }
+}
