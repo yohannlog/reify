@@ -1,6 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
-
 use crate::table::Table;
 use crate::value::Value;
 
@@ -92,56 +89,159 @@ impl std::fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
+// ── SQLSTATE constants ──────────────────────────────────────────────
+
+/// Standard SQLSTATE codes for constraint violations (class 23).
+pub mod sqlstate {
+    /// SQLSTATE class prefix for all integrity constraint violations.
+    pub const CONSTRAINT_CLASS: &str = "23";
+    /// 23000 — generic integrity constraint violation.
+    pub const INTEGRITY_CONSTRAINT: &str = "23000";
+    /// 23502 — NOT NULL violation.
+    pub const NOT_NULL_VIOLATION: &str = "23502";
+    /// 23503 — foreign key violation.
+    pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+    /// 23505 — unique constraint violation.
+    pub const UNIQUE_VIOLATION: &str = "23505";
+    /// 23514 — CHECK constraint violation.
+    pub const CHECK_VIOLATION: &str = "23514";
+
+    /// Returns `true` if the given SQLSTATE code is a constraint violation.
+    pub fn is_constraint_violation(code: &str) -> bool {
+        code.starts_with(CONSTRAINT_CLASS)
+    }
+}
+
+// ── Shared type aliases ─────────────────────────────────────────────
+
+/// A boxed, `Send`-safe future returning `Result<T, DbError>`.
+///
+/// Used by [`DynDatabase`] (the dyn-compatible companion trait) to erase
+/// the concrete future type behind a trait object.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, DbError>> + Send + 'a>>;
+
+/// The closure accepted by [`Database::transaction`].
+///
+/// Receives a `&dyn DynDatabase` representing the isolated transaction
+/// connection and returns a [`BoxFuture`] that resolves when the
+/// transaction body completes.
+pub type TransactionFn<'a> = Box<dyn FnOnce(&'a dyn DynDatabase) -> BoxFuture<'a, ()> + Send + 'a>;
+
 // ── Database trait ──────────────────────────────────────────────────
 
 /// Async database connection trait.
 ///
-/// Implemented by each adapter (postgres, mysql/mariadb).
+/// Implemented by each adapter (postgres, mysql/mariadb, sqlite).
+///
+/// Uses native `async fn` (AFIT) — zero-cost, no heap allocation per call.
+/// Requires `Send + Sync` on implementors for use across threads.
+///
+/// The `transaction` method accepts a boxed closure whose inner connection
+/// is typed as `&dyn DynDatabase` (the dyn-compatible companion trait) so
+/// that the transaction wrapper can be passed as a trait object. This is the
+/// only remaining allocation and is intentional (one per transaction, not per
+/// query).
+#[allow(async_fn_in_trait)]
 pub trait Database: Send + Sync {
     /// Execute a statement (INSERT, UPDATE, DELETE). Returns rows affected.
+    fn execute(&self, sql: &str, params: &[Value]) -> impl std::future::Future<Output = Result<u64, DbError>> + Send;
+
+    /// Execute a query (SELECT). Returns rows.
+    fn query(&self, sql: &str, params: &[Value]) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send;
+
+    /// Execute a query and return a single row (e.g. COUNT).
+    fn query_one(&self, sql: &str, params: &[Value]) -> impl std::future::Future<Output = Result<Row, DbError>> + Send;
+
+    /// Run a closure inside a transaction.
+    ///
+    /// The closure receives a `&dyn DynDatabase` that represents the
+    /// **isolated transaction connection** — NOT the pool. All queries inside
+    /// `f` MUST go through this reference to participate in the transaction.
+    async fn transaction<'a>(
+        &'a self,
+        f: TransactionFn<'a>,
+    ) -> Result<(), DbError>;
+}
+
+// ── DynDatabase — dyn-compatible companion ──────────────────────────
+
+/// Dyn-compatible version of [`Database`], used where a trait object
+/// (`&dyn DynDatabase`) is required — primarily inside transaction closures.
+///
+/// A blanket impl automatically implements this for every `T: Database`.
+/// You should not implement this trait manually.
+pub trait DynDatabase: Send + Sync {
     fn execute<'a>(
         &'a self,
         sql: &'a str,
         params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DbError>> + Send + 'a>>;
+    ) -> BoxFuture<'a, u64>;
 
-    /// Execute a query (SELECT). Returns rows.
     fn query<'a>(
         &'a self,
         sql: &'a str,
         params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>, DbError>> + Send + 'a>>;
+    ) -> BoxFuture<'a, Vec<Row>>;
 
-    /// Execute a query and return a single scalar value (e.g. COUNT).
     fn query_one<'a>(
         &'a self,
         sql: &'a str,
         params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Row, DbError>> + Send + 'a>>;
+    ) -> BoxFuture<'a, Row>;
+}
 
-    /// Run a closure inside a transaction.
-    fn transaction<'a>(
+impl<T: Database> DynDatabase for T {
+    fn execute<'a>(
         &'a self,
-        f: Box<
-            dyn FnOnce(
-                    &'a dyn Database,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>>
-                + Send
-                + 'a,
-        >,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>>;
+        sql: &'a str,
+        params: &'a [Value],
+    ) -> BoxFuture<'a, u64> {
+        Box::pin(Database::execute(self, sql, params))
+    }
+
+    fn query<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [Value],
+    ) -> BoxFuture<'a, Vec<Row>> {
+        Box::pin(Database::query(self, sql, params))
+    }
+
+    fn query_one<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [Value],
+    ) -> BoxFuture<'a, Row> {
+        Box::pin(Database::query_one(self, sql, params))
+    }
+}
+
+impl Database for dyn DynDatabase + '_ {
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        DynDatabase::execute(self, sql, params).await
+    }
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        DynDatabase::query(self, sql, params).await
+    }
+    async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        DynDatabase::query_one(self, sql, params).await
+    }
+    async fn transaction<'a>(
+        &'a self,
+        _f: TransactionFn<'a>,
+    ) -> Result<(), DbError> {
+        Err(DbError::Other("transaction not supported on dyn DynDatabase".into()))
+    }
 }
 
 // ── Query execution helpers ─────────────────────────────────────────
 
-/// Extension methods on query builders for direct execution against a database.
-///
-/// These are free functions to avoid orphan rule issues.
+// Extension methods on query builders for direct execution against a database.
+// These are free functions to avoid orphan rule issues.
 
 /// Execute a SELECT and return raw rows.
 pub async fn fetch_all<M: Table>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::SelectBuilder<M>,
 ) -> Result<Vec<Row>, DbError> {
     let (sql, params) = builder.build();
@@ -150,7 +250,7 @@ pub async fn fetch_all<M: Table>(
 
 /// Execute a SELECT and return typed results.
 pub async fn fetch<M: Table + FromRow>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::SelectBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
     let rows = fetch_all(db, builder).await?;
@@ -159,7 +259,7 @@ pub async fn fetch<M: Table + FromRow>(
 
 /// Execute an INSERT.
 pub async fn insert<M: Table>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::InsertBuilder<M>,
 ) -> Result<u64, DbError> {
     let (sql, params) = builder.build();
@@ -168,7 +268,7 @@ pub async fn insert<M: Table>(
 
 /// Execute a batch INSERT (multiple rows in one statement).
 pub async fn insert_many<M: Table>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::InsertManyBuilder<M>,
 ) -> Result<u64, DbError> {
     let (sql, params) = builder.build();
@@ -178,7 +278,7 @@ pub async fn insert_many<M: Table>(
 /// Execute a batch INSERT … RETURNING and return typed results (PostgreSQL only).
 #[cfg(feature = "postgres")]
 pub async fn insert_many_returning<M: Table + FromRow>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::InsertManyBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
     let (sql, params) = builder.build();
@@ -189,7 +289,7 @@ pub async fn insert_many_returning<M: Table + FromRow>(
 /// Execute an INSERT … RETURNING and return typed results (PostgreSQL only).
 #[cfg(feature = "postgres")]
 pub async fn insert_returning<M: Table + FromRow>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::InsertBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
     let (sql, params) = builder.build();
@@ -199,7 +299,7 @@ pub async fn insert_returning<M: Table + FromRow>(
 
 /// Execute an UPDATE.
 pub async fn update<M: Table>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::UpdateBuilder<M>,
 ) -> Result<u64, DbError> {
     let (sql, params) = builder.build();
@@ -209,7 +309,7 @@ pub async fn update<M: Table>(
 /// Execute an UPDATE … RETURNING and return typed results (PostgreSQL only).
 #[cfg(feature = "postgres")]
 pub async fn update_returning<M: Table + FromRow>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::UpdateBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
     let (sql, params) = builder.build();
@@ -219,7 +319,7 @@ pub async fn update_returning<M: Table + FromRow>(
 
 /// Execute a DELETE.
 pub async fn delete<M: Table>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::DeleteBuilder<M>,
 ) -> Result<u64, DbError> {
     let (sql, params) = builder.build();
@@ -229,7 +329,7 @@ pub async fn delete<M: Table>(
 /// Execute a DELETE … RETURNING and return typed results (PostgreSQL only).
 #[cfg(feature = "postgres")]
 pub async fn delete_returning<M: Table + FromRow>(
-    db: &dyn Database,
+    db: &impl Database,
     builder: &crate::query::DeleteBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
     let (sql, params) = builder.build();
@@ -248,7 +348,7 @@ pub async fn delete_returning<M: Table + FromRow>(
 /// let affected = raw_execute(db, "DELETE FROM sessions WHERE expires_at < ?", &[Value::Timestamptz(cutoff)]).await?;
 /// ```
 pub async fn raw_execute(
-    db: &dyn Database,
+    db: &impl Database,
     sql: &str,
     params: &[Value],
 ) -> Result<u64, DbError> {
@@ -263,7 +363,7 @@ pub async fn raw_execute(
 /// let rows = raw_query(db, "SELECT id, name FROM users WHERE active = ?", &[Value::Bool(true)]).await?;
 /// ```
 pub async fn raw_query(
-    db: &dyn Database,
+    db: &impl Database,
     sql: &str,
     params: &[Value],
 ) -> Result<Vec<Row>, DbError> {
@@ -278,7 +378,7 @@ pub async fn raw_query(
 /// let users: Vec<User> = raw_fetch::<User>(db, "SELECT * FROM users WHERE id = ?", &[Value::I64(1)]).await?;
 /// ```
 pub async fn raw_fetch<T: FromRow>(
-    db: &dyn Database,
+    db: &impl Database,
     sql: &str,
     params: &[Value],
 ) -> Result<Vec<T>, DbError> {
@@ -312,51 +412,23 @@ mod tests {
     }
 
     impl Database for StubDb {
-        fn execute<'a>(
-            &'a self,
-            _sql: &'a str,
-            _params: &'a [Value],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, DbError>> + Send + 'a>>
-        {
-            let n = self.affected;
-            Box::pin(async move { Ok(n) })
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<u64, DbError> {
+            Ok(self.affected)
         }
 
-        fn query<'a>(
-            &'a self,
-            _sql: &'a str,
-            _params: &'a [Value],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Row>, DbError>> + Send + 'a>>
-        {
-            let rows = self.rows.clone();
-            Box::pin(async move { Ok(rows) })
+        async fn query(&self, _sql: &str, _params: &[Value]) -> Result<Vec<Row>, DbError> {
+            Ok(self.rows.clone())
         }
 
-        fn query_one<'a>(
-            &'a self,
-            _sql: &'a str,
-            _params: &'a [Value],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Row, DbError>> + Send + 'a>>
-        {
-            let row = self.rows.first().cloned();
-            Box::pin(async move {
-                row.ok_or_else(|| DbError::Query("no rows".into()))
-            })
+        async fn query_one(&self, _sql: &str, _params: &[Value]) -> Result<Row, DbError> {
+            self.rows.first().cloned().ok_or_else(|| DbError::Query("no rows".into()))
         }
 
-        fn transaction<'a>(
+        async fn transaction<'a>(
             &'a self,
-            f: Box<
-                dyn FnOnce(
-                        &'a dyn Database,
-                    ) -> std::pin::Pin<
-                        Box<dyn std::future::Future<Output = Result<(), DbError>> + Send + 'a>,
-                    > + Send
-                    + 'a,
-            >,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbError>> + Send + 'a>>
-        {
-            Box::pin(async move { f(self).await })
+            f: TransactionFn<'a>,
+        ) -> Result<(), DbError> {
+            f(self).await
         }
     }
 
@@ -489,7 +561,7 @@ mod tests {
 /// Pass a mutable reference to the model so `before_insert` can mutate it
 /// (e.g. set `created_at`).
 pub async fn insert_with_hooks<M: Table + crate::hooks::ModelHooks>(
-    db: &dyn Database,
+    db: &impl Database,
     model: &mut M,
     builder_fn: impl FnOnce(&M) -> crate::query::InsertBuilder<M>,
 ) -> Result<u64, DbError> {
@@ -503,7 +575,7 @@ pub async fn insert_with_hooks<M: Table + crate::hooks::ModelHooks>(
 
 /// Execute an UPDATE, calling `ModelHooks::before_update` if implemented.
 pub async fn update_with_hooks<M: Table + crate::hooks::ModelHooks>(
-    db: &dyn Database,
+    db: &impl Database,
     model: &mut M,
     builder_fn: impl FnOnce(&M) -> crate::query::UpdateBuilder<M>,
 ) -> Result<u64, DbError> {
@@ -515,7 +587,7 @@ pub async fn update_with_hooks<M: Table + crate::hooks::ModelHooks>(
 
 /// Execute a DELETE, calling `ModelHooks::before_delete` if implemented.
 pub async fn delete_with_hooks<M: Table + crate::hooks::ModelHooks>(
-    db: &dyn Database,
+    db: &impl Database,
     model: &M,
     builder: &crate::query::DeleteBuilder<M>,
 ) -> Result<u64, DbError> {

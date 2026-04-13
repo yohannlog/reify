@@ -2,12 +2,10 @@
 //!
 //! Uses a MockDb that captures executed SQL and returns configurable query results.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use reify::{
-    Database, DbError, Row, Value,
+    Database, DbError, Row, Value, TransactionFn,
     migration::{
         Migration, MigrationContext, MigrationError, MigrationPlan, MigrationRunner,
         generate_migration_file,
@@ -45,49 +43,28 @@ impl MockDb {
 }
 
 impl Database for MockDb {
-    fn execute<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DbError>> + Send + 'a>> {
-        self.executed
-            .lock()
-            .unwrap()
-            .push((sql.to_string(), params.to_vec()));
-        Box::pin(async { Ok(1) })
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        self.executed.lock().unwrap().push((sql.to_string(), params.to_vec()));
+        Ok(1)
     }
 
-    fn query<'a>(
-        &'a self,
-        _sql: &'a str,
-        _params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>, DbError>> + Send + 'a>> {
+    async fn query(&self, _sql: &str, _params: &[Value]) -> Result<Vec<Row>, DbError> {
         let rows = {
             let mut q = self.query_results.lock().unwrap();
             if q.is_empty() { vec![] } else { q.remove(0) }
         };
-        Box::pin(async move { Ok(rows) })
+        Ok(rows)
     }
 
-    fn query_one<'a>(
-        &'a self,
-        _sql: &'a str,
-        _params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Row, DbError>> + Send + 'a>> {
-        Box::pin(async { Err(DbError::Query("no rows".into())) })
+    async fn query_one(&self, _sql: &str, _params: &[Value]) -> Result<Row, DbError> {
+        Err(DbError::Query("no rows".into()))
     }
 
-    fn transaction<'a>(
+    async fn transaction<'a>(
         &'a self,
-        f: Box<
-            dyn FnOnce(
-                    &'a dyn Database,
-                ) -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>>
-                + Send
-                + 'a,
-        >,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>> {
-        Box::pin(async move { f(self).await })
+        f: TransactionFn<'a>,
+    ) -> Result<(), DbError> {
+        f(self).await
     }
 }
 
@@ -414,4 +391,107 @@ fn migration_plan_display_shows_version_and_sql() {
     assert!(d.contains("Would apply (up)"));
     assert!(d.contains("20240320_000001_add_user_city"));
     assert!(d.contains("ALTER TABLE users"));
+}
+
+// ── Metadata-based DDL tests ────────────────────────────────────────
+
+#[test]
+fn create_table_uses_metadata_types_not_heuristics() {
+    use reify::migration::create_table_sql;
+    use reify::schema::{ColumnDef, SqlType};
+    use reify::Dialect;
+
+    // Build column defs with explicit types matching User's columns
+    let defs = vec![
+        ColumnDef {
+            name: "id",
+            sql_type: SqlType::BigSerial,
+            primary_key: true,
+            auto_increment: true,
+            unique: false,
+            index: false,
+            nullable: false,
+            default: None,
+        },
+        ColumnDef {
+            name: "email",
+            sql_type: SqlType::Uuid,
+            primary_key: false,
+            auto_increment: false,
+            unique: true,
+            index: false,
+            nullable: false,
+            default: None,
+        },
+        ColumnDef {
+            name: "role",
+            sql_type: SqlType::Text,
+            primary_key: false,
+            auto_increment: false,
+            unique: false,
+            index: false,
+            nullable: true,
+            default: None,
+        },
+    ];
+
+    let sql = create_table_sql::<User>(&defs, Dialect::Postgres);
+    assert!(sql.contains("BIGSERIAL"), "expected BIGSERIAL, got: {sql}");
+    // email uses Uuid type → should render as UUID for Postgres, not TEXT
+    assert!(sql.contains("UUID"), "expected UUID (from metadata, not name heuristic), got: {sql}");
+    assert!(sql.contains("TEXT"), "expected TEXT for role, got: {sql}");
+    assert!(sql.contains("PRIMARY KEY"), "expected PRIMARY KEY, got: {sql}");
+    assert!(sql.contains("UNIQUE"), "expected UNIQUE, got: {sql}");
+}
+
+#[test]
+fn column_defs_from_derive_macro_have_correct_types() {
+    use reify::schema::SqlType;
+    use reify::Table;
+
+    let defs = User::column_defs();
+    assert_eq!(defs.len(), 3);
+
+    // id: i64 + primary_key + auto_increment → BigSerial
+    let id = &defs[0];
+    assert_eq!(id.sql_type, SqlType::BigSerial);
+    assert!(id.primary_key);
+    assert!(id.auto_increment);
+
+    // email: String → Text + unique
+    let email = &defs[1];
+    assert_eq!(email.sql_type, SqlType::Text);
+    assert!(email.unique);
+
+    // role: Option<String> → Text + nullable
+    let role = &defs[2];
+    assert_eq!(role.sql_type, SqlType::Text);
+    assert!(role.nullable);
+}
+
+#[tokio::test]
+async fn auto_migration_uses_metadata_types_in_create_table() {
+    let db = MockDb::new();
+    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // existing_columns users → absent
+    db.push_rows(vec![]); // existing_columns posts → absent
+
+    MigrationRunner::new()
+        .add_table::<User>()
+        .add_table::<Post>()
+        .run(&db)
+        .await
+        .unwrap();
+
+    let sql = db.executed_sql();
+    let create_users = sql.iter().find(|s| s.contains("CREATE TABLE IF NOT EXISTS users"));
+    assert!(create_users.is_some(), "expected CREATE TABLE users: {sql:?}");
+
+    let create_sql = create_users.unwrap();
+    // Should use metadata types, not name-based heuristics
+    // id has BigSerial → renders as "INTEGER" in Generic dialect
+    assert!(
+        create_sql.contains("PRIMARY KEY"),
+        "expected PRIMARY KEY in: {create_sql}"
+    );
 }

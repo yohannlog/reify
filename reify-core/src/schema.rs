@@ -1,6 +1,119 @@
 use std::marker::PhantomData;
 
 use crate::column::Column;
+use crate::query::Dialect;
+
+// ── SQL types ──────────────────────────────────────────────────────
+
+/// SQL column type — the source-of-truth for DDL generation.
+///
+/// Derived automatically from Rust types by `#[derive(Table)]`, or set
+/// explicitly via `#[column(sql_type = "JSONB")]` / the builder API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlType {
+    /// `SMALLINT` / `INT2`
+    SmallInt,
+    /// `INTEGER` / `INT4`
+    Integer,
+    /// `BIGINT` / `INT8`
+    BigInt,
+    /// `REAL` / `FLOAT4`
+    Float,
+    /// `DOUBLE PRECISION` / `FLOAT8`
+    Double,
+    /// `NUMERIC` / `DECIMAL`
+    Numeric,
+    /// `BOOLEAN`
+    Boolean,
+    /// `TEXT`
+    Text,
+    /// `BYTEA` (Postgres) / `BLOB` (SQLite/MySQL)
+    Bytea,
+    /// `UUID` (Postgres) / `CHAR(36)` (MySQL) / `TEXT` (SQLite)
+    Uuid,
+    /// `TIMESTAMPTZ` (Postgres) / `DATETIME` (MySQL/SQLite)
+    Timestamptz,
+    /// `TIMESTAMP` (without time zone)
+    Timestamp,
+    /// `DATE`
+    Date,
+    /// `TIME`
+    Time,
+    /// `JSONB` (Postgres) / `JSON` (MySQL) / `TEXT` (SQLite)
+    Jsonb,
+    /// `BIGSERIAL` (Postgres) / `BIGINT AUTO_INCREMENT` (MySQL) /
+    /// `INTEGER` with AUTOINCREMENT (SQLite)
+    BigSerial,
+    /// `SERIAL` (Postgres) / `INT AUTO_INCREMENT` (MySQL) /
+    /// `INTEGER` with AUTOINCREMENT (SQLite)
+    Serial,
+    /// Escape hatch — raw SQL type string.
+    Custom(&'static str),
+}
+
+impl SqlType {
+    /// Render this type as a SQL string for the given dialect.
+    pub fn to_sql(&self, dialect: Dialect) -> &'static str {
+        match self {
+            SqlType::SmallInt => "SMALLINT",
+            SqlType::Integer => "INTEGER",
+            SqlType::BigInt => "BIGINT",
+            SqlType::Float => match dialect {
+                Dialect::Postgres => "REAL",
+                _ => "FLOAT",
+            },
+            SqlType::Double => match dialect {
+                Dialect::Postgres => "DOUBLE PRECISION",
+                _ => "DOUBLE",
+            },
+            SqlType::Numeric => "NUMERIC",
+            SqlType::Boolean => "BOOLEAN",
+            SqlType::Text => "TEXT",
+            SqlType::Bytea => match dialect {
+                Dialect::Postgres => "BYTEA",
+                Dialect::Mysql => "LONGBLOB",
+                _ => "BLOB",
+            },
+            SqlType::Uuid => match dialect {
+                Dialect::Postgres => "UUID",
+                Dialect::Mysql => "CHAR(36)",
+                _ => "TEXT",
+            },
+            SqlType::Timestamptz => match dialect {
+                Dialect::Postgres => "TIMESTAMPTZ",
+                _ => "DATETIME",
+            },
+            SqlType::Timestamp => match dialect {
+                Dialect::Postgres => "TIMESTAMP",
+                _ => "DATETIME",
+            },
+            SqlType::Date => "DATE",
+            SqlType::Time => "TIME",
+            SqlType::Jsonb => match dialect {
+                Dialect::Postgres => "JSONB",
+                Dialect::Mysql => "JSON",
+                _ => "TEXT",
+            },
+            SqlType::BigSerial => match dialect {
+                Dialect::Postgres => "BIGSERIAL",
+                Dialect::Mysql => "BIGINT AUTO_INCREMENT",
+                _ => "INTEGER",
+            },
+            SqlType::Serial => match dialect {
+                Dialect::Postgres => "SERIAL",
+                Dialect::Mysql => "INT AUTO_INCREMENT",
+                _ => "INTEGER",
+            },
+            SqlType::Custom(s) => s,
+        }
+    }
+}
+
+impl Default for SqlType {
+    fn default() -> Self {
+        SqlType::Text
+    }
+}
 
 // ── Column attributes ───────────────────────────────────────────────
 
@@ -8,6 +121,7 @@ use crate::column::Column;
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: &'static str,
+    pub sql_type: SqlType,
     pub primary_key: bool,
     pub auto_increment: bool,
     pub unique: bool,
@@ -26,6 +140,7 @@ impl ColumnBuilder {
         Self {
             def: ColumnDef {
                 name,
+                sql_type: SqlType::Text,
                 primary_key: false,
                 auto_increment: false,
                 unique: false,
@@ -34,6 +149,12 @@ impl ColumnBuilder {
                 default: None,
             },
         }
+    }
+
+    /// Set the SQL type for this column.
+    pub fn sql_type(mut self, ty: SqlType) -> Self {
+        self.def.sql_type = ty;
+        self
     }
 
     pub fn primary_key(mut self) -> Self {

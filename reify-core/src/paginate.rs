@@ -1,7 +1,9 @@
 use std::marker::PhantomData;
 
 use crate::column::Column;
+use crate::condition::Condition;
 use crate::query::SelectBuilder;
+use crate::sql::{OrderFragment, SqlFragment};
 use crate::table::Table;
 use crate::value::{IntoValue, Value};
 
@@ -79,17 +81,44 @@ impl<M: Table> Paginated<M> {
     /// - `count_sql`: SELECT COUNT(*) with the same WHERE clause
     /// - `params`: shared parameters (used by both queries)
     pub fn build(&self) -> (String, String, Vec<Value>) {
-        let (base_sql, params) = self.builder.build();
-
-        // Data query: inject LIMIT/OFFSET (replace existing if any)
-        let data_sql = strip_limit_offset(&base_sql);
+        let ast = self.builder.build_ast();
         let offset = (self.page - 1) * self.per_page;
-        let data_sql = format!("{data_sql} LIMIT {} OFFSET {offset}", self.per_page);
 
-        // Count query: replace SELECT ... FROM with SELECT COUNT(*) FROM
-        let count_sql = to_count_query(&base_sql);
+        // Data query: set LIMIT/OFFSET on the AST
+        let data_ast = match ast {
+            SqlFragment::Select {
+                columns,
+                from,
+                joins,
+                conditions,
+                group_by,
+                having,
+                order_by,
+                ..
+            } => SqlFragment::Select {
+                columns,
+                from,
+                joins,
+                conditions,
+                group_by,
+                having,
+                order_by,
+                limit: Some(self.per_page),
+                offset: Some(offset),
+            },
+            raw => raw,
+        };
 
-        (data_sql, count_sql, params)
+        let mut data_params = Vec::new();
+        let data_sql = data_ast.render(&mut data_params);
+
+        // Count query: from the AST
+        let count_ast = self.builder.build_ast().to_count_query();
+        let mut count_params = Vec::new();
+        let count_sql = count_ast.render(&mut count_params);
+
+        // Use data_params as the shared params (count params are identical)
+        (data_sql, count_sql, data_params)
     }
 
     /// Create a `Page` metadata object from a known total count.
@@ -147,39 +176,52 @@ impl<M: Table> CursorPaginated<M> {
     ///
     /// Requests `limit + 1` rows to detect if there are more results.
     pub fn build(&self) -> (String, Vec<Value>) {
-        let (base_sql, mut params) = self.builder.build();
+        let ast = self.builder.build_ast();
 
-        let base_sql = strip_limit_offset(&base_sql);
+        // Operate on the AST: strip limit/offset, add cursor condition + ordering
+        let ast = match ast {
+            SqlFragment::Select {
+                columns,
+                from,
+                joins,
+                mut conditions,
+                group_by,
+                having,
+                ..
+            } => {
+                // Add cursor condition
+                if let Some(ref val) = self.cursor_value {
+                    let cursor_cond = match self.direction {
+                        CursorDirection::Forward => Condition::Gt(self.cursor_column, val.clone()),
+                        CursorDirection::Backward => Condition::Lt(self.cursor_column, val.clone()),
+                    };
+                    conditions.push(cursor_cond);
+                }
 
-        let has_where = base_sql.contains(" WHERE ");
-        let connector = if has_where { " AND" } else { " WHERE" };
+                // Replace ORDER BY with cursor ordering
+                let descending = self.direction == CursorDirection::Backward;
+                let order_by = vec![OrderFragment {
+                    column: self.cursor_column.to_string(),
+                    descending,
+                }];
 
-        let mut sql = base_sql;
-
-        // Add cursor condition if we have a cursor value
-        if let Some(ref val) = self.cursor_value {
-            let op = match self.direction {
-                CursorDirection::Forward => ">",
-                CursorDirection::Backward => "<",
-            };
-            params.push(val.clone());
-            sql = format!("{sql}{connector} {} {op} ?", self.cursor_column);
-        }
-
-        // Order by cursor column
-        let order = match self.direction {
-            CursorDirection::Forward => "ASC",
-            CursorDirection::Backward => "DESC",
+                SqlFragment::Select {
+                    columns,
+                    from,
+                    joins,
+                    conditions,
+                    group_by,
+                    having,
+                    order_by,
+                    limit: Some(self.limit + 1), // fetch one extra to detect has_next
+                    offset: None,
+                }
+            }
+            raw => raw,
         };
 
-        // Strip existing ORDER BY to replace with cursor ordering
-        let sql = strip_order_by(&sql);
-        let sql = format!(
-            "{sql} ORDER BY {} {order} LIMIT {}",
-            self.cursor_column,
-            self.limit + 1 // fetch one extra to detect has_next
-        );
-
+        let mut params = Vec::new();
+        let sql = ast.render(&mut params);
         (sql, params)
     }
 
@@ -252,42 +294,5 @@ impl<M: Table> SelectBuilder<M> {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-fn strip_limit_offset(sql: &str) -> String {
-    let sql = sql.trim_end();
-    // Remove trailing OFFSET ...
-    let sql = if let Some(idx) = sql.to_uppercase().rfind(" OFFSET ") {
-        &sql[..idx]
-    } else {
-        sql
-    };
-    // Remove trailing LIMIT ...
-    if let Some(idx) = sql.to_uppercase().rfind(" LIMIT ") {
-        sql[..idx].to_string()
-    } else {
-        sql.to_string()
-    }
-}
-
-fn strip_order_by(sql: &str) -> String {
-    if let Some(idx) = sql.to_uppercase().rfind(" ORDER BY ") {
-        sql[..idx].to_string()
-    } else {
-        sql.to_string()
-    }
-}
-
-fn to_count_query(sql: &str) -> String {
-    let upper = sql.to_uppercase();
-    if let Some(from_idx) = upper.find(" FROM ") {
-        let rest = &sql[from_idx..];
-        // Strip ORDER BY, LIMIT, OFFSET from count query
-        let rest = strip_order_by(rest);
-        let rest = strip_limit_offset(&rest);
-        format!("SELECT COUNT(*){rest}")
-    } else {
-        // Fallback — shouldn't happen with well-formed queries
-        sql.to_string()
-    }
-}
+// Text-based helpers removed — pagination now operates on SqlFragment AST.
+// See SqlFragment::to_count_query(), without_limit_offset(), without_order_by().

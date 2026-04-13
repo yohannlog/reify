@@ -1,11 +1,9 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::condition::Condition;
-use crate::db::{Database, DbError, Row};
+use crate::db::{Database, DynDatabase, DbError, Row, TransactionFn};
 use crate::value::Value;
 
 // ── Policy context ─────────────────────────────────────────────────
@@ -85,12 +83,12 @@ pub trait Policy: crate::table::Table {
 /// let posts = scoped_fetch(&scoped, &Post::find()).await?;
 /// ```
 pub struct Scoped<'a> {
-    inner: &'a dyn Database,
+    inner: &'a dyn DynDatabase,
     ctx: RlsContext,
 }
 
 impl<'a> Scoped<'a> {
-    pub fn new(db: &'a dyn Database, ctx: RlsContext) -> Self {
+    pub fn new(db: &'a dyn DynDatabase, ctx: RlsContext) -> Self {
         Self { inner: db, ctx }
     }
 
@@ -103,41 +101,23 @@ impl<'a> Scoped<'a> {
 /// Delegate raw `Database` calls — policies are enforced at the builder level,
 /// not at the SQL string level, so the raw trait just passes through.
 impl Database for Scoped<'_> {
-    fn execute<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DbError>> + Send + 'a>> {
-        self.inner.execute(sql, params)
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        self.inner.execute(sql, params).await
     }
 
-    fn query<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>, DbError>> + Send + 'a>> {
-        self.inner.query(sql, params)
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        self.inner.query(sql, params).await
     }
 
-    fn query_one<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Row, DbError>> + Send + 'a>> {
-        self.inner.query_one(sql, params)
+    async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        self.inner.query_one(sql, params).await
     }
 
-    fn transaction<'a>(
+    async fn transaction<'a>(
         &'a self,
-        f: Box<
-            dyn FnOnce(
-                    &'a dyn Database,
-                ) -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>>
-                + Send
-                + 'a,
-        >,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>> {
-        self.inner.transaction(f)
+        f: TransactionFn<'a>,
+    ) -> Result<(), DbError> {
+        self.inner.transaction(f).await
     }
 }
 
@@ -153,7 +133,7 @@ pub async fn scoped_fetch_all<M: crate::table::Table + Policy>(
         None => builder,
     };
     let (sql, params) = builder.build();
-    scoped.query(&sql, &params).await
+    Database::query(scoped, &sql, &params).await
 }
 
 /// Fetch typed results with RLS policy applied.
@@ -175,7 +155,7 @@ pub async fn scoped_update<M: crate::table::Table + Policy>(
         None => builder,
     };
     let (sql, params) = builder.build();
-    scoped.execute(&sql, &params).await
+    Database::execute(scoped, &sql, &params).await
 }
 
 /// Execute a DELETE with RLS policy applied to the WHERE clause.
@@ -188,5 +168,5 @@ pub async fn scoped_delete<M: crate::table::Table + Policy>(
         None => builder,
     };
     let (sql, params) = builder.build();
-    scoped.execute(&sql, &params).await
+    Database::execute(scoped, &sql, &params).await
 }

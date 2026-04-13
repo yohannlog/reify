@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse::Parse, parse_macro_input, Attribute, Data, DeriveInput, Fields, Lit, Meta, Path};
+use syn::{parse::Parse, parse_macro_input, Attribute, Data, DeriveInput, Fields, Lit, Path};
 
 /// Derive macro that implements `Table` and generates typed column constants + query builder helpers.
 ///
@@ -326,6 +326,8 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let mut value_conversions = Vec::new();
     let mut single_col_indexes: Vec<String> = Vec::new();
 
+    let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
+
     for field in fields.iter() {
         let ident = field.ident.as_ref().unwrap();
         let ty = &field.ty;
@@ -335,13 +337,47 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         col_idents.push(ident.clone());
         col_types.push(ty.clone());
 
-        let flags = parse_column_attrs(&field.attrs);
-        if flags.iter().any(|f| f == "index") {
+        let col_attrs = parse_column_attrs(&field.attrs);
+        if col_attrs.index {
             single_col_indexes.push(name_str.clone());
         }
 
         value_conversions.push(quote! {
             reify_core::value::IntoValue::into_value(self.#ident.clone())
+        });
+
+        // Determine SqlType and nullable from the Rust type + attributes
+        let (is_option, inner_ty) = unwrap_option_type(ty);
+        let is_nullable = col_attrs.nullable || is_option;
+        let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
+            let custom_str: &str = custom;
+            quote! { reify_core::schema::SqlType::Custom(#custom_str) }
+        } else if col_attrs.primary_key && col_attrs.auto_increment {
+            quote! { reify_core::schema::SqlType::BigSerial }
+        } else {
+            rust_type_to_sql_type(inner_ty)
+        };
+
+        let is_pk = col_attrs.primary_key;
+        let is_auto = col_attrs.auto_increment;
+        let is_unique = col_attrs.unique;
+        let is_index = col_attrs.index;
+        let default_token = match &col_attrs.default {
+            Some(d) => quote! { Some(#d.to_string()) },
+            None => quote! { None },
+        };
+
+        col_defs_tokens.push(quote! {
+            reify_core::schema::ColumnDef {
+                name: #name_str,
+                sql_type: #sql_type_token,
+                primary_key: #is_pk,
+                auto_increment: #is_auto,
+                unique: #is_unique,
+                index: #is_index,
+                nullable: #is_nullable,
+                default: #default_token,
+            }
         });
     }
 
@@ -419,6 +455,10 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
             fn into_values(&self) -> Vec<reify_core::Value> {
                 vec![#(#value_conversions),*]
+            }
+
+            fn column_defs() -> Vec<reify_core::schema::ColumnDef> {
+                vec![#(#col_defs_tokens),*]
             }
 
             fn indexes() -> Vec<reify_core::IndexDef> {
@@ -648,24 +688,53 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
-/// Parse `#[column(...)]` attributes. Returns flags.
-fn parse_column_attrs(attrs: &[Attribute]) -> Vec<String> {
-    let mut flags = Vec::new();
+/// Parsed column attributes from `#[column(...)]`.
+#[derive(Default)]
+struct ColumnAttrs {
+    primary_key: bool,
+    auto_increment: bool,
+    unique: bool,
+    nullable: bool,
+    index: bool,
+    default: Option<String>,
+    sql_type: Option<String>,
+}
+
+/// Parse `#[column(...)]` attributes using proper `syn` parsing.
+fn parse_column_attrs(attrs: &[Attribute]) -> ColumnAttrs {
+    let mut result = ColumnAttrs::default();
     for attr in attrs {
         if !attr.path().is_ident("column") {
             continue;
         }
-        if let Meta::List(list) = &attr.meta {
-            let tokens = list.tokens.to_string();
-            for part in tokens.split(',') {
-                let flag = part.trim().to_string();
-                if !flag.is_empty() {
-                    flags.push(flag);
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("primary_key") {
+                result.primary_key = true;
+            } else if meta.path.is_ident("auto_increment") {
+                result.auto_increment = true;
+            } else if meta.path.is_ident("unique") {
+                result.unique = true;
+            } else if meta.path.is_ident("nullable") {
+                result.nullable = true;
+            } else if meta.path.is_ident("index") {
+                result.index = true;
+            } else if meta.path.is_ident("default") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.default = Some(s.value());
+                }
+            } else if meta.path.is_ident("sql_type") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.sql_type = Some(s.value());
                 }
             }
-        }
+            Ok(())
+        });
     }
-    flags
+    result
 }
 
 /// Derive macro that generates `FromRow` and a `select_columns()` helper
@@ -686,9 +755,19 @@ fn impl_partial_model(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(named) => &named.named,
-            _ => return Err(syn::Error::new_spanned(input, "PartialModel requires named fields")),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "PartialModel requires named fields",
+                ))
+            }
         },
-        _ => return Err(syn::Error::new_spanned(input, "PartialModel only works on structs")),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "PartialModel only works on structs",
+            ))
+        }
     };
 
     let mut col_names: Vec<String> = Vec::new();
@@ -752,4 +831,58 @@ fn parse_partial_model_attr(attrs: &[Attribute]) -> syn::Result<Option<String>> 
         return Ok(entity);
     }
     Ok(None)
+}
+
+// ── Type mapping helpers ────────────────────────────────────────────
+
+/// Unwrap `Option<T>` → `(true, T)`, or return `(false, ty)` unchanged.
+fn unwrap_option_type(ty: &syn::Type) -> (bool, &syn::Type) {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(seg) = type_path.path.segments.last() {
+            if seg.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                        return (true, inner);
+                    }
+                }
+            }
+        }
+    }
+    (false, ty)
+}
+
+/// Map a Rust type to the corresponding `SqlType` variant token stream.
+fn rust_type_to_sql_type(ty: &syn::Type) -> proc_macro2::TokenStream {
+    let type_str = quote!(#ty).to_string().replace(' ', "");
+    match type_str.as_str() {
+        "i16" => quote! { reify_core::schema::SqlType::SmallInt },
+        "i32" => quote! { reify_core::schema::SqlType::Integer },
+        "i64" => quote! { reify_core::schema::SqlType::BigInt },
+        "f32" => quote! { reify_core::schema::SqlType::Float },
+        "f64" => quote! { reify_core::schema::SqlType::Double },
+        "bool" => quote! { reify_core::schema::SqlType::Boolean },
+        "String" | "&str" => quote! { reify_core::schema::SqlType::Text },
+        "Vec<u8>" => quote! { reify_core::schema::SqlType::Bytea },
+        // chrono types
+        "chrono::DateTime<chrono::Utc>" | "DateTime<Utc>" => {
+            quote! { reify_core::schema::SqlType::Timestamptz }
+        }
+        "chrono::NaiveDateTime" | "NaiveDateTime" => {
+            quote! { reify_core::schema::SqlType::Timestamp }
+        }
+        "chrono::NaiveDate" | "NaiveDate" => {
+            quote! { reify_core::schema::SqlType::Date }
+        }
+        "chrono::NaiveTime" | "NaiveTime" => {
+            quote! { reify_core::schema::SqlType::Time }
+        }
+        // uuid
+        "uuid::Uuid" | "Uuid" => quote! { reify_core::schema::SqlType::Uuid },
+        // serde_json
+        "serde_json::Value" | "JsonValue" => {
+            quote! { reify_core::schema::SqlType::Jsonb }
+        }
+        // Fallback
+        _ => quote! { reify_core::schema::SqlType::Text },
+    }
 }

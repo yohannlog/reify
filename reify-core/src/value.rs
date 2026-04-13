@@ -71,6 +71,53 @@ pub enum Value {
     ArrayUuid(Vec<uuid::Uuid>),
 }
 
+impl Value {
+    /// Return the `SqlType` that corresponds to this value variant.
+    pub fn sql_type(&self) -> crate::schema::SqlType {
+        use crate::schema::SqlType;
+        match self {
+            Value::Null => SqlType::Text,
+            Value::Bool(_) => SqlType::Boolean,
+            Value::I16(_) => SqlType::SmallInt,
+            Value::I32(_) => SqlType::Integer,
+            Value::I64(_) => SqlType::BigInt,
+            Value::F32(_) => SqlType::Float,
+            Value::F64(_) => SqlType::Double,
+            Value::String(_) => SqlType::Text,
+            Value::Bytes(_) => SqlType::Bytea,
+            #[cfg(feature = "postgres")]
+            Value::Uuid(_) => SqlType::Uuid,
+            #[cfg(feature = "postgres")]
+            Value::Timestamptz(_) => SqlType::Timestamptz,
+            #[cfg(feature = "postgres")]
+            Value::Jsonb(_) => SqlType::Jsonb,
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Value::Timestamp(_) => SqlType::Timestamp,
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Value::Date(_) => SqlType::Date,
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Value::Time(_) => SqlType::Time,
+            // Ranges and arrays fall back to Text — they are PG-specific
+            // and don't have a single portable SQL type.
+            #[cfg(feature = "postgres")]
+            Value::Int4Range(_)
+            | Value::Int8Range(_)
+            | Value::TsRange(_)
+            | Value::TstzRange(_)
+            | Value::DateRange(_) => SqlType::Text,
+            #[cfg(feature = "postgres")]
+            Value::ArrayBool(_)
+            | Value::ArrayI16(_)
+            | Value::ArrayI32(_)
+            | Value::ArrayI64(_)
+            | Value::ArrayF32(_)
+            | Value::ArrayF64(_)
+            | Value::ArrayString(_)
+            | Value::ArrayUuid(_) => SqlType::Text,
+        }
+    }
+}
+
 /// Trait for types that can be converted into a `Value`.
 pub trait IntoValue {
     fn into_value(self) -> Value;

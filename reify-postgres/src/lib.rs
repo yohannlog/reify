@@ -7,15 +7,13 @@
 //! let rows = reify_core::fetch_all(&db, &User::find().filter(User::id.eq(1i64))).await?;
 //! ```
 
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use deadpool_postgres::{Config as DpConfig, Pool, Runtime};
 use tokio_postgres::{NoTls, types::ToSql as PgToSql};
 use tracing::{debug, error};
 
-use reify_core::db::{Database, DbError, Row};
+use reify_core::db::{Database, DbError, Row, TransactionFn};
 use reify_core::range::{Bound, Range};
 use reify_core::value::Value;
 
@@ -471,33 +469,20 @@ fn pg_column_to_value(
 
 // ── Rewrite `?` placeholders to `$N` for PostgreSQL ─────────────────
 
-fn rewrite_placeholders(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut idx = 1u32;
-    for ch in sql.chars() {
-        if ch == '?' {
-            result.push('$');
-            result.push_str(&idx.to_string());
-            idx += 1;
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
+use reify_core::rewrite_placeholders_pg as rewrite_placeholders;
 
 // ── Error conversion helpers ─────────────────────────────────────────
 
 /// Map a `tokio_postgres::Error` to a `DbError`, promoting constraint
 /// violations (SQLSTATE class 23) to `DbError::Constraint`.
 fn pg_err(e: tokio_postgres::Error) -> DbError {
+    use reify_core::db::sqlstate;
     if let Some(db_err) = e.as_db_error() {
-        let sqlstate = db_err.code().code().to_owned();
-        // SQLSTATE class 23 = integrity constraint violation
-        if sqlstate.starts_with("23") {
+        let code = db_err.code().code().to_owned();
+        if sqlstate::is_constraint_violation(&code) {
             return DbError::Constraint {
                 message: db_err.message().to_owned(),
-                sqlstate: Some(sqlstate),
+                sqlstate: Some(code),
             };
         }
     }
@@ -509,97 +494,143 @@ async fn get_conn(pool: &Pool) -> Result<deadpool_postgres::Object, DbError> {
     pool.get().await.map_err(|e| DbError::Connection(e.to_string()))
 }
 
+/// Prepare params and execute a statement on a `tokio_postgres::Client`.
+async fn pg_execute(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+) -> Result<u64, DbError> {
+    let pg_sql = rewrite_placeholders(sql);
+    let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> =
+        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    debug!(target: "reify::postgres", sql = %pg_sql, "Executing");
+    client.execute(&*pg_sql, &param_refs[..]).await.map_err(pg_err)
+}
+
+/// Prepare params and run a query on a `tokio_postgres::Client`.
+async fn pg_query(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<Row>, DbError> {
+    let pg_sql = rewrite_placeholders(sql);
+    let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> =
+        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    debug!(target: "reify::postgres", sql = %pg_sql, "Querying");
+    let rows = client.query(&*pg_sql, &param_refs[..]).await.map_err(pg_err)?;
+    Ok(rows.iter().map(pg_row_to_row).collect())
+}
+
+/// Prepare params and run a query returning exactly one row.
+async fn pg_query_one(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+) -> Result<Row, DbError> {
+    let pg_sql = rewrite_placeholders(sql);
+    let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> =
+        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    debug!(target: "reify::postgres", sql = %pg_sql, "Querying one");
+    let row = client.query_one(&*pg_sql, &param_refs[..]).await.map_err(pg_err)?;
+    Ok(pg_row_to_row(&row))
+}
+
 // ── Database trait implementation ───────────────────────────────────
 
 impl Database for PostgresDb {
-    fn execute<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DbError>> + Send + 'a>> {
-        Box::pin(async move {
-            let pg_sql = rewrite_placeholders(sql);
-            let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-            let param_refs: Vec<&(dyn PgToSql + Sync)> =
-                pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
-
-            debug!(target: "reify::postgres", sql = %pg_sql, "Executing");
-            let conn = get_conn(&self.pool).await?;
-            conn.execute(&pg_sql, &param_refs).await.map_err(pg_err)
-        })
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        let conn = get_conn(&self.pool).await?;
+        pg_execute(&conn, sql, params).await
     }
 
-    fn query<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>, DbError>> + Send + 'a>> {
-        Box::pin(async move {
-            let pg_sql = rewrite_placeholders(sql);
-            let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-            let param_refs: Vec<&(dyn PgToSql + Sync)> =
-                pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
-
-            debug!(target: "reify::postgres", sql = %pg_sql, "Querying");
-            let conn = get_conn(&self.pool).await?;
-            let rows = conn.query(&pg_sql, &param_refs).await.map_err(pg_err)?;
-            Ok(rows.iter().map(pg_row_to_row).collect())
-        })
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        let conn = get_conn(&self.pool).await?;
+        pg_query(&conn, sql, params).await
     }
 
-    fn query_one<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<Row, DbError>> + Send + 'a>> {
-        Box::pin(async move {
-            let pg_sql = rewrite_placeholders(sql);
-            let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-            let param_refs: Vec<&(dyn PgToSql + Sync)> =
-                pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
-
-            debug!(target: "reify::postgres", sql = %pg_sql, "Querying one");
-            let conn = get_conn(&self.pool).await?;
-            let row = conn.query_one(&pg_sql, &param_refs).await.map_err(pg_err)?;
-            Ok(pg_row_to_row(&row))
-        })
+    async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        let conn = get_conn(&self.pool).await?;
+        pg_query_one(&conn, sql, params).await
     }
 
-    fn transaction<'a>(
+    async fn transaction<'a>(
         &'a self,
-        f: Box<
-            dyn FnOnce(
-                    &'a dyn Database,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>>
-                + Send
-                + 'a,
-        >,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DbError>> + Send + 'a>> {
-        Box::pin(async move {
-            debug!(target: "reify::postgres", "BEGIN transaction");
-            let conn = get_conn(&self.pool).await?;
-            conn.execute("BEGIN", &[]).await.map_err(pg_err)?;
-            // Return the connection to the pool; subsequent ops in `f` each
-            // acquire their own connection from the same pool, which is
-            // correct for the manual-BEGIN pattern used here.
-            drop(conn);
+        f: TransactionFn<'a>,
+    ) -> Result<(), DbError> {
+        debug!(target: "reify::postgres", "BEGIN transaction");
+        let conn = get_conn(&self.pool).await?;
+        conn.execute("BEGIN", &[]).await.map_err(pg_err)?;
 
-            match f(self).await {
-                Ok(()) => {
-                    debug!(target: "reify::postgres", "COMMIT transaction");
-                    let conn = get_conn(&self.pool).await?;
-                    conn.execute("COMMIT", &[]).await.map_err(pg_err)?;
-                    Ok(())
-                }
-                Err(e) => {
-                    error!(target: "reify::postgres", error = %e, "ROLLBACK transaction");
-                    if let Ok(conn) = get_conn(&self.pool).await {
-                        let _ = conn.execute("ROLLBACK", &[]).await;
-                    }
-                    Err(e)
-                }
+        // Heap-allocate the transaction wrapper so it can be borrowed
+        // for the `'a` lifetime required by the closure.
+        let txn: Box<PgTransaction> = Box::new(PgTransaction { conn });
+        // SAFETY: `txn` lives until the end of this async block, which
+        // is strictly longer than the `f(&*txn_ref).await` call. The
+        // `'a` lifetime in the closure signature is the lifetime of
+        // `&'a self`, but the compiler can't prove our local `txn`
+        // lives that long. We guarantee it does because we don't drop
+        // `txn` until after `f` completes.
+        let txn_ref: &'a PgTransaction =
+            unsafe { &*(&*txn as *const PgTransaction) };
+
+        match f(txn_ref).await {
+            Ok(()) => {
+                debug!(target: "reify::postgres", "COMMIT transaction");
+                txn.conn.execute("COMMIT", &[]).await.map_err(pg_err)?;
+                Ok(())
             }
-        })
+            Err(e) => {
+                error!(target: "reify::postgres", error = %e, "ROLLBACK transaction");
+                let _ = txn.conn.execute("ROLLBACK", &[]).await;
+                Err(e)
+            }
+        }
+    }
+}
+
+// ── PgTransaction — dedicated connection for transaction scope ──────
+
+/// A single PostgreSQL connection held open for the duration of a transaction.
+///
+/// Implements `Database` so the closure inside `transaction()` can use it
+/// transparently. All queries go through this one connection, preserving
+/// ACID guarantees.
+struct PgTransaction {
+    conn: deadpool_postgres::Object,
+}
+
+impl Database for PgTransaction {
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        pg_execute(&self.conn, sql, params).await
+    }
+
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        pg_query(&self.conn, sql, params).await
+    }
+
+    async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        pg_query_one(&self.conn, sql, params).await
+    }
+
+    async fn transaction<'a>(
+        &'a self,
+        f: TransactionFn<'a>,
+    ) -> Result<(), DbError> {
+        // Nested transaction via SAVEPOINT
+        debug!(target: "reify::postgres", "SAVEPOINT nested_txn");
+        self.conn.execute("SAVEPOINT nested_txn", &[]).await.map_err(pg_err)?;
+        match f(self).await {
+            Ok(()) => {
+                self.conn.execute("RELEASE SAVEPOINT nested_txn", &[]).await.map_err(pg_err)?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK TO SAVEPOINT nested_txn", &[]).await;
+                Err(e)
+            }
+        }
     }
 }

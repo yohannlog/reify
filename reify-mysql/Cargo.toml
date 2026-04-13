@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 reify-core = { path = "../reify-core", version = "0.1.0", features = ["mysql"] }
 mysql_async = { version = "0.35", default-features = false, features = ["default-rustls"] }
+tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

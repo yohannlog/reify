@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use reify::{IndexKind, Schema, Table, TableSchema, Value};
+use reify::{IndexKind, Schema, SqlType, Table, TableSchema, Value};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Table, Debug, Clone)]
@@ -571,6 +571,105 @@ fn builder_unique_partial_index() {
     assert!(idx.unique);
     assert_eq!(idx.predicate, Some("deleted_at IS NULL".to_string()));
     assert_eq!(idx.name, Some("idx_products_live_sku".to_string()));
+}
+
+// ── column_defs() generation tests ──────────────────────────────────
+
+#[test]
+fn column_defs_generated_with_correct_types() {
+    let defs = User::column_defs();
+    assert_eq!(defs.len(), 3);
+
+    // id: i64 + primary_key + auto_increment → BigSerial
+    assert_eq!(defs[0].name, "id");
+    assert_eq!(defs[0].sql_type, SqlType::BigSerial);
+    assert!(defs[0].primary_key);
+    assert!(defs[0].auto_increment);
+    assert!(!defs[0].nullable);
+
+    // email: String → Text + unique
+    assert_eq!(defs[1].name, "email");
+    assert_eq!(defs[1].sql_type, SqlType::Text);
+    assert!(defs[1].unique);
+    assert!(!defs[1].nullable);
+
+    // role: Option<String> → Text + nullable
+    assert_eq!(defs[2].name, "role");
+    assert_eq!(defs[2].sql_type, SqlType::Text);
+    assert!(defs[2].nullable);
+}
+
+#[test]
+fn column_defs_nullable_option_fields() {
+    // User.role is Option<String> → should be nullable
+    let defs = User::column_defs();
+    let role_def = defs.iter().find(|d| d.name == "role").unwrap();
+    assert!(role_def.nullable);
+    assert_eq!(role_def.sql_type, SqlType::Text);
+
+    // User.id is i64 (not Option) → should NOT be nullable
+    let id_def = defs.iter().find(|d| d.name == "id").unwrap();
+    assert!(!id_def.nullable);
+}
+
+#[test]
+fn column_defs_integer_types() {
+    #[derive(Table, Debug, Clone)]
+    #[table(name = "metrics")]
+    struct Metric {
+        #[column(primary_key)]
+        pub id: i32,
+        pub count: i16,
+        pub big_count: i64,
+    }
+
+    let defs = Metric::column_defs();
+    assert_eq!(defs[0].sql_type, SqlType::Integer);
+    assert_eq!(defs[1].sql_type, SqlType::SmallInt);
+    assert_eq!(defs[2].sql_type, SqlType::BigInt);
+}
+
+#[test]
+fn column_defs_float_and_bool() {
+    #[derive(Table, Debug, Clone)]
+    #[table(name = "readings")]
+    struct Reading {
+        #[column(primary_key)]
+        pub id: i64,
+        pub temperature: f64,
+        pub pressure: f32,
+        pub is_valid: bool,
+    }
+
+    let defs = Reading::column_defs();
+    assert_eq!(defs[1].sql_type, SqlType::Double);
+    assert_eq!(defs[2].sql_type, SqlType::Float);
+    assert_eq!(defs[3].sql_type, SqlType::Boolean);
+}
+
+#[test]
+fn sql_type_dialect_rendering() {
+    use reify::Dialect;
+
+    assert_eq!(SqlType::BigSerial.to_sql(Dialect::Postgres), "BIGSERIAL");
+    assert_eq!(
+        SqlType::BigSerial.to_sql(Dialect::Mysql),
+        "BIGINT AUTO_INCREMENT"
+    );
+    assert_eq!(SqlType::BigSerial.to_sql(Dialect::Generic), "INTEGER");
+
+    assert_eq!(SqlType::Uuid.to_sql(Dialect::Postgres), "UUID");
+    assert_eq!(SqlType::Uuid.to_sql(Dialect::Mysql), "CHAR(36)");
+    assert_eq!(SqlType::Uuid.to_sql(Dialect::Generic), "TEXT");
+
+    assert_eq!(SqlType::Jsonb.to_sql(Dialect::Postgres), "JSONB");
+    assert_eq!(SqlType::Jsonb.to_sql(Dialect::Mysql), "JSON");
+
+    assert_eq!(
+        SqlType::Timestamptz.to_sql(Dialect::Postgres),
+        "TIMESTAMPTZ"
+    );
+    assert_eq!(SqlType::Timestamptz.to_sql(Dialect::Mysql), "DATETIME");
 }
 
 // ── Index support (builder) ─────────────────────────────────────────

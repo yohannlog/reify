@@ -1,7 +1,8 @@
+use std::fmt::Write;
 use std::marker::PhantomData;
 
 use crate::condition::Condition;
-use crate::sql::ToSql;
+use crate::sql::{write_joined, ToSql};
 use crate::table::Table;
 use crate::value::Value;
 use tracing::debug;
@@ -59,6 +60,63 @@ fn trace_query(operation: &str, table: &'static str, sql: &str, params: &[Value]
         params = ?params,
         "Built SQL query"
     );
+}
+
+/// Append an `ON CONFLICT` clause to `sql` based on the conflict strategy and dialect.
+fn write_on_conflict(sql: &mut String, on_conflict: &Option<OnConflict>, dialect: Dialect) {
+    match (on_conflict, dialect) {
+        (Some(OnConflict::DoNothing), Dialect::Postgres) => {
+            sql.push_str(" ON CONFLICT DO NOTHING");
+        }
+        (
+            Some(OnConflict::DoUpdate {
+                target_cols,
+                updates,
+            }),
+            Dialect::Postgres,
+        ) => {
+            sql.push_str(" ON CONFLICT (");
+            write_joined(sql, target_cols, ", ", |buf, c| buf.push_str(c));
+            sql.push_str(") DO UPDATE SET ");
+            write_joined(sql, updates, ", ", |buf, c| {
+                let _ = write!(buf, "{c} = EXCLUDED.{c}");
+            });
+        }
+        (Some(OnConflict::DoUpdate { updates, .. }), Dialect::Mysql) => {
+            sql.push_str(" ON DUPLICATE KEY UPDATE ");
+            write_joined(sql, updates, ", ", |buf, c| {
+                let _ = write!(buf, "{c} = VALUES({c})");
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Append a `RETURNING` clause to `sql` (PostgreSQL only).
+#[cfg(feature = "postgres")]
+fn write_returning(sql: &mut String, returning: &Option<Vec<&'static str>>) {
+    if let Some(ret_cols) = returning {
+        sql.push_str(" RETURNING ");
+        write_joined(sql, ret_cols, ", ", |buf, c| buf.push_str(c));
+    }
+}
+
+/// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params.
+///
+/// Call this on the SQL string returned by `build()` when targeting PostgreSQL.
+/// This is a pure string transformation with a single allocation.
+pub fn rewrite_placeholders_pg(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len() + 16);
+    let mut idx = 1u32;
+    for ch in sql.chars() {
+        if ch == '?' {
+            let _ = write!(result, "${idx}");
+            idx += 1;
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 // ── Aggregate expressions ───────────────────────────────────────────
@@ -225,63 +283,69 @@ impl<M: Table> SelectBuilder<M> {
         self
     }
 
-    /// Build the SQL string and parameter list.
-    pub fn build(&self) -> (String, Vec<Value>) {
-        let mut params = Vec::new();
+    /// Select typed columns (alternative to string-based `select()`).
+    ///
+    /// ```ignore
+    /// User::find().select_cols(&[User::id, User::email]).build();
+    /// ```
+    pub fn select_cols<T>(mut self, cols: &[crate::column::Column<M, T>]) -> Self {
+        self.columns = Some(cols.iter().map(|c| c.name).collect());
+        self
+    }
 
-        // SELECT list: exprs take priority over plain columns.
-        let select_list = if let Some(ref exprs) = self.exprs {
-            exprs
-                .iter()
-                .map(|e| e.to_sql_fragment())
-                .collect::<Vec<_>>()
-                .join(", ")
+    /// Group by typed columns (alternative to string-based `group_by()`).
+    pub fn group_by_cols<T>(mut self, cols: &[crate::column::Column<M, T>]) -> Self {
+        self.group_by.extend(cols.iter().map(|c| c.name));
+        self
+    }
+
+    /// Build a structured `SqlFragment` AST for this query.
+    ///
+    /// Use this when you need to manipulate the query structure (e.g. pagination)
+    /// without parsing rendered SQL text.
+    pub fn build_ast(&self) -> crate::sql::SqlFragment {
+        let columns = if let Some(ref exprs) = self.exprs {
+            exprs.iter().map(|e| e.to_sql_fragment()).collect()
         } else {
             match &self.columns {
-                Some(c) => c.join(", "),
-                None => "*".to_owned(),
+                Some(c) => c.iter().map(|s| s.to_string()).collect(),
+                None => vec![],
             }
         };
-        let mut sql = format!("SELECT {} FROM {}", select_list, M::table_name());
 
-        if !self.conditions.is_empty() {
-            let where_parts: Vec<String> = self
-                .conditions
-                .iter()
-                .map(|c| c.to_sql(&mut params))
-                .collect();
-            sql.push_str(&format!(" WHERE {}", where_parts.join(" AND ")));
-        }
+        let order_by = self
+            .orders
+            .iter()
+            .map(|o| match o {
+                Order::Asc(c) => crate::sql::OrderFragment {
+                    column: c.to_string(),
+                    descending: false,
+                },
+                Order::Desc(c) => crate::sql::OrderFragment {
+                    column: c.to_string(),
+                    descending: true,
+                },
+            })
+            .collect();
 
-        if !self.group_by.is_empty() {
-            sql.push_str(&format!(" GROUP BY {}", self.group_by.join(", ")));
+        crate::sql::SqlFragment::Select {
+            columns,
+            from: M::table_name().to_string(),
+            joins: vec![],
+            conditions: self.conditions.clone(),
+            group_by: self.group_by.iter().map(|s| s.to_string()).collect(),
+            having: self.having.clone(),
+            order_by,
+            limit: self.limit,
+            offset: self.offset,
         }
+    }
 
-        if !self.having.is_empty() {
-            let having_parts: Vec<String> =
-                self.having.iter().map(|c| c.to_sql(&mut params)).collect();
-            sql.push_str(&format!(" HAVING {}", having_parts.join(" AND ")));
-        }
-
-        if !self.orders.is_empty() {
-            let order_parts: Vec<String> = self
-                .orders
-                .iter()
-                .map(|o| match o {
-                    Order::Asc(c) => format!("{c} ASC"),
-                    Order::Desc(c) => format!("{c} DESC"),
-                })
-                .collect();
-            sql.push_str(&format!(" ORDER BY {}", order_parts.join(", ")));
-        }
-
-        if let Some(n) = self.limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
-        if let Some(n) = self.offset {
-            sql.push_str(&format!(" OFFSET {n}"));
-        }
-
+    /// Build the SQL string and parameter list.
+    pub fn build(&self) -> (String, Vec<Value>) {
+        let ast = self.build_ast();
+        let mut params = Vec::new();
+        let sql = ast.render(&mut params);
         trace_query("select", M::table_name(), &sql, &params);
         (sql, params)
     }
@@ -360,8 +424,8 @@ impl<M: Table> InsertBuilder<M> {
     /// Build SQL for a specific [`Dialect`].
     #[allow(unused_mut)]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        let cols = M::column_names().join(", ");
-        let placeholders: Vec<&str> = (0..self.values.len()).map(|_| "?").collect();
+        let col_names = M::column_names();
+        let num_cols = self.values.len();
 
         // MySQL INSERT IGNORE prefix
         let insert_kw = match (&self.on_conflict, dialect) {
@@ -369,53 +433,23 @@ impl<M: Table> InsertBuilder<M> {
             _ => "INSERT",
         };
 
-        let mut sql = format!(
-            "{} INTO {} ({}) VALUES ({})",
-            insert_kw,
-            M::table_name(),
-            cols,
-            placeholders.join(", ")
-        );
+        let mut sql = String::with_capacity(64 + num_cols * 3);
+        let _ = write!(sql, "{insert_kw} INTO {} (", M::table_name());
+        write_joined(&mut sql, col_names, ", ", |buf, c| buf.push_str(c));
+        sql.push_str(") VALUES (");
+        for i in 0..num_cols {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+        }
+        sql.push(')');
 
         // Conflict clause
-        match (&self.on_conflict, dialect) {
-            (Some(OnConflict::DoNothing), Dialect::Postgres) => {
-                sql.push_str(" ON CONFLICT DO NOTHING");
-            }
-            (
-                Some(OnConflict::DoUpdate {
-                    target_cols,
-                    updates,
-                }),
-                Dialect::Postgres,
-            ) => {
-                sql.push_str(&format!(
-                    " ON CONFLICT ({}) DO UPDATE SET {}",
-                    target_cols.join(", "),
-                    updates
-                        .iter()
-                        .map(|c| format!("{c} = EXCLUDED.{c}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            (Some(OnConflict::DoUpdate { updates, .. }), Dialect::Mysql) => {
-                sql.push_str(&format!(
-                    " ON DUPLICATE KEY UPDATE {}",
-                    updates
-                        .iter()
-                        .map(|c| format!("{c} = VALUES({c})"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            _ => {}
-        }
+        write_on_conflict(&mut sql, &self.on_conflict, dialect);
 
         #[cfg(feature = "postgres")]
-        if let Some(ref ret_cols) = self.returning {
-            sql.push_str(&format!(" RETURNING {}", ret_cols.join(", ")));
-        }
+        write_returning(&mut sql, &self.returning);
 
         trace_query("insert", M::table_name(), &sql, &self.values);
         (sql, self.values.clone())
@@ -486,18 +520,8 @@ impl<M: Table> InsertManyBuilder<M> {
     #[allow(unused_mut)]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
         let col_names = M::column_names();
-        let cols = col_names.join(", ");
         let num_cols = col_names.len();
-
-        // Build the VALUES list: (?, ?, ?), (?, ?, ?), …
-        let row_placeholders: Vec<String> = self
-            .rows
-            .iter()
-            .map(|_| {
-                let ph: Vec<&str> = (0..num_cols).map(|_| "?").collect();
-                format!("({})", ph.join(", "))
-            })
-            .collect();
+        let num_rows = self.rows.len();
 
         // Flatten all row values into a single params vec.
         let params: Vec<Value> = self.rows.iter().flat_map(|r| r.iter().cloned()).collect();
@@ -507,53 +531,32 @@ impl<M: Table> InsertManyBuilder<M> {
             _ => "INSERT",
         };
 
-        let mut sql = format!(
-            "{} INTO {} ({}) VALUES {}",
-            insert_kw,
-            M::table_name(),
-            cols,
-            row_placeholders.join(", ")
-        );
+        // Capacity: keyword + table + cols + VALUES rows
+        let mut sql = String::with_capacity(64 + num_cols * 3 + num_rows * (num_cols * 3 + 4));
+        let _ = write!(sql, "{insert_kw} INTO {} (", M::table_name());
+        write_joined(&mut sql, col_names, ", ", |buf, c| buf.push_str(c));
+        sql.push_str(") VALUES ");
+
+        // Write (?, ?, ?), (?, ?, ?), … directly
+        for row_idx in 0..num_rows {
+            if row_idx > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('(');
+            for col_idx in 0..num_cols {
+                if col_idx > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+            }
+            sql.push(')');
+        }
 
         // Conflict clause
-        match (&self.on_conflict, dialect) {
-            (Some(OnConflict::DoNothing), Dialect::Postgres) => {
-                sql.push_str(" ON CONFLICT DO NOTHING");
-            }
-            (
-                Some(OnConflict::DoUpdate {
-                    target_cols,
-                    updates,
-                }),
-                Dialect::Postgres,
-            ) => {
-                sql.push_str(&format!(
-                    " ON CONFLICT ({}) DO UPDATE SET {}",
-                    target_cols.join(", "),
-                    updates
-                        .iter()
-                        .map(|c| format!("{c} = EXCLUDED.{c}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            (Some(OnConflict::DoUpdate { updates, .. }), Dialect::Mysql) => {
-                sql.push_str(&format!(
-                    " ON DUPLICATE KEY UPDATE {}",
-                    updates
-                        .iter()
-                        .map(|c| format!("{c} = VALUES({c})"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            _ => {}
-        }
+        write_on_conflict(&mut sql, &self.on_conflict, dialect);
 
         #[cfg(feature = "postgres")]
-        if let Some(ref ret_cols) = self.returning {
-            sql.push_str(&format!(" RETURNING {}", ret_cols.join(", ")));
-        }
+        write_returning(&mut sql, &self.returning);
 
         trace_query("insert_many", M::table_name(), &sql, &params);
         (sql, params)
@@ -571,7 +574,7 @@ pub enum JoinKind {
 }
 
 impl JoinKind {
-    fn sql_keyword(self) -> &'static str {
+    pub fn sql_keyword(self) -> &'static str {
         match self {
             JoinKind::Inner => "INNER JOIN",
             JoinKind::Left => "LEFT JOIN",
@@ -669,16 +672,10 @@ impl<M: Table> JoinedSelectBuilder<M> {
         self
     }
 
-    /// Build the final SQL and parameter list.
-    ///
-    /// Generates `SELECT from_table.*, joined_table.*, … FROM from_table
-    /// INNER/LEFT/RIGHT JOIN joined_table ON … WHERE … ORDER BY … LIMIT … OFFSET …`.
-    pub fn build(&self) -> (String, Vec<Value>) {
-        let mut params = Vec::new();
-
+    /// Build a structured `SqlFragment` AST for this joined query.
+    pub fn build_ast(&self) -> crate::sql::SqlFragment {
         // SELECT list: qualify every table with `table.*`
         let mut select_tables = vec![format!("{}.*", M::table_name())];
-        // Deduplicate joined tables while preserving order.
         let mut seen = std::collections::HashSet::new();
         seen.insert(M::table_name());
         for j in &self.joins {
@@ -686,68 +683,54 @@ impl<M: Table> JoinedSelectBuilder<M> {
                 select_tables.push(format!("{}.*", j.table));
             }
         }
-        let select_list = select_tables.join(", ");
 
-        let mut sql = format!("SELECT {} FROM {}", select_list, M::table_name());
+        let joins = self
+            .joins
+            .iter()
+            .map(|j| crate::sql::JoinFragment {
+                kind: j.kind,
+                table: j.table.to_string(),
+                on_condition: j.on.clone(),
+            })
+            .collect();
 
-        // JOIN clauses
-        for j in &self.joins {
-            sql.push_str(&format!(
-                " {} {} ON {}",
-                j.kind.sql_keyword(),
-                j.table,
-                j.on
-            ));
+        let order_by = self
+            .inner
+            .orders
+            .iter()
+            .map(|o| match o {
+                Order::Asc(c) => crate::sql::OrderFragment {
+                    column: c.to_string(),
+                    descending: false,
+                },
+                Order::Desc(c) => crate::sql::OrderFragment {
+                    column: c.to_string(),
+                    descending: true,
+                },
+            })
+            .collect();
+
+        crate::sql::SqlFragment::Select {
+            columns: select_tables,
+            from: M::table_name().to_string(),
+            joins,
+            conditions: self.inner.conditions.clone(),
+            group_by: self.inner.group_by.iter().map(|s| s.to_string()).collect(),
+            having: self.inner.having.clone(),
+            order_by,
+            limit: self.inner.limit,
+            offset: self.inner.offset,
         }
+    }
 
-        // WHERE
-        if !self.inner.conditions.is_empty() {
-            let where_parts: Vec<String> = self
-                .inner
-                .conditions
-                .iter()
-                .map(|c| c.to_sql(&mut params))
-                .collect();
-            sql.push_str(&format!(" WHERE {}", where_parts.join(" AND ")));
-        }
-
-        // GROUP BY
-        if !self.inner.group_by.is_empty() {
-            sql.push_str(&format!(" GROUP BY {}", self.inner.group_by.join(", ")));
-        }
-
-        // HAVING
-        if !self.inner.having.is_empty() {
-            let having_parts: Vec<String> = self
-                .inner
-                .having
-                .iter()
-                .map(|c| c.to_sql(&mut params))
-                .collect();
-            sql.push_str(&format!(" HAVING {}", having_parts.join(" AND ")));
-        }
-
-        // ORDER BY
-        if !self.inner.orders.is_empty() {
-            let order_parts: Vec<String> = self
-                .inner
-                .orders
-                .iter()
-                .map(|o| match o {
-                    Order::Asc(c) => format!("{c} ASC"),
-                    Order::Desc(c) => format!("{c} DESC"),
-                })
-                .collect();
-            sql.push_str(&format!(" ORDER BY {}", order_parts.join(", ")));
-        }
-
-        if let Some(n) = self.inner.limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
-        if let Some(n) = self.inner.offset {
-            sql.push_str(&format!(" OFFSET {n}"));
-        }
-
+    /// Build the final SQL and parameter list.
+    ///
+    /// Generates `SELECT from_table.*, joined_table.*, … FROM from_table
+    /// INNER/LEFT/RIGHT JOIN joined_table ON … WHERE … ORDER BY … LIMIT … OFFSET …`.
+    pub fn build(&self) -> (String, Vec<Value>) {
+        let ast = self.build_ast();
+        let mut params = Vec::new();
+        let sql = ast.render(&mut params);
         trace_query("select_join", M::table_name(), &sql, &params);
         (sql, params)
     }
@@ -911,28 +894,21 @@ impl<M: Table> UpdateBuilder<M> {
         );
 
         let mut params = Vec::new();
-        let set_parts: Vec<String> = self
-            .sets
-            .iter()
-            .map(|(col, val)| {
-                params.push(val.clone());
-                format!("{col} = ?")
-            })
-            .collect();
+        let mut sql = String::with_capacity(64 + self.sets.len() * 16);
+        let _ = write!(sql, "UPDATE {} SET ", M::table_name());
 
-        let mut sql = format!("UPDATE {} SET {}", M::table_name(), set_parts.join(", "));
+        write_joined(&mut sql, &self.sets, ", ", |buf, (col, val)| {
+            params.push(val.clone());
+            let _ = write!(buf, "{col} = ?");
+        });
 
-        let where_parts: Vec<String> = self
-            .conditions
-            .iter()
-            .map(|c| c.to_sql(&mut params))
-            .collect();
-        sql.push_str(&format!(" WHERE {}", where_parts.join(" AND ")));
+        sql.push_str(" WHERE ");
+        write_joined(&mut sql, &self.conditions, " AND ", |buf, c| {
+            c.write_sql(buf, &mut params);
+        });
 
         #[cfg(feature = "postgres")]
-        if let Some(ref ret_cols) = self.returning {
-            sql.push_str(&format!(" RETURNING {}", ret_cols.join(", ")));
-        }
+        write_returning(&mut sql, &self.returning);
 
         trace_query("update", M::table_name(), &sql, &params);
         (sql, params)
@@ -986,19 +962,16 @@ impl<M: Table> DeleteBuilder<M> {
         );
 
         let mut params = Vec::new();
-        let mut sql = format!("DELETE FROM {}", M::table_name());
+        let mut sql = String::with_capacity(64);
+        let _ = write!(sql, "DELETE FROM {}", M::table_name());
 
-        let where_parts: Vec<String> = self
-            .conditions
-            .iter()
-            .map(|c| c.to_sql(&mut params))
-            .collect();
-        sql.push_str(&format!(" WHERE {}", where_parts.join(" AND ")));
+        sql.push_str(" WHERE ");
+        write_joined(&mut sql, &self.conditions, " AND ", |buf, c| {
+            c.write_sql(buf, &mut params);
+        });
 
         #[cfg(feature = "postgres")]
-        if let Some(ref ret_cols) = self.returning {
-            sql.push_str(&format!(" RETURNING {}", ret_cols.join(", ")));
-        }
+        write_returning(&mut sql, &self.returning);
 
         trace_query("delete", M::table_name(), &sql, &params);
         (sql, params)
