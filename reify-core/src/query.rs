@@ -995,6 +995,17 @@ impl<M: Table> DeleteBuilder<M> {
         self
     }
 
+    /// Convert this `DeleteBuilder` into a `SelectBuilder` with the same WHERE conditions.
+    ///
+    /// Used by `audited_delete` to capture old rows before deletion.
+    pub fn to_select(&self) -> SelectBuilder<M> {
+        let mut sel = SelectBuilder::new();
+        for cond in &self.conditions {
+            sel = sel.filter(cond.clone());
+        }
+        sel
+    }
+
     /// Build the SQL. Panics if no WHERE clause — safety by default.
     #[allow(unused_mut)]
     pub fn build(&self) -> (String, Vec<Value>) {

@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod column;
 pub mod condition;
 pub mod db;
@@ -53,6 +54,11 @@ pub use migration::{
 
 pub use rls::{
     Policy, RlsContext, Scoped, scoped_delete, scoped_fetch, scoped_fetch_all, scoped_update,
+};
+
+pub use audit::{
+    Auditable, AuditContext, AuditOperation, audit_column_defs_for, values_to_json_string,
+    audited_update, audited_delete,
 };
 
 pub use enumeration::{DbEnum, enum_from_value};

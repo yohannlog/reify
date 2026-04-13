@@ -418,6 +418,51 @@ pub fn create_table_sql<T: Table>(
     )
 }
 
+/// Generate a `CREATE TABLE IF NOT EXISTS` statement from an explicit table name
+/// and column definitions (used for synthetic tables like audit companions).
+pub(crate) fn create_table_sql_named(
+    table_name: &str,
+    column_defs: &[crate::schema::ColumnDef],
+    dialect: crate::query::Dialect,
+) -> String {
+    use crate::schema::TimestampSource;
+
+    let mut col_lines: Vec<String> = Vec::new();
+
+    for def in column_defs {
+        let mut parts: Vec<String> = vec![format!("    {}", def.name)];
+
+        let sql_type = def.sql_type.to_sql(dialect);
+        parts.push(sql_type.into());
+
+        if def.primary_key {
+            parts.push("PRIMARY KEY".into());
+        }
+        if !def.nullable && !def.primary_key {
+            parts.push("NOT NULL".into());
+        }
+        if def.unique {
+            parts.push("UNIQUE".into());
+        }
+        if def.timestamp_source == TimestampSource::Db {
+            let default_now = match dialect {
+                crate::query::Dialect::Mysql => "DEFAULT CURRENT_TIMESTAMP",
+                _ => "DEFAULT NOW()",
+            };
+            parts.push(default_now.into());
+        } else if let Some(ref dv) = def.default {
+            parts.push(format!("DEFAULT {dv}"));
+        }
+
+        col_lines.push(parts.join(" "));
+    }
+
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} (\n{}\n);",
+        col_lines.join(",\n")
+    )
+}
+
 /// Generate `ALTER TABLE … ADD COLUMN` for columns present in the struct
 /// but missing from the database.
 pub fn add_column_sql(
@@ -564,6 +609,45 @@ impl MigrationRunner {
             table_name: T::table_name(),
             column_names: T::column_names(),
             column_defs: schema.columns,
+            create_sql,
+        });
+        self
+    }
+
+    /// Register a `Table` type that has `#[table(audit)]` for automatic diff-based migration.
+    ///
+    /// Registers both the main table (via `add_table::<T>()`) and a synthetic audit companion
+    /// table (`<table>_audit`) with the 5 fixed audit columns.
+    pub fn add_audited_table<T: Table + crate::audit::Auditable>(mut self) -> Self {
+        self = self.add_table::<T>();
+        let audit_defs = T::audit_column_defs();
+        let audit_name = T::audit_table_name();
+        let create_sql = create_table_sql_named(audit_name, &audit_defs, crate::query::Dialect::Generic);
+        self.tables.push(TableEntry {
+            table_name: audit_name,
+            column_names: &[],
+            column_defs: audit_defs,
+            create_sql,
+        });
+        self
+    }
+
+    /// Register a `Table` type with explicit `Schema` metadata, plus its audit companion table.
+    ///
+    /// Same as `add_audited_table` but delegates the main table registration to
+    /// `add_table_with_schema(schema)` for users who define their schema via the builder API.
+    pub fn add_audited_table_with_schema<T>(mut self, schema: crate::schema::TableSchema<T>) -> Self
+    where
+        T: Table + crate::audit::Auditable,
+    {
+        self = self.add_table_with_schema(schema);
+        let audit_defs = T::audit_column_defs();
+        let audit_name = T::audit_table_name();
+        let create_sql = create_table_sql_named(audit_name, &audit_defs, crate::query::Dialect::Generic);
+        self.tables.push(TableEntry {
+            table_name: audit_name,
+            column_names: &[],
+            column_defs: audit_defs,
             create_sql,
         });
         self

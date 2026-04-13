@@ -1,0 +1,320 @@
+//! Integration tests for the audit logging feature.
+//!
+//! Uses a MockDb that captures executed SQL for verifying audit behaviour.
+
+use std::sync::{Arc, Mutex};
+
+use reify::{
+    Auditable, AuditContext, Database, DbError, FromRow, MigrationRunner, Row, SqlType,
+    TransactionFn, Value, audit::values_to_json_string,
+};
+
+// ── MockDb ───────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct MockDb {
+    executed: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
+    query_results: Arc<Mutex<Vec<Vec<Row>>>>,
+}
+
+impl MockDb {
+    fn new() -> Self {
+        Self {
+            executed: Arc::new(Mutex::new(Vec::new())),
+            query_results: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn push_rows(&self, rows: Vec<Row>) {
+        self.query_results.lock().unwrap().push(rows);
+    }
+
+    fn executed_sql(&self) -> Vec<String> {
+        self.executed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
+    fn executed_params(&self) -> Vec<Vec<Value>> {
+        self.executed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+}
+
+impl Database for MockDb {
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        self.executed.lock().unwrap().push((sql.to_string(), params.to_vec()));
+        Ok(1)
+    }
+
+    async fn query(&self, _sql: &str, _params: &[Value]) -> Result<Vec<Row>, DbError> {
+        let rows = {
+            let mut q = self.query_results.lock().unwrap();
+            if q.is_empty() { vec![] } else { q.remove(0) }
+        };
+        Ok(rows)
+    }
+
+    async fn query_one(&self, _sql: &str, _params: &[Value]) -> Result<Row, DbError> {
+        Err(DbError::Query("no rows".into()))
+    }
+
+    async fn transaction<'a>(
+        &'a self,
+        f: TransactionFn<'a>,
+    ) -> Result<(), DbError> {
+        f(self).await
+    }
+}
+
+// ── Test structs ─────────────────────────────────────────────────────
+
+#[derive(reify::Table, Debug, Clone)]
+#[table(name = "users", audit)]
+pub struct AuditUser {
+    #[column(primary_key, auto_increment)]
+    pub id: i64,
+    #[column(unique)]
+    pub email: String,
+    #[column(nullable)]
+    pub role: Option<String>,
+}
+
+impl FromRow for AuditUser {
+    fn from_row(row: &Row) -> Result<Self, DbError> {
+        let id = match row.get("id") {
+            Some(Value::I64(v)) => *v,
+            _ => return Err(DbError::Conversion("missing id".into())),
+        };
+        let email = match row.get("email") {
+            Some(Value::String(v)) => v.clone(),
+            _ => return Err(DbError::Conversion("missing email".into())),
+        };
+        let role = match row.get("role") {
+            Some(Value::String(v)) => Some(v.clone()),
+            Some(Value::Null) | None => None,
+            _ => return Err(DbError::Conversion("invalid role".into())),
+        };
+        Ok(AuditUser { id, email, role })
+    }
+}
+
+// Struct WITHOUT audit — used to verify Auditable is NOT implemented.
+#[derive(reify::Table, Debug, Clone)]
+#[table(name = "products")]
+pub struct Product {
+    #[column(primary_key, auto_increment)]
+    pub id: i64,
+    pub name: String,
+}
+
+// ── Trait correctness ────────────────────────────────────────────────
+
+#[test]
+fn audit_table_name() {
+    assert_eq!(AuditUser::audit_table_name(), "users_audit");
+}
+
+#[test]
+fn audit_column_defs_count() {
+    let defs = AuditUser::audit_column_defs();
+    assert_eq!(defs.len(), 5);
+}
+
+#[test]
+fn audit_column_defs_names() {
+    let defs = AuditUser::audit_column_defs();
+    assert_eq!(defs[0].name, "audit_id");
+    assert_eq!(defs[1].name, "operation");
+    assert_eq!(defs[2].name, "actor_id");
+    assert_eq!(defs[3].name, "changed_at");
+    assert_eq!(defs[4].name, "row_data");
+}
+
+#[test]
+fn audit_column_defs_types() {
+    let defs = AuditUser::audit_column_defs();
+    assert_eq!(defs[0].sql_type, SqlType::BigSerial);
+    assert!(defs[0].primary_key);
+    assert_eq!(defs[1].sql_type, SqlType::Text);
+    assert!(!defs[1].nullable);
+    assert_eq!(defs[2].sql_type, SqlType::BigInt);
+    assert!(defs[2].nullable);
+    assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
+    assert_eq!(defs[3].default, Some("NOW()".to_string()));
+    assert_eq!(defs[4].sql_type, SqlType::Jsonb);
+    assert!(!defs[4].nullable);
+}
+
+// ── MigrationRunner::add_audited_table ───────────────────────────────
+
+#[tokio::test]
+async fn add_audited_table_creates_both_tables() {
+    let db = MockDb::new();
+    // No existing tables
+    db.push_rows(vec![]); // existing_columns for users
+    db.push_rows(vec![]); // existing_columns for users_audit
+
+    let runner = MigrationRunner::new().add_audited_table::<AuditUser>();
+    let plans = runner.dry_run(&db).await.unwrap();
+
+    let all_sql: String = plans.iter().flat_map(|p| p.statements.iter().map(|s| s.as_str())).collect::<Vec<_>>().join("\n");
+    assert!(all_sql.contains("CREATE TABLE IF NOT EXISTS users"), "missing users table: {all_sql}");
+    assert!(all_sql.contains("CREATE TABLE IF NOT EXISTS users_audit"), "missing users_audit table: {all_sql}");
+}
+
+#[tokio::test]
+async fn add_audited_table_with_schema_creates_both_tables() {
+    use reify::{schema::table, ColumnBuilder};
+
+    let db = MockDb::new();
+    db.push_rows(vec![]); // existing_columns for users
+    db.push_rows(vec![]); // existing_columns for users_audit
+
+    let schema = table::<AuditUser>("users")
+        .column(AuditUser::id, |c: ColumnBuilder| c.primary_key().auto_increment())
+        .column(AuditUser::email, |c: ColumnBuilder| c.unique())
+        .column(AuditUser::role, |c: ColumnBuilder| c.nullable());
+
+    let runner = MigrationRunner::new().add_audited_table_with_schema(schema);
+    let plans = runner.dry_run(&db).await.unwrap();
+
+    let all_sql: String = plans.iter().flat_map(|p| p.statements.iter().map(|s| s.as_str())).collect::<Vec<_>>().join("\n");
+    assert!(all_sql.contains("CREATE TABLE IF NOT EXISTS users"), "missing users table: {all_sql}");
+    assert!(all_sql.contains("CREATE TABLE IF NOT EXISTS users_audit"), "missing users_audit table: {all_sql}");
+}
+
+// ── values_to_json_string ────────────────────────────────────────────
+
+#[test]
+fn json_string_basic() {
+    let json = values_to_json_string(
+        &["id", "email"],
+        &[Value::I64(1), Value::String("alice@example.com".into())],
+    );
+    assert_eq!(json, r#"{"id":1,"email":"alice@example.com"}"#);
+}
+
+#[test]
+fn json_string_null_value() {
+    let json = values_to_json_string(&["role"], &[Value::Null]);
+    assert_eq!(json, r#"{"role":null}"#);
+}
+
+#[test]
+fn json_string_bool() {
+    let json = values_to_json_string(&["active"], &[Value::Bool(true)]);
+    assert_eq!(json, r#"{"active":true}"#);
+}
+
+#[test]
+fn json_string_empty() {
+    let json = values_to_json_string(&[], &[]);
+    assert_eq!(json, "{}");
+}
+
+#[test]
+fn json_string_escaping() {
+    let json = values_to_json_string(&["msg"], &[Value::String(r#"say "hi""#.into())]);
+    assert_eq!(json, r#"{"msg":"say \"hi\""}"#);
+}
+
+// ── audited_update ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn audited_update_executes_update_and_audit_insert() {
+    let db = MockDb::new();
+    let ctx = AuditContext { actor_id: Some(42) };
+
+    let builder = AuditUser::update()
+        .set(AuditUser::email, "new@example.com")
+        .filter(AuditUser::id.eq(1i64));
+
+    reify::audited_update(&db, builder, &ctx).await.unwrap();
+
+    let sqls = db.executed_sql();
+    assert_eq!(sqls.len(), 2, "expected UPDATE + INSERT, got: {sqls:?}");
+    assert!(sqls[0].starts_with("UPDATE users SET"), "first SQL should be UPDATE: {}", sqls[0]);
+    assert!(sqls[1].contains("INSERT INTO users_audit"), "second SQL should be audit INSERT: {}", sqls[1]);
+}
+
+#[tokio::test]
+async fn audited_update_null_actor() {
+    let db = MockDb::new();
+    let ctx = AuditContext { actor_id: None };
+
+    let builder = AuditUser::update()
+        .set(AuditUser::email, "x@example.com")
+        .filter(AuditUser::id.eq(1i64));
+
+    reify::audited_update(&db, builder, &ctx).await.unwrap();
+
+    let params = db.executed_params();
+    // audit INSERT params: [operation, actor_id, row_data]
+    assert_eq!(params[1][1], Value::Null, "actor_id should be NULL");
+}
+
+// ── audited_delete ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn audited_delete_captures_rows_and_inserts_audit() {
+    let db = MockDb::new();
+
+    // Pre-load the SELECT result (old rows to capture)
+    let old_row = Row::new(
+        vec!["id".into(), "email".into(), "role".into()],
+        vec![Value::I64(1), Value::String("alice@example.com".into()), Value::Null],
+    );
+    db.push_rows(vec![old_row]);
+
+    let ctx = AuditContext { actor_id: Some(7) };
+    let builder = AuditUser::delete().filter(AuditUser::id.eq(1i64));
+
+    reify::audited_delete::<AuditUser>(&db, builder, &ctx).await.unwrap();
+
+    let sqls = db.executed_sql();
+    // DELETE + one audit INSERT
+    assert_eq!(sqls.len(), 2, "expected DELETE + INSERT, got: {sqls:?}");
+    assert!(sqls[0].starts_with("DELETE FROM users"), "first SQL should be DELETE: {}", sqls[0]);
+    assert!(sqls[1].contains("INSERT INTO users_audit"), "second SQL should be audit INSERT: {}", sqls[1]);
+
+    // Verify row_data contains the old email
+    let params = db.executed_params();
+    let row_data = match &params[1][2] {
+        Value::String(s) => s.clone(),
+        other => panic!("expected String row_data, got {other:?}"),
+    };
+    assert!(row_data.contains("alice@example.com"), "row_data should contain old email: {row_data}");
+}
+
+#[tokio::test]
+async fn audited_delete_no_rows_no_audit_insert() {
+    let db = MockDb::new();
+    // SELECT returns empty — nothing to delete
+    db.push_rows(vec![]);
+
+    let ctx = AuditContext { actor_id: Some(1) };
+    let builder = AuditUser::delete().filter(AuditUser::id.eq(999i64));
+
+    reify::audited_delete::<AuditUser>(&db, builder, &ctx).await.unwrap();
+
+    let sqls = db.executed_sql();
+    // Only the DELETE — no audit INSERT since no rows were captured
+    assert_eq!(sqls.len(), 1, "expected only DELETE, got: {sqls:?}");
+    assert!(sqls[0].starts_with("DELETE FROM users"), "{}", sqls[0]);
+}
+
+// ── Compile-time guard: Product does NOT implement Auditable ─────────
+// The following would fail to compile if uncommented:
+//
+// fn _assert_product_not_auditable() {
+//     fn requires_auditable<T: Auditable>() {}
+//     requires_auditable::<Product>();
+// }

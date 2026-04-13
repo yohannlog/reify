@@ -292,6 +292,7 @@ struct ParsedIndex {
 struct TableAttr {
     name: String,
     indexes: Vec<ParsedIndex>,
+    audit: bool,
 }
 
 fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -487,6 +488,23 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let all_index_tokens = single_index_tokens.chain(composite_index_tokens);
 
+    // ── Optional Auditable impl ─────────────────────────────────────
+    let audit_impl = if table_attr.audit {
+        let audit_table_name = format!("{}_audit", table_name);
+        quote! {
+            impl reify_core::audit::Auditable for #struct_name {
+                fn audit_table_name() -> &'static str {
+                    #audit_table_name
+                }
+                fn audit_column_defs() -> Vec<reify_core::schema::ColumnDef> {
+                    reify_core::audit::audit_column_defs_for(#audit_table_name)
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         // ── Table trait impl ────────────────────────────────────────
         impl reify_core::Table for #struct_name {
@@ -542,7 +560,7 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
-    Ok(quote! { #expanded })
+    Ok(quote! { #expanded #audit_impl })
 }
 
 /// Parse `#[table(name = "users", index(...), ...)]`
@@ -554,6 +572,7 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
 
         let mut table_name = None;
         let mut indexes = Vec::new();
+        let mut audit = false;
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
@@ -562,6 +581,8 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                 if let Lit::Str(s) = lit {
                     table_name = Some(s.value());
                 }
+            } else if meta.path.is_ident("audit") {
+                audit = true;
             } else if meta.path.is_ident("index") {
                 let mut columns = Vec::new();
                 let mut unique = false;
@@ -607,7 +628,7 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
         })?;
 
         if let Some(name) = table_name {
-            return Ok(TableAttr { name, indexes });
+            return Ok(TableAttr { name, indexes, audit });
         }
     }
     Err(syn::Error::new(
