@@ -15,6 +15,7 @@ pub mod schema;
 pub mod sql;
 pub mod table;
 pub mod value;
+pub mod view;
 
 pub use tracing;
 
@@ -32,8 +33,9 @@ pub use table::Table;
 pub use value::Value;
 
 pub use schema::{
-    table, ColumnBuilder, ColumnDef, ComputedColumn, IndexBuilder, IndexDef, IndexKind, Schema,
-    SqlType, TableSchema, TimestampKind, TimestampSource,
+    table, ColumnBuilder, ColumnDef, ComputedColumn, HasTimestamp, IndexBuilder, IndexColumnDef,
+    IndexDef, IndexKind, NoTimestamp, Schema, SortDirection, SqlType, TableSchema, TimestampKind,
+    TimestampSource, TimestampState,
 };
 
 pub use paginate::{
@@ -49,7 +51,8 @@ pub use db::{delete_returning, insert_many_returning, insert_returning, update_r
 pub use migration::{
     ColumnDiff, DbColumnInfo, Migration, MigrationContext, MigrationError, MigrationPlan,
     MigrationRunner, MigrationStatus, SchemaDiff, TableDiff, create_table_sql,
-    generate_migration_file, normalize_sql_type,
+    create_table_sql_with_checks, generate_migration_file, generate_view_migration_file,
+    normalize_sql_type,
 };
 
 pub use rls::{
@@ -64,3 +67,8 @@ pub use audit::{
 pub use enumeration::{DbEnum, enum_from_value};
 
 pub use range::{Bound, Range, RangeElement};
+
+pub use view::{
+    View, ViewDef, ViewQuery, ViewSchema, ViewSchemaDef, create_view_sql, drop_view_sql,
+    view as view_schema,
+};

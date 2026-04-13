@@ -1,0 +1,28 @@
+error[E0277]: the trait bound `std::string::String: Temporal` is not satisfied
+  --> tests/compile_fail/creation_timestamp_on_string.rs:13:30
+   |
+13 |         .column(EMAIL, |c| c.creation_timestamp());
+   |                              ^^^^^^^^^^^^^^^^^^ the trait `Temporal` is not implemented for `std::string::String`
+   |
+help: the following other types implement trait `Temporal`
+  --> $WORKSPACE/reify-core/src/column.rs
+   |
+   | impl Temporal for chrono::NaiveDateTime {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `chrono::naive::datetime::NaiveDateTime`
+   | #[cfg(any(feature = "postgres", feature = "mysql"))]
+   | impl Temporal for chrono::NaiveDate {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `chrono::naive::date::NaiveDate`
+   | #[cfg(any(feature = "postgres", feature = "mysql"))]
+   | impl Temporal for chrono::NaiveTime {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `chrono::naive::time::NaiveTime`
+   | #[cfg(feature = "postgres")]
+   | impl Temporal for chrono::DateTime<chrono::Utc> {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `chrono::datetime::DateTime<chrono::offset::utc::Utc>`
+note: required by a bound in `ColumnBuilder::<T, S>::creation_timestamp`
+  --> $WORKSPACE/reify-core/src/schema.rs
+   |
+   |     pub fn creation_timestamp(mut self) -> ColumnBuilder<T, HasTimestamp>
+   |            ------------------ required by a bound in this associated function
+   |     where
+   |         T: crate::column::Temporal,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ColumnBuilder::<T, S>::creation_timestamp`

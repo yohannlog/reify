@@ -280,8 +280,13 @@ pub fn derive_db_enum(input: TokenStream) -> TokenStream {
 
 // ── Parsed index from #[table(index(...))] ──────────────────────────
 
+struct ParsedIndexColumn {
+    name: String,
+    desc: bool,
+}
+
 struct ParsedIndex {
-    columns: Vec<String>,
+    columns: Vec<ParsedIndexColumn>,
     unique: bool,
     name: Option<String>,
     predicate: Option<String>,
@@ -367,8 +372,7 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let (is_option, inner_ty) = unwrap_option_type(ty);
         let is_nullable = col_attrs.nullable || is_option;
         let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
-            let custom_str: &str = custom;
-            quote! { reify_core::schema::SqlType::Custom(#custom_str) }
+            parse_sql_type_string(custom)
         } else if col_attrs.primary_key && col_attrs.auto_increment {
             quote! { reify_core::schema::SqlType::BigSerial }
         } else {
@@ -411,6 +415,11 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             quote! { reify_core::schema::TimestampSource::Vm }
         };
 
+        let check_token = match &col_attrs.check {
+            Some(expr) => quote! { Some(#expr.to_string()) },
+            None => quote! { None },
+        };
+
         col_defs_tokens.push(quote! {
             reify_core::schema::ColumnDef {
                 name: #name_str,
@@ -424,6 +433,7 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 computed: #computed_token,
                 timestamp_kind: #timestamp_kind_token,
                 timestamp_source: #timestamp_source_token,
+                check: #check_token,
             }
         });
     }
@@ -450,23 +460,35 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         quote! {
             reify_core::IndexDef {
                 name: Some(#auto_name.to_string()),
-                columns: vec![#col_name],
+                columns: vec![reify_core::IndexColumnDef::asc(#col_name)],
                 unique: false,
                 kind: reify_core::IndexKind::BTree,
-                  predicate: None,
+                predicate: None,
             }
         }
     });
 
     // Generate IndexDef tokens for composite indexes from #[table(index(...))]
     let composite_index_tokens = table_attr.indexes.iter().map(|idx| {
-        let cols = &idx.columns;
+        let col_tokens: Vec<_> = idx
+            .columns
+            .iter()
+            .map(|c| {
+                let name = &c.name;
+                if c.desc {
+                    quote! { reify_core::IndexColumnDef::desc(#name) }
+                } else {
+                    quote! { reify_core::IndexColumnDef::asc(#name) }
+                }
+            })
+            .collect();
+        let col_names: Vec<&str> = idx.columns.iter().map(|c| c.name.as_str()).collect();
         let unique = idx.unique;
         let name_token = match &idx.name {
             Some(n) => quote! { Some(#n.to_string()) },
             None => {
                 let sep = "_";
-                let auto_name = format!("idx_{}_{}", table_name, cols.join(sep));
+                let auto_name = format!("idx_{}_{}", table_name, col_names.join(sep));
                 quote! { Some(#auto_name.to_string()) }
             }
         };
@@ -477,8 +499,8 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
         quote! {
             reify_core::IndexDef {
-                  name: #name_token,
-                columns: vec![#(#cols),*],
+                name: #name_token,
+                columns: vec![#(#col_tokens),*],
                 unique: #unique,
                 kind: reify_core::IndexKind::BTree,
                 predicate: #predicate_token,
@@ -596,7 +618,22 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                         let lits = content.parse_terminated(Lit::parse, syn::Token![,])?;
                         for lit in lits {
                             if let Lit::Str(s) = lit {
-                                columns.push(s.value());
+                                let val = s.value();
+                                // Support "col_name desc" or "col_name asc" syntax
+                                let (name, desc) = if let Some(base) = val
+                                    .strip_suffix(" desc")
+                                    .or_else(|| val.strip_suffix(" DESC"))
+                                {
+                                    (base.to_string(), true)
+                                } else if let Some(base) = val
+                                    .strip_suffix(" asc")
+                                    .or_else(|| val.strip_suffix(" ASC"))
+                                {
+                                    (base.to_string(), false)
+                                } else {
+                                    (val, false)
+                                };
+                                columns.push(ParsedIndexColumn { name, desc });
                             }
                         }
                     } else if inner.path.is_ident("unique") {
@@ -628,7 +665,11 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
         })?;
 
         if let Some(name) = table_name {
-            return Ok(TableAttr { name, indexes, audit });
+            return Ok(TableAttr {
+                name,
+                indexes,
+                audit,
+            });
         }
     }
     Err(syn::Error::new(
@@ -779,6 +820,8 @@ struct ColumnAttrs {
     update_timestamp: bool,
     /// Source of the current date: `"vm"` (default) or `"db"`.
     timestamp_source: Option<String>,
+    /// SQL CHECK constraint expression.
+    check: Option<String>,
 }
 
 /// Parse `#[column(...)]` attributes using proper `syn` parsing.
@@ -828,6 +871,12 @@ fn parse_column_attrs(attrs: &[Attribute]) -> ColumnAttrs {
                 let lit: Lit = value.parse()?;
                 if let Lit::Str(s) = lit {
                     result.timestamp_source = Some(s.value());
+                }
+            } else if meta.path.is_ident("check") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.check = Some(s.value());
                 }
             }
             Ok(())
@@ -984,4 +1033,266 @@ fn rust_type_to_sql_type(ty: &syn::Type) -> proc_macro2::TokenStream {
         // Fallback
         _ => quote! { reify_core::schema::SqlType::Text },
     }
+}
+
+/// Parse a `sql_type = "..."` attribute string into the corresponding `SqlType` variant.
+///
+/// Recognises parameterized types like `VARCHAR(255)`, `CHAR(36)`, `DECIMAL(10,2)`,
+/// `NUMERIC(10,2)` (case-insensitive) and emits the proper enum variant instead of
+/// falling back to `SqlType::Custom`.
+fn parse_sql_type_string(s: &str) -> proc_macro2::TokenStream {
+    let upper = s.trim().to_uppercase();
+
+    // Try VARCHAR(N)
+    if let Some(inner) = upper
+        .strip_prefix("VARCHAR(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        if let Ok(len) = inner.trim().parse::<u32>() {
+            return quote! { reify_core::schema::SqlType::Varchar(#len) };
+        }
+    }
+
+    // Try CHAR(N)
+    if let Some(inner) = upper
+        .strip_prefix("CHAR(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        if let Ok(len) = inner.trim().parse::<u32>() {
+            return quote! { reify_core::schema::SqlType::Char(#len) };
+        }
+    }
+
+    // Try DECIMAL(P,S) or NUMERIC(P,S)
+    let decimal_inner = upper
+        .strip_prefix("DECIMAL(")
+        .or_else(|| upper.strip_prefix("NUMERIC("))
+        .and_then(|r| r.strip_suffix(')'));
+    if let Some(inner) = decimal_inner {
+        let parts: Vec<&str> = inner.split(',').collect();
+        if parts.len() == 2 {
+            if let (Ok(p), Ok(sc)) = (parts[0].trim().parse::<u8>(), parts[1].trim().parse::<u8>())
+            {
+                return quote! { reify_core::schema::SqlType::Decimal(#p, #sc) };
+            }
+        }
+    }
+
+    // Fallback: Custom
+    quote! { reify_core::schema::SqlType::Custom(#s) }
+}
+
+// ── #[derive(View)] ─────────────────────────────────────────────────
+
+/// Derive macro that implements `View` (and a minimal `Table`) for read-only
+/// SQL views, plus typed column constants and a `find()` query builder.
+///
+/// # Usage
+///
+/// ```ignore
+/// #[derive(View, Debug, Clone)]
+/// #[view(name = "active_users", query = "SELECT id, email FROM users WHERE deleted_at IS NULL")]
+/// pub struct ActiveUser {
+///     pub id: i64,
+///     pub email: String,
+/// }
+///
+/// // Read-only query builder
+/// let (sql, params) = ActiveUser::find()
+///     .filter(ActiveUser::email.ends_with("@corp.io"))
+///     .build();
+/// ```
+///
+/// The `query` attribute is optional — you can define the query via the
+/// `ViewSchemaDef` trait or `ViewSchema` builder instead.
+#[proc_macro_derive(View, attributes(view, column))]
+pub fn derive_view(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match impl_view(&input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+// ── Parsed view attribute ───────────────────────────────────────────
+
+struct ViewAttr {
+    name: String,
+    query: Option<String>,
+}
+
+/// Parse `#[view(name = "...", query = "...")]`
+fn parse_view_attr(attrs: &[Attribute]) -> syn::Result<ViewAttr> {
+    for attr in attrs {
+        if !attr.path().is_ident("view") {
+            continue;
+        }
+
+        let mut view_name = None;
+        let mut query = None;
+
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    view_name = Some(s.value());
+                }
+            } else if meta.path.is_ident("query") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    query = Some(s.value());
+                }
+            }
+            Ok(())
+        })?;
+
+        if let Some(name) = view_name {
+            return Ok(ViewAttr { name, query });
+        }
+    }
+    Err(syn::Error::new(
+        proc_macro2::Span::call_site(),
+        r#"Missing #[view(name = "...")] attribute"#,
+    ))
+}
+
+fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let struct_name = &input.ident;
+
+    let view_attr = parse_view_attr(&input.attrs)?;
+    let view_name = &view_attr.name;
+
+    // Extract fields
+    let fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(named) => &named.named,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "View derive requires named fields",
+                ))
+            }
+        },
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "View derive only works on structs",
+            ))
+        }
+    };
+
+    let mut col_names = Vec::new();
+    let mut col_idents = Vec::new();
+    let mut col_types = Vec::new();
+    let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    for field in fields.iter() {
+        let ident = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+        let name_str = ident.to_string();
+
+        col_names.push(name_str.clone());
+        col_idents.push(ident.clone());
+        col_types.push(ty.clone());
+
+        let col_attrs = parse_column_attrs(&field.attrs);
+        let (is_option, inner_ty) = unwrap_option_type(ty);
+        let is_nullable = col_attrs.nullable || is_option;
+        let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
+            parse_sql_type_string(custom)
+        } else {
+            rust_type_to_sql_type(inner_ty)
+        };
+
+        col_defs_tokens.push(quote! {
+            reify_core::schema::ColumnDef {
+                name: #name_str,
+                sql_type: #sql_type_token,
+                primary_key: false,
+                auto_increment: false,
+                unique: false,
+                index: false,
+                nullable: #is_nullable,
+                default: None,
+                computed: None,
+                timestamp_kind: None,
+                timestamp_source: reify_core::schema::TimestampSource::Vm,
+                check: None,
+            }
+        });
+    }
+
+    let col_name_strs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+    let num_cols = col_names.len();
+
+    // Generate Column constants
+    let column_consts =
+        col_idents
+            .iter()
+            .zip(col_types.iter())
+            .zip(col_names.iter())
+            .map(|((ident, ty), name)| {
+                quote! {
+                    #[allow(non_upper_case_globals)]
+                    pub const #ident: reify_core::Column<#struct_name, #ty> = reify_core::Column::new(#name);
+                }
+            });
+
+    // View query — from attribute or empty (set via ViewSchemaDef)
+    let view_query_impl = if let Some(ref query) = view_attr.query {
+        quote! {
+            fn view_query() -> reify_core::view::ViewQuery {
+                reify_core::view::ViewQuery::Raw(#query.to_string())
+            }
+        }
+    } else {
+        quote! {
+            fn view_query() -> reify_core::view::ViewQuery {
+                reify_core::view::ViewQuery::Raw(String::new())
+            }
+        }
+    };
+
+    Ok(quote! {
+        // ── Minimal Table impl (views use table_name = view_name for SelectBuilder) ──
+        impl reify_core::Table for #struct_name {
+            fn table_name() -> &'static str {
+                #view_name
+            }
+
+            fn column_names() -> &'static [&'static str] {
+                static COLS: [&str; #num_cols] = [#(#col_name_strs),*];
+                &COLS
+            }
+
+            fn into_values(&self) -> Vec<reify_core::Value> {
+                vec![] // Views are read-only
+            }
+
+            fn column_defs() -> Vec<reify_core::schema::ColumnDef> {
+                vec![#(#col_defs_tokens),*]
+            }
+        }
+
+        // ── View trait impl ────────────────────────────────────────────
+        impl reify_core::view::View for #struct_name {
+            fn view_name() -> &'static str {
+                #view_name
+            }
+
+            #view_query_impl
+        }
+
+        // ── Column constants + read-only query builder ─────────────────
+        impl #struct_name {
+            #(#column_consts)*
+
+            /// Read-only query builder for this view.
+            pub fn find() -> reify_core::SelectBuilder<#struct_name> {
+                reify_core::SelectBuilder::new()
+            }
+        }
+    })
 }

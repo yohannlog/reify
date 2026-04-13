@@ -46,8 +46,14 @@ pub struct MigrationContext {
 }
 
 impl MigrationContext {
-    fn new() -> Self {
+    /// Create a new, empty migration context.
+    pub fn new() -> Self {
         Self { statements: Vec::new() }
+    }
+
+    /// Return the accumulated SQL statements.
+    pub fn statements(&self) -> &[String] {
+        &self.statements
     }
 
     /// Add a column to an existing table.
@@ -79,6 +85,24 @@ impl MigrationContext {
     /// Use `?` as the placeholder character.
     pub fn execute(&mut self, sql: impl Into<String>) {
         self.statements.push(sql.into());
+    }
+
+    /// Create or replace a SQL view.
+    ///
+    /// ```ignore
+    /// ctx.create_view("active_users", "SELECT id, email FROM users WHERE deleted_at IS NULL");
+    /// ```
+    pub fn create_view(&mut self, name: &str, query: &str) {
+        self.statements.push(crate::view::create_view_sql(name, query));
+    }
+
+    /// Drop a SQL view if it exists.
+    ///
+    /// ```ignore
+    /// ctx.drop_view("active_users");
+    /// ```
+    pub fn drop_view(&mut self, name: &str) {
+        self.statements.push(crate::view::drop_view_sql(name));
     }
 }
 
@@ -303,9 +327,15 @@ impl SchemaDiff {
 /// - `"BOOL"` → `"boolean"`
 pub fn normalize_sql_type(raw: &str) -> String {
     let lower = raw.trim().to_lowercase();
-    // Strip trailing parenthesised precision/length, e.g. "varchar(255)" → "varchar"
-    let base = lower.split('(').next().unwrap_or(&lower).trim();
-    match base {
+    // Split base type from parenthesised params, e.g. "varchar(255)" → ("varchar", Some("255"))
+    let (base, params) = match lower.find('(') {
+        Some(idx) => (
+            lower[..idx].trim(),
+            Some(lower[idx..].trim().to_string()),
+        ),
+        None => (lower.as_str(), None),
+    };
+    let normalized_base = match base {
         // Serial / auto-increment shorthands
         "serial" | "serial4" => "integer",
         "bigserial" | "serial8" => "bigint",
@@ -314,9 +344,11 @@ pub fn normalize_sql_type(raw: &str) -> String {
         "int" | "int4" | "integer" => "integer",
         "int8" | "bigint" => "bigint",
         "int2" | "smallint" => "smallint",
-        // Character aliases
+        // Character aliases — preserve params
         "character varying" | "varchar" => "varchar",
         "character" | "char" => "char",
+        // Numeric aliases — normalize both to "numeric", preserve params
+        "decimal" | "numeric" => "numeric",
         // Boolean aliases
         "bool" | "boolean" => "boolean",
         // Float aliases
@@ -326,9 +358,19 @@ pub fn normalize_sql_type(raw: &str) -> String {
         "timestamp without time zone" | "timestamp" => "timestamp",
         "timestamp with time zone" | "timestamptz" => "timestamptz",
         // Pass through anything else unchanged
-        other => return other.to_string(),
+        other => return match params {
+            Some(p) => format!("{other}{p}"),
+            None => other.to_string(),
+        },
+    };
+    // Preserve params for types where precision/length matters
+    match normalized_base {
+        "varchar" | "char" | "numeric" => match params {
+            Some(p) => format!("{normalized_base}{p}"),
+            None => normalized_base.to_string(),
+        },
+        _ => normalized_base.to_string(),
     }
-    .to_string()
 }
 
 // ── DDL generation ───────────────────────────────────────────────────
@@ -372,8 +414,8 @@ pub fn create_table_sql<T: Table>(
         // Type — from metadata, not from column name heuristics
         let sql_type = def
             .map(|d| d.sql_type.to_sql(dialect))
-            .unwrap_or("TEXT");
-        parts.push(sql_type.into());
+            .unwrap_or(std::borrow::Cow::Borrowed("TEXT"));
+        parts.push(sql_type.into_owned());
 
         // DB-generated computed column: GENERATED ALWAYS AS (expr) STORED
         if let Some(ComputedColumn::Stored(expr)) = computed {
@@ -407,6 +449,11 @@ pub fn create_table_sql<T: Table>(
             } else if let Some(dv) = default_val {
                 parts.push(format!("DEFAULT {dv}"));
             }
+
+            // Column-level CHECK constraint
+            if let Some(check_expr) = def.and_then(|d| d.check.as_deref()) {
+                parts.push(format!("CHECK ({check_expr})"));
+            }
         }
 
         col_lines.push(parts.join(" "));
@@ -416,6 +463,32 @@ pub fn create_table_sql<T: Table>(
         "CREATE TABLE IF NOT EXISTS {table} (\n{}\n);",
         col_lines.join(",\n")
     )
+}
+
+/// Generate a `CREATE TABLE IF NOT EXISTS` statement with optional table-level
+/// CHECK constraints (from `TableSchema.checks`).
+///
+/// Column-level CHECK constraints are rendered inline by `create_table_sql`;
+/// this function additionally appends table-level CHECK lines after all columns.
+pub fn create_table_sql_with_checks<T: Table>(
+    column_defs: &[crate::schema::ColumnDef],
+    checks: &[String],
+    dialect: crate::query::Dialect,
+) -> String {
+    if checks.is_empty() {
+        return create_table_sql::<T>(column_defs, dialect);
+    }
+
+    // Build the base DDL (without the closing ");") and append table-level checks
+    let base = create_table_sql::<T>(column_defs, dialect);
+    // Strip trailing "\n);" to append more lines
+    let trimmed = base.trim_end_matches("\n);");
+    let mut result = trimmed.to_string();
+    for check in checks {
+        result.push_str(&format!(",\n    CHECK ({check})"));
+    }
+    result.push_str("\n);");
+    result
 }
 
 /// Generate a `CREATE TABLE IF NOT EXISTS` statement from an explicit table name
@@ -433,7 +506,7 @@ pub(crate) fn create_table_sql_named(
         let mut parts: Vec<String> = vec![format!("    {}", def.name)];
 
         let sql_type = def.sql_type.to_sql(dialect);
-        parts.push(sql_type.into());
+        parts.push(sql_type.into_owned());
 
         if def.primary_key {
             parts.push("PRIMARY KEY".into());
@@ -452,6 +525,11 @@ pub(crate) fn create_table_sql_named(
             parts.push(default_now.into());
         } else if let Some(ref dv) = def.default {
             parts.push(format!("DEFAULT {dv}"));
+        }
+
+        // Column-level CHECK constraint
+        if let Some(ref check_expr) = def.check {
+            parts.push(format!("CHECK ({check_expr})"));
         }
 
         col_lines.push(parts.join(" "));
@@ -478,7 +556,8 @@ pub fn add_column_sql(
         if let Some(ComputedColumn::Stored(expr)) = &d.computed {
             let sql_type = d.sql_type.to_sql(dialect);
             return format!(
-                "ALTER TABLE {table} ADD COLUMN {column} {sql_type} GENERATED ALWAYS AS ({expr}) STORED;"
+                "ALTER TABLE {table} ADD COLUMN {column} {} GENERATED ALWAYS AS ({expr}) STORED;",
+                &*sql_type
             );
         }
     }
@@ -486,10 +565,10 @@ pub fn add_column_sql(
     let is_nullable = def.map(|d| d.nullable).unwrap_or(false);
     let sql_type = def
         .map(|d| d.sql_type.to_sql(dialect))
-        .unwrap_or("TEXT");
+        .unwrap_or(std::borrow::Cow::Borrowed("TEXT"));
     let null_clause = if is_nullable { "" } else { " NOT NULL" };
     let default_clause = if !is_nullable {
-        format!(" DEFAULT {}", default_for_type(sql_type))
+        format!(" DEFAULT {}", default_for_type(&sql_type))
     } else {
         String::new()
     };
@@ -497,6 +576,12 @@ pub fn add_column_sql(
 }
 
 fn default_for_type(ty: &str) -> &'static str {
+    if ty.starts_with("DECIMAL") || ty.starts_with("NUMERIC") {
+        return "0";
+    }
+    if ty.starts_with("VARCHAR") || ty.starts_with("CHAR(") {
+        return "''";
+    }
     match ty {
         "BIGINT" | "INTEGER" | "SMALLINT" | "NUMERIC" | "BIGSERIAL" | "SERIAL" => "0",
         "BOOLEAN" => "FALSE",
@@ -527,6 +612,15 @@ struct TableEntry {
     create_sql: String,
 }
 
+// ── ViewEntry — auto-diff entry for views ───────────────────────────
+
+/// An entry registered via `MigrationRunner::add_view::<V>()`.
+struct ViewEntry {
+    view_name: &'static str,
+    /// The SELECT query that defines this view.
+    query: String,
+}
+
 // ── MigrationRunner ──────────────────────────────────────────────────
 
 /// Orchestrates automatic diff-based migrations and manual `Migration` impls.
@@ -537,19 +631,21 @@ struct TableEntry {
 /// MigrationRunner::new()
 ///     .add_table::<User>()      // auto CREATE TABLE / ADD COLUMN
 ///     .add_table::<Post>()
+///     .add_view::<ActiveUser>() // auto CREATE OR REPLACE VIEW
 ///     .add(SplitAddress)        // manual migration
 ///     .run(&db)
 ///     .await?;
 /// ```
 pub struct MigrationRunner {
     tables: Vec<TableEntry>,
+    views: Vec<ViewEntry>,
     manual: Vec<Box<dyn Migration>>,
 }
 
 impl MigrationRunner {
     /// Create a new, empty runner.
     pub fn new() -> Self {
-        Self { tables: Vec::new(), manual: Vec::new() }
+        Self { tables: Vec::new(), views: Vec::new(), manual: Vec::new() }
     }
 
     /// Register a `Table` type for automatic diff-based migration.
@@ -581,6 +677,7 @@ impl MigrationRunner {
                         computed: None,
                         timestamp_kind: None,
                         timestamp_source: crate::schema::TimestampSource::Vm,
+                        check: None,
                     })
                     .collect()
             } else {
@@ -604,7 +701,11 @@ impl MigrationRunner {
     where
         T: Table,
     {
-        let create_sql = create_table_sql::<T>(&schema.columns, crate::query::Dialect::Generic);
+        let create_sql = create_table_sql_with_checks::<T>(
+            &schema.columns,
+            &schema.checks,
+            crate::query::Dialect::Generic,
+        );
         self.tables.push(TableEntry {
             table_name: T::table_name(),
             column_names: T::column_names(),
@@ -913,6 +1014,33 @@ impl MigrationRunner {
         Ok(plans)
     }
 
+    /// Build the list of view plans (CREATE OR REPLACE VIEW).
+    fn view_plans(
+        &self,
+        applied: &std::collections::HashSet<String>,
+    ) -> Vec<MigrationPlan> {
+        let mut plans = Vec::new();
+
+        for entry in &self.views {
+            let version = format!("auto_view__{}", entry.view_name);
+
+            // Views use CREATE OR REPLACE, so we always emit the statement
+            // to keep the view definition in sync. But we only track it once.
+            if applied.contains(&version) {
+                continue;
+            }
+
+            plans.push(MigrationPlan {
+                version,
+                description: format!("Create view {}", entry.view_name),
+                statements: vec![crate::view::create_view_sql(entry.view_name, &entry.query)],
+                is_up: true,
+            });
+        }
+
+        plans
+    }
+
     /// Build plans for pending manual migrations.
     fn manual_plans(
         &self,
@@ -995,8 +1123,8 @@ impl MigrationRunner {
                                     // Type check: use metadata sql_type, falling back to TEXT.
                                     let raw_type = def
                                         .map(|d| d.sql_type.to_sql(crate::query::Dialect::Generic))
-                                        .unwrap_or("TEXT");
-                                    let struct_type = normalize_sql_type(raw_type);
+                                        .unwrap_or(std::borrow::Cow::Borrowed("TEXT"));
+                                    let struct_type = normalize_sql_type(&raw_type);
                                     if struct_type != db_col.data_type {
                                         diffs.push(ColumnDiff::TypeChanged {
                                             column: col_name.to_string(),
@@ -1066,16 +1194,25 @@ impl MigrationRunner {
         Ok(SchemaDiff { tables: table_diffs })
     }
 
-    /// Apply all pending migrations (auto-diff + manual) against the database.
+    /// Apply all pending migrations (auto-diff + manual + views) against the database.
     ///
     /// Creates the `_reify_migrations` tracking table if it doesn't exist.
     pub async fn run(&self, db: &impl Database) -> Result<(), MigrationError> {
         self.ensure_tracking_table(db).await?;
             let applied = self.applied_versions(db).await?;
 
-            // Auto-diff plans
+            // Auto-diff plans (tables)
             let auto_plans = self.auto_diff_plans(db, &applied).await?;
             for plan in &auto_plans {
+                for stmt in &plan.statements {
+                    db.execute(stmt, &[]).await?;
+                }
+                self.mark_applied(db, &plan.version, &plan.description).await?;
+            }
+
+            // View plans (after tables, since views may reference them)
+            let view_plans = self.view_plans(&applied);
+            for plan in &view_plans {
                 for stmt in &plan.statements {
                     db.execute(stmt, &[]).await?;
                 }
@@ -1105,6 +1242,9 @@ impl MigrationRunner {
         let applied = self.applied_versions(db).await?;
 
         let mut plans = self.auto_diff_plans(db, &applied).await?;
+
+        // View plans
+        plans.extend(self.view_plans(&applied));
 
         for (plan, _) in self.manual_plans(&applied) {
             plans.push(plan);
@@ -1240,6 +1380,17 @@ impl MigrationRunner {
             });
         }
 
+        // View entries
+        for entry in &self.views {
+            let version = format!("auto_view__{}", entry.view_name);
+            statuses.push(MigrationStatus {
+                version: version.clone(),
+                description: format!("Auto-manage view {}", entry.view_name),
+                applied: applied.contains(&version),
+                is_auto: true,
+            });
+        }
+
         // Manual migrations
         for m in &self.manual {
             statuses.push(MigrationStatus {
@@ -1251,6 +1402,41 @@ impl MigrationRunner {
         }
 
         Ok(statuses)
+    }
+
+    /// Register a `View` type for automatic migration.
+    ///
+    /// Emits `CREATE OR REPLACE VIEW` when the view hasn't been applied yet.
+    pub fn add_view<V: crate::view::View>(mut self) -> Self {
+        let query = match V::view_query() {
+            crate::view::ViewQuery::Raw(s) => s,
+            crate::view::ViewQuery::Typed { sql, .. } => sql,
+        };
+        self.views.push(ViewEntry {
+            view_name: V::view_name(),
+            query,
+        });
+        self
+    }
+
+    /// Register a view with explicit `ViewSchema` metadata.
+    pub fn add_view_with_schema<V: crate::view::View>(
+        mut self,
+        schema: crate::view::ViewSchema<V>,
+    ) -> Self {
+        let query = schema
+            .query_sql()
+            .unwrap_or_else(|| {
+                match V::view_query() {
+                    crate::view::ViewQuery::Raw(s) => s,
+                    crate::view::ViewQuery::Typed { sql, .. } => sql,
+                }
+            });
+        self.views.push(ViewEntry {
+            view_name: V::view_name(),
+            query,
+        });
+        self
     }
 }
 
@@ -1322,6 +1508,48 @@ impl Migration for {struct_name} {{
 
     fn down(&self, ctx: &mut MigrationContext) {{
         todo!("implement down migration")
+    }}
+}}
+"#
+    )
+}
+
+/// Generate the content of a new **view** migration file from a name.
+///
+/// Used by `reify new --view <name>`.
+pub fn generate_view_migration_file(name: &str, version: &str) -> String {
+    let struct_name: String = name
+        .split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect();
+
+    format!(
+        r#"// Generated by: reify new --view {name}
+use reify::{{Migration, MigrationContext}};
+
+pub struct {struct_name};
+
+impl Migration for {struct_name} {{
+    fn version(&self) -> &'static str {{
+        "{version}"
+    }}
+
+    fn description(&self) -> &'static str {{
+        "Create view {name}"
+    }}
+
+    fn up(&self, ctx: &mut MigrationContext) {{
+        ctx.create_view("{name}", "SELECT ... FROM ... WHERE ...");
+    }}
+
+    fn down(&self, ctx: &mut MigrationContext) {{
+        ctx.drop_view("{name}");
     }}
 }}
 "#
@@ -1417,6 +1645,7 @@ mod tests {
                     computed: None,
                     timestamp_kind: None,
                     timestamp_source: crate::schema::TimestampSource::Vm,
+                    check: None,
                 },
                 crate::schema::ColumnDef {
                     name: "email",
@@ -1430,6 +1659,7 @@ mod tests {
                     computed: None,
                     timestamp_kind: None,
                     timestamp_source: crate::schema::TimestampSource::Vm,
+                    check: None,
                 },
                 crate::schema::ColumnDef {
                     name: "role",
@@ -1443,6 +1673,7 @@ mod tests {
                     computed: None,
                     timestamp_kind: None,
                     timestamp_source: crate::schema::TimestampSource::Vm,
+                    check: None,
                 },
             ]
         }
@@ -2029,6 +2260,7 @@ mod tests {
                 computed: None,
                 timestamp_kind: None,
                 timestamp_source: crate::schema::TimestampSource::Vm,
+                check: None,
             },
             crate::schema::ColumnDef {
                 name: "email",
@@ -2042,6 +2274,7 @@ mod tests {
                 computed: None,
                 timestamp_kind: None,
                 timestamp_source: crate::schema::TimestampSource::Vm,
+                check: None,
             },
         ];
         let sql = create_table_sql::<Users>(&defs, crate::query::Dialect::Postgres);
@@ -2050,5 +2283,93 @@ mod tests {
         assert!(sql.contains("email"));
         assert!(sql.contains("BIGSERIAL"));
         assert!(sql.contains("PRIMARY KEY"));
+    }
+
+    // ── View migration tests ────────────────────────────────────────
+
+    #[test]
+    fn migration_context_create_view() {
+        let mut ctx = MigrationContext::new();
+        ctx.create_view("active_users", "SELECT id, email FROM users WHERE deleted_at IS NULL");
+        assert_eq!(ctx.statements.len(), 1);
+        assert!(ctx.statements[0].contains("CREATE OR REPLACE VIEW active_users"));
+        assert!(ctx.statements[0].contains("SELECT id, email FROM users"));
+    }
+
+    #[test]
+    fn migration_context_drop_view() {
+        let mut ctx = MigrationContext::new();
+        ctx.drop_view("active_users");
+        assert_eq!(ctx.statements.len(), 1);
+        assert!(ctx.statements[0].contains("DROP VIEW IF EXISTS active_users"));
+    }
+
+    // Minimal View impl for tests
+    struct TestView;
+    impl Table for TestView {
+        fn table_name() -> &'static str { "active_users" }
+        fn column_names() -> &'static [&'static str] { &["id", "email"] }
+        fn into_values(&self) -> Vec<Value> { vec![] }
+    }
+    impl crate::view::View for TestView {
+        fn view_name() -> &'static str { "active_users" }
+        fn view_query() -> crate::view::ViewQuery {
+            crate::view::ViewQuery::Raw(
+                "SELECT id, email FROM users WHERE deleted_at IS NULL".into(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_view_emits_create_view() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+
+        let runner = MigrationRunner::new().add_view::<TestView>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version, "auto_view__active_users");
+        assert!(plans[0].statements[0].contains("CREATE OR REPLACE VIEW active_users"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_view_skips_already_applied() {
+        let db = MockDb::new();
+        let applied_row = Row::new(
+            vec!["version".into()],
+            vec![Value::String("auto_view__active_users".into())],
+        );
+        db.push_query_result(vec![applied_row]);
+
+        let runner = MigrationRunner::new().add_view::<TestView>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert!(plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_view_executes_create_view() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+
+        let runner = MigrationRunner::new().add_view::<TestView>();
+        runner.run(&db).await.unwrap();
+
+        let sql = db.executed_sql();
+        let has_create_view = sql.iter().any(|s| s.contains("CREATE OR REPLACE VIEW active_users"));
+        assert!(has_create_view, "expected CREATE VIEW in: {sql:?}");
+    }
+
+    #[test]
+    fn generate_view_migration_file_produces_valid_template() {
+        let content = generate_view_migration_file(
+            "active_users",
+            "20240320_000001_active_users",
+        );
+        assert!(content.contains("struct ActiveUsers"));
+        assert!(content.contains("impl Migration for ActiveUsers"));
+        assert!(content.contains("ctx.create_view(\"active_users\""));
+        assert!(content.contains("ctx.drop_view(\"active_users\""));
     }
 }

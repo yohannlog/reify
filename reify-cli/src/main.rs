@@ -10,7 +10,8 @@
 
 use clap::{Parser, Subcommand};
 use reify_core::migration::{
-    generate_migration_file, MigrationError, MigrationRunner, MigrationStatus,
+    generate_migration_file, generate_view_migration_file, MigrationError, MigrationRunner,
+    MigrationStatus,
 };
 
 // ── CLI definition ───────────────────────────────────────────────────
@@ -43,6 +44,9 @@ enum Commands {
         /// Output directory for the generated file (default: migrations/).
         #[arg(long, default_value = "migrations")]
         dir: String,
+        /// Generate a view migration template instead of a table migration.
+        #[arg(long)]
+        view: bool,
     },
     /// Roll back the last applied migration (or to a specific version).
     Rollback {
@@ -60,7 +64,7 @@ fn main() {
     match &cli.command {
         Commands::Migrate { dry_run } => cmd_migrate(*dry_run),
         Commands::Status => cmd_status(),
-        Commands::New { name, dir } => cmd_new(name, dir),
+        Commands::New { name, dir, view } => cmd_new(name, dir, *view),
         Commands::Rollback { to } => cmd_rollback(to.as_deref()),
     }
 }
@@ -106,19 +110,20 @@ fn cmd_status() {
     println!("  }}");
 }
 
-/// `reify new <name>`
-fn cmd_new(name: &str, dir: &str) {
+/// `reify new <name> [--view]`
+fn cmd_new(name: &str, dir: &str, view: bool) {
     use std::fs;
     use std::path::Path;
 
     // Generate a timestamp-based version string
     let now = chrono::Utc::now();
-    let version = format!(
-        "{}_000001_{name}",
-        now.format("%Y%m%d")
-    );
+    let version = format!("{}_000001_{name}", now.format("%Y%m%d"));
 
-    let content = generate_migration_file(name, &version);
+    let content = if view {
+        generate_view_migration_file(name, &version)
+    } else {
+        generate_migration_file(name, &version)
+    };
     let filename = format!("{version}.rs");
     let path = Path::new(dir).join(&filename);
 
@@ -132,9 +137,16 @@ fn cmd_new(name: &str, dir: &str) {
         Ok(()) => {
             println!("Created: {}", path.display());
             println!();
-            println!("Register it in your runner:");
-            println!("  .add({struct_name})",
-                struct_name = to_pascal_case(name));
+            if view {
+                println!("Register it in your runner:");
+                println!(
+                    "  .add_view::<{struct_name}>()",
+                    struct_name = to_pascal_case(name)
+                );
+            } else {
+                println!("Register it in your runner:");
+                println!("  .add({struct_name})", struct_name = to_pascal_case(name));
+            }
         }
         Err(e) => {
             eprintln!("error: could not write '{}': {e}", path.display());
@@ -194,7 +206,7 @@ mod tests {
     fn cmd_new_generates_file_in_temp_dir() {
         let dir = std::env::temp_dir().join("reify_cli_test");
         let dir_str = dir.to_str().unwrap();
-        cmd_new("test_migration", dir_str);
+        cmd_new("test_migration", dir_str, false);
         // Check that at least one .rs file was created
         let entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()

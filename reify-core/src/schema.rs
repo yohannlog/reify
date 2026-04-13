@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 use crate::column::Column;
@@ -27,6 +28,17 @@ pub enum SqlType {
     Boolean,
     /// `TEXT`
     Text,
+    /// `VARCHAR(n)` — variable-length string with a maximum length.
+    ///
+    /// Portable across all dialects. Prefer over `Custom("VARCHAR(255)")` for
+    /// cross-dialect DDL generation.
+    Varchar(u32),
+    /// `CHAR(n)` — fixed-length string.
+    Char(u32),
+    /// `DECIMAL(precision, scale)` / `NUMERIC(precision, scale)`.
+    ///
+    /// Renders as `NUMERIC(p,s)` on PostgreSQL, `DECIMAL(p,s)` elsewhere.
+    Decimal(u8, u8),
     /// `BYTEA` (Postgres) / `BLOB` (SQLite/MySQL)
     Bytea,
     /// `UUID` (Postgres) / `CHAR(36)` (MySQL) / `TEXT` (SQLite)
@@ -53,58 +65,67 @@ pub enum SqlType {
 
 impl SqlType {
     /// Render this type as a SQL string for the given dialect.
-    pub fn to_sql(&self, dialect: Dialect) -> &'static str {
+    ///
+    /// Returns `Cow::Borrowed` for fixed types (zero-alloc) and
+    /// `Cow::Owned` for parameterized types like `Varchar(255)`.
+    pub fn to_sql(&self, dialect: Dialect) -> Cow<'static, str> {
         match self {
-            SqlType::SmallInt => "SMALLINT",
-            SqlType::Integer => "INTEGER",
-            SqlType::BigInt => "BIGINT",
+            SqlType::SmallInt => Cow::Borrowed("SMALLINT"),
+            SqlType::Integer => Cow::Borrowed("INTEGER"),
+            SqlType::BigInt => Cow::Borrowed("BIGINT"),
             SqlType::Float => match dialect {
-                Dialect::Postgres => "REAL",
-                _ => "FLOAT",
+                Dialect::Postgres => Cow::Borrowed("REAL"),
+                _ => Cow::Borrowed("FLOAT"),
             },
             SqlType::Double => match dialect {
-                Dialect::Postgres => "DOUBLE PRECISION",
-                _ => "DOUBLE",
+                Dialect::Postgres => Cow::Borrowed("DOUBLE PRECISION"),
+                _ => Cow::Borrowed("DOUBLE"),
             },
-            SqlType::Numeric => "NUMERIC",
-            SqlType::Boolean => "BOOLEAN",
-            SqlType::Text => "TEXT",
+            SqlType::Numeric => Cow::Borrowed("NUMERIC"),
+            SqlType::Boolean => Cow::Borrowed("BOOLEAN"),
+            SqlType::Text => Cow::Borrowed("TEXT"),
+            SqlType::Varchar(len) => Cow::Owned(format!("VARCHAR({len})")),
+            SqlType::Char(len) => Cow::Owned(format!("CHAR({len})")),
+            SqlType::Decimal(p, s) => match dialect {
+                Dialect::Postgres => Cow::Owned(format!("NUMERIC({p},{s})")),
+                _ => Cow::Owned(format!("DECIMAL({p},{s})")),
+            },
             SqlType::Bytea => match dialect {
-                Dialect::Postgres => "BYTEA",
-                Dialect::Mysql => "LONGBLOB",
-                _ => "BLOB",
+                Dialect::Postgres => Cow::Borrowed("BYTEA"),
+                Dialect::Mysql => Cow::Borrowed("LONGBLOB"),
+                _ => Cow::Borrowed("BLOB"),
             },
             SqlType::Uuid => match dialect {
-                Dialect::Postgres => "UUID",
-                Dialect::Mysql => "CHAR(36)",
-                _ => "TEXT",
+                Dialect::Postgres => Cow::Borrowed("UUID"),
+                Dialect::Mysql => Cow::Borrowed("CHAR(36)"),
+                _ => Cow::Borrowed("TEXT"),
             },
             SqlType::Timestamptz => match dialect {
-                Dialect::Postgres => "TIMESTAMPTZ",
-                _ => "DATETIME",
+                Dialect::Postgres => Cow::Borrowed("TIMESTAMPTZ"),
+                _ => Cow::Borrowed("DATETIME"),
             },
             SqlType::Timestamp => match dialect {
-                Dialect::Postgres => "TIMESTAMP",
-                _ => "DATETIME",
+                Dialect::Postgres => Cow::Borrowed("TIMESTAMP"),
+                _ => Cow::Borrowed("DATETIME"),
             },
-            SqlType::Date => "DATE",
-            SqlType::Time => "TIME",
+            SqlType::Date => Cow::Borrowed("DATE"),
+            SqlType::Time => Cow::Borrowed("TIME"),
             SqlType::Jsonb => match dialect {
-                Dialect::Postgres => "JSONB",
-                Dialect::Mysql => "JSON",
-                _ => "TEXT",
+                Dialect::Postgres => Cow::Borrowed("JSONB"),
+                Dialect::Mysql => Cow::Borrowed("JSON"),
+                _ => Cow::Borrowed("TEXT"),
             },
             SqlType::BigSerial => match dialect {
-                Dialect::Postgres => "BIGSERIAL",
-                Dialect::Mysql => "BIGINT AUTO_INCREMENT",
-                _ => "INTEGER",
+                Dialect::Postgres => Cow::Borrowed("BIGSERIAL"),
+                Dialect::Mysql => Cow::Borrowed("BIGINT AUTO_INCREMENT"),
+                _ => Cow::Borrowed("INTEGER"),
             },
             SqlType::Serial => match dialect {
-                Dialect::Postgres => "SERIAL",
-                Dialect::Mysql => "INT AUTO_INCREMENT",
-                _ => "INTEGER",
+                Dialect::Postgres => Cow::Borrowed("SERIAL"),
+                Dialect::Mysql => Cow::Borrowed("INT AUTO_INCREMENT"),
+                _ => Cow::Borrowed("INTEGER"),
             },
-            SqlType::Custom(s) => s,
+            SqlType::Custom(s) => Cow::Borrowed(s),
         }
     }
 }
@@ -194,14 +215,59 @@ pub struct ColumnDef {
     pub timestamp_kind: Option<TimestampKind>,
     /// Where the timestamp value comes from (`Vm` or `Db`).
     pub timestamp_source: TimestampSource,
+    /// Optional SQL CHECK constraint expression.
+    ///
+    /// Rendered as `CHECK (expr)` inline after the column definition in DDL.
+    ///
+    /// ```ignore
+    /// .column(Product::price, |c| c.check("price >= 0"))
+    /// // → price DECIMAL(10,2) NOT NULL CHECK (price >= 0)
+    /// ```
+    pub check: Option<String>,
 }
+
+// ── Type-state for timestamp builder ────────────────────────────────
+
+/// Sealed trait for the timestamp state of a [`ColumnBuilder`].
+///
+/// Only [`NoTimestamp`] and [`HasTimestamp`] implement this trait.
+#[doc(hidden)]
+pub trait TimestampState: ts_state::Sealed {}
+
+mod ts_state {
+    #[doc(hidden)]
+    pub trait Sealed {}
+    impl Sealed for super::NoTimestamp {}
+    impl Sealed for super::HasTimestamp {}
+}
+
+/// Marker type: the column builder has not yet been configured as a timestamp.
+///
+/// This is the default state for [`ColumnBuilder`].
+pub struct NoTimestamp;
+
+/// Marker type: the column builder has been configured as a timestamp via
+/// [`.creation_timestamp()`](ColumnBuilder::creation_timestamp) or
+/// [`.update_timestamp()`](ColumnBuilder::update_timestamp).
+///
+/// Only in this state is [`.source_db()`](ColumnBuilder::source_db) available.
+pub struct HasTimestamp;
+
+impl TimestampState for NoTimestamp {}
+impl TimestampState for HasTimestamp {}
 
 /// Fluent builder for column attributes — fully autocompleted by rust-analyzer.
-pub struct ColumnBuilder {
+///
+/// `T` is the Rust type of the column field; `S` is the timestamp state
+/// ([`NoTimestamp`] or [`HasTimestamp`]).  Both parameters are inferred
+/// automatically — you never need to write them explicitly.
+pub struct ColumnBuilder<T, S: TimestampState = NoTimestamp> {
     def: ColumnDef,
+    _type: PhantomData<T>,
+    _state: PhantomData<S>,
 }
 
-impl ColumnBuilder {
+impl<T> ColumnBuilder<T, NoTimestamp> {
     fn new(name: &'static str) -> Self {
         Self {
             def: ColumnDef {
@@ -216,8 +282,23 @@ impl ColumnBuilder {
                 computed: None,
                 timestamp_kind: None,
                 timestamp_source: TimestampSource::Vm,
+                check: None,
             },
+            _type: PhantomData,
+            _state: PhantomData,
         }
+    }
+
+    /// Public constructor for use by `ViewSchema` and other builders.
+    pub fn new_pub(name: &'static str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl<T, S: TimestampState> ColumnBuilder<T, S> {
+    /// Consume the builder and return the `ColumnDef`.
+    pub fn build(self) -> ColumnDef {
+        self.def
     }
 
     /// Set the SQL type for this column.
@@ -276,34 +357,98 @@ impl ColumnBuilder {
 
     /// Mark as a creation timestamp — set once on INSERT.
     ///
-    /// By default uses `Vm` source (Rust-side `Utc::now()`). Chain
-    /// `.source_db()` to let the database provide the value instead.
+    /// Only available when `T: Temporal` (requires `postgres` or `mysql` feature).
+    /// Transitions the builder state to [`HasTimestamp`], enabling `.source_db()`.
     ///
     /// ```ignore
     /// .column(User::created_at, |c| c.creation_timestamp())
     /// .column(User::created_at, |c| c.creation_timestamp().source_db())
     /// ```
-    pub fn creation_timestamp(mut self) -> Self {
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    pub fn creation_timestamp(mut self) -> ColumnBuilder<T, HasTimestamp>
+    where
+        T: crate::column::Temporal,
+    {
         self.def.timestamp_kind = Some(TimestampKind::Creation);
-        self
+        ColumnBuilder {
+            def: self.def,
+            _type: PhantomData,
+            _state: PhantomData,
+        }
     }
 
     /// Mark as an update timestamp — set on INSERT **and** every UPDATE.
     ///
-    /// By default uses `Vm` source (Rust-side `Utc::now()`). Chain
-    /// `.source_db()` to let the database provide the value instead.
+    /// Only available when `T: Temporal` (requires `postgres` or `mysql` feature).
+    /// Transitions the builder state to [`HasTimestamp`], enabling `.source_db()`.
     ///
     /// ```ignore
     /// .column(User::updated_at, |c| c.update_timestamp())
     /// .column(User::updated_at, |c| c.update_timestamp().source_db())
     /// ```
-    pub fn update_timestamp(mut self) -> Self {
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    pub fn update_timestamp(mut self) -> ColumnBuilder<T, HasTimestamp>
+    where
+        T: crate::column::Temporal,
+    {
         self.def.timestamp_kind = Some(TimestampKind::Update);
+        ColumnBuilder {
+            def: self.def,
+            _type: PhantomData,
+            _state: PhantomData,
+        }
+    }
+
+    /// Set the column type to `VARCHAR(length)`.
+    ///
+    /// ```ignore
+    /// .column(User::name, |c| c.varchar(255))
+    /// ```
+    pub fn varchar(mut self, length: u32) -> Self {
+        self.def.sql_type = SqlType::Varchar(length);
         self
     }
 
+    /// Set the column type to `CHAR(length)`.
+    ///
+    /// ```ignore
+    /// .column(Product::currency_code, |c| c.char_type(3))
+    /// ```
+    pub fn char_type(mut self, length: u32) -> Self {
+        self.def.sql_type = SqlType::Char(length);
+        self
+    }
+
+    /// Set the column type to `DECIMAL(precision, scale)`.
+    ///
+    /// Renders as `NUMERIC(p,s)` on PostgreSQL, `DECIMAL(p,s)` elsewhere.
+    ///
+    /// ```ignore
+    /// .column(Product::price, |c| c.decimal(10, 2))
+    /// ```
+    pub fn decimal(mut self, precision: u8, scale: u8) -> Self {
+        self.def.sql_type = SqlType::Decimal(precision, scale);
+        self
+    }
+
+    /// Add a SQL `CHECK` constraint to this column.
+    ///
+    /// The expression is rendered inline as `CHECK (expr)` in DDL.
+    ///
+    /// ```ignore
+    /// .column(Product::price, |c| c.decimal(10, 2).check("price >= 0"))
+    /// // → price DECIMAL(10,2) NOT NULL CHECK (price >= 0)
+    /// ```
+    pub fn check(mut self, expr: impl Into<String>) -> Self {
+        self.def.check = Some(expr.into());
+        self
+    }
+}
+
+impl<T> ColumnBuilder<T, HasTimestamp> {
     /// Use the database as the source of the current date/time.
     ///
+    /// Only available after calling `.creation_timestamp()` or `.update_timestamp()`.
     /// The column will get `DEFAULT NOW()` / `CURRENT_TIMESTAMP` in DDL
     /// and be excluded from INSERT/UPDATE parameter lists.
     pub fn source_db(mut self) -> Self {
@@ -327,13 +472,63 @@ pub enum IndexKind {
     Gist,
 }
 
+/// Sort direction for an index column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    /// Ascending order (default).
+    Asc,
+    /// Descending order.
+    Desc,
+}
+
+impl std::fmt::Display for SortDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SortDirection::Asc => write!(f, "ASC"),
+            SortDirection::Desc => write!(f, "DESC"),
+        }
+    }
+}
+
+/// A column within an index, with its sort direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexColumnDef {
+    /// Column name.
+    pub name: &'static str,
+    /// Sort direction (ASC or DESC).
+    pub direction: SortDirection,
+}
+
+impl IndexColumnDef {
+    /// Create a new index column with the given direction.
+    pub fn new(name: &'static str, direction: SortDirection) -> Self {
+        Self { name, direction }
+    }
+
+    /// Create an ascending index column.
+    pub fn asc(name: &'static str) -> Self {
+        Self {
+            name,
+            direction: SortDirection::Asc,
+        }
+    }
+
+    /// Create a descending index column.
+    pub fn desc(name: &'static str) -> Self {
+        Self {
+            name,
+            direction: SortDirection::Desc,
+        }
+    }
+}
+
 /// Definition of a table-level index (single or composite).
 #[derive(Debug, Clone)]
 pub struct IndexDef {
     /// Optional explicit name. Auto-generated if `None`.
     pub name: Option<String>,
-    /// Columns included in this index, in order.
-    pub columns: Vec<&'static str>,
+    /// Columns included in this index, in order, with sort direction.
+    pub columns: Vec<IndexColumnDef>,
     /// Whether this is a UNIQUE index.
     pub unique: bool,
     /// Index type.
@@ -369,9 +564,21 @@ impl IndexBuilder {
         self
     }
 
-    /// Add a column to this index.
+    /// Add a column to this index (ascending by default).
     pub fn column<M, T>(mut self, col: Column<M, T>) -> Self {
-        self.def.columns.push(col.name);
+        self.def.columns.push(IndexColumnDef::asc(col.name));
+        self
+    }
+
+    /// Add a column with ascending sort order.
+    pub fn column_asc<M, T>(mut self, col: Column<M, T>) -> Self {
+        self.def.columns.push(IndexColumnDef::asc(col.name));
+        self
+    }
+
+    /// Add a column with descending sort order.
+    pub fn column_desc<M, T>(mut self, col: Column<M, T>) -> Self {
+        self.def.columns.push(IndexColumnDef::desc(col.name));
         self
     }
 
@@ -425,6 +632,11 @@ pub struct TableSchema<M> {
     pub name: &'static str,
     pub columns: Vec<ColumnDef>,
     pub indexes: Vec<IndexDef>,
+    /// Table-level CHECK constraints.
+    ///
+    /// Each entry is a raw SQL expression rendered as `CHECK (expr)` at the
+    /// end of the `CREATE TABLE` column list.
+    pub checks: Vec<String>,
     _model: PhantomData<M>,
 }
 
@@ -434,12 +646,12 @@ impl<M> TableSchema<M> {
     /// ```ignore
     /// .column(User::id, |c| c.primary_key().auto_increment())
     /// ```
-    pub fn column<T>(
+    pub fn column<T, S: TimestampState>(
         mut self,
         col: Column<M, T>,
-        configure: impl FnOnce(ColumnBuilder) -> ColumnBuilder,
+        configure: impl FnOnce(ColumnBuilder<T, NoTimestamp>) -> ColumnBuilder<T, S>,
     ) -> Self {
-        let builder = ColumnBuilder::new(col.name);
+        let builder = ColumnBuilder::<T, NoTimestamp>::new(col.name);
         self.columns.push(configure(builder).def);
         self
     }
@@ -452,6 +664,22 @@ impl<M> TableSchema<M> {
     pub fn index(mut self, configure: impl FnOnce(IndexBuilder) -> IndexBuilder) -> Self {
         let builder = IndexBuilder::new();
         self.indexes.push(configure(builder).def);
+        self
+    }
+
+    /// Add a table-level `CHECK` constraint.
+    ///
+    /// The expression is rendered as a separate `CHECK (expr)` line at the
+    /// end of the `CREATE TABLE` column list.
+    ///
+    /// ```ignore
+    /// reify::table::<Event>("events")
+    ///     .column(Event::start_date, |c| c)
+    ///     .column(Event::end_date, |c| c)
+    ///     .check("start_date < end_date")
+    /// ```
+    pub fn check(mut self, expr: impl Into<String>) -> Self {
+        self.checks.push(expr.into());
         self
     }
 }
@@ -468,6 +696,7 @@ pub fn table<M>(name: &'static str) -> TableSchema<M> {
         name,
         columns: Vec::new(),
         indexes: Vec::new(),
+        checks: Vec::new(),
         _model: PhantomData,
     }
 }

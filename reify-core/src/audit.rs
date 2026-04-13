@@ -56,6 +56,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Vm,
+            check: None,
         },
         ColumnDef {
             name: "operation",
@@ -69,6 +70,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Vm,
+            check: None,
         },
         ColumnDef {
             name: "actor_id",
@@ -82,6 +84,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Vm,
+            check: None,
         },
         ColumnDef {
             name: "changed_at",
@@ -95,6 +98,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Db,
+            check: None,
         },
         ColumnDef {
             name: "row_data",
@@ -108,6 +112,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Vm,
+            check: None,
         },
     ]
 }

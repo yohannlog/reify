@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use reify::{IndexKind, Schema, SqlType, Table, TableSchema, Value};
+use reify::{IndexColumnDef, IndexKind, Schema, SqlType, Table, TableSchema, Value};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Table, Debug, Clone)]
@@ -416,14 +416,14 @@ fn macro_single_column_indexes() {
     assert_eq!(indexes.len(), 2);
 
     assert_eq!(indexes[0].name, Some("idx_products_sku".to_string()));
-    assert_eq!(indexes[0].columns, vec!["sku"]);
+    assert_eq!(indexes[0].columns, vec![IndexColumnDef::asc("sku")]);
     assert!(!indexes[0].unique);
 
     assert_eq!(
         indexes[1].name,
         Some("idx_products_category_id".to_string())
     );
-    assert_eq!(indexes[1].columns, vec!["category_id"]);
+    assert_eq!(indexes[1].columns, vec![IndexColumnDef::asc("category_id")]);
 }
 
 #[derive(Table, Debug, Clone)]
@@ -451,12 +451,21 @@ fn macro_composite_indexes() {
         indexes[0].name,
         Some("idx_orders_user_id_created_at".to_string())
     );
-    assert_eq!(indexes[0].columns, vec!["user_id", "created_at"]);
+    assert_eq!(
+        indexes[0].columns,
+        vec![
+            IndexColumnDef::asc("user_id"),
+            IndexColumnDef::asc("created_at")
+        ]
+    );
     assert!(!indexes[0].unique);
 
     // Explicitly named unique composite index
     assert_eq!(indexes[1].name, Some("idx_orders_email_status".to_string()));
-    assert_eq!(indexes[1].columns, vec!["email", "status"]);
+    assert_eq!(
+        indexes[1].columns,
+        vec![IndexColumnDef::asc("email"), IndexColumnDef::asc("status")]
+    );
     assert!(indexes[1].unique);
 }
 
@@ -475,9 +484,15 @@ fn macro_mixed_single_and_composite_indexes() {
     let indexes = Event::indexes();
     assert_eq!(indexes.len(), 2);
     // Single-column from #[column(index)] comes first
-    assert_eq!(indexes[0].columns, vec!["tenant_id"]);
+    assert_eq!(indexes[0].columns, vec![IndexColumnDef::asc("tenant_id")]);
     // Composite from #[table(index(...))] comes second
-    assert_eq!(indexes[1].columns, vec!["tenant_id", "created_at"]);
+    assert_eq!(
+        indexes[1].columns,
+        vec![
+            IndexColumnDef::asc("tenant_id"),
+            IndexColumnDef::asc("created_at")
+        ]
+    );
 }
 
 #[test]
@@ -515,7 +530,7 @@ fn macro_partial_index() {
     assert_eq!(indexes.len(), 2);
 
     // Partial index with predicate
-    assert_eq!(indexes[0].columns, vec!["customer_id"]);
+    assert_eq!(indexes[0].columns, vec![IndexColumnDef::asc("customer_id")]);
     assert_eq!(indexes[0].predicate, Some("status = 'active'".to_string()));
     assert!(!indexes[0].unique);
 }
@@ -525,7 +540,7 @@ fn macro_unique_partial_index() {
     let indexes = Invoice::indexes();
 
     // Unique partial index
-    assert_eq!(indexes[1].columns, vec!["email"]);
+    assert_eq!(indexes[1].columns, vec![IndexColumnDef::asc("email")]);
     assert!(indexes[1].unique);
     assert_eq!(indexes[1].predicate, Some("deleted_at IS NULL".to_string()));
     assert_eq!(indexes[1].name, Some("idx_invoices_live_email".to_string()));
@@ -555,7 +570,13 @@ fn builder_partial_index() {
         schema.indexes[0].predicate,
         Some("tenant_id IS NOT NULL".to_string())
     );
-    assert_eq!(schema.indexes[0].columns, vec!["tenant_id", "created_at"]);
+    assert_eq!(
+        schema.indexes[0].columns,
+        vec![
+            IndexColumnDef::asc("tenant_id"),
+            IndexColumnDef::asc("created_at")
+        ]
+    );
 }
 
 #[test]
@@ -672,6 +693,59 @@ fn sql_type_dialect_rendering() {
     assert_eq!(SqlType::Timestamptz.to_sql(Dialect::Mysql), "DATETIME");
 }
 
+// ── Parameterized SqlType rendering ─────────────────────────────────
+
+#[test]
+fn sql_type_parameterized_rendering() {
+    use reify::Dialect;
+
+    // Varchar
+    assert_eq!(
+        &*SqlType::Varchar(255).to_sql(Dialect::Postgres),
+        "VARCHAR(255)"
+    );
+    assert_eq!(
+        &*SqlType::Varchar(255).to_sql(Dialect::Mysql),
+        "VARCHAR(255)"
+    );
+    assert_eq!(
+        &*SqlType::Varchar(100).to_sql(Dialect::Generic),
+        "VARCHAR(100)"
+    );
+
+    // Char
+    assert_eq!(&*SqlType::Char(36).to_sql(Dialect::Postgres), "CHAR(36)");
+    assert_eq!(&*SqlType::Char(3).to_sql(Dialect::Mysql), "CHAR(3)");
+
+    // Decimal — Postgres uses NUMERIC, others use DECIMAL
+    assert_eq!(
+        &*SqlType::Decimal(10, 2).to_sql(Dialect::Postgres),
+        "NUMERIC(10,2)"
+    );
+    assert_eq!(
+        &*SqlType::Decimal(10, 2).to_sql(Dialect::Mysql),
+        "DECIMAL(10,2)"
+    );
+    assert_eq!(
+        &*SqlType::Decimal(8, 4).to_sql(Dialect::Generic),
+        "DECIMAL(8,4)"
+    );
+}
+
+#[test]
+fn builder_varchar_decimal_methods() {
+    use reify::ColumnBuilder;
+
+    let col = ColumnBuilder::<()>::new_pub("name").varchar(255).build();
+    assert_eq!(col.sql_type, SqlType::Varchar(255));
+
+    let col = ColumnBuilder::<()>::new_pub("code").char_type(3).build();
+    assert_eq!(col.sql_type, SqlType::Char(3));
+
+    let col = ColumnBuilder::<()>::new_pub("price").decimal(10, 2).build();
+    assert_eq!(col.sql_type, SqlType::Decimal(10, 2));
+}
+
 // ── Index support (builder) ─────────────────────────────────────────
 
 #[test]
@@ -682,7 +756,7 @@ fn builder_single_index() {
         .index(|idx| idx.column(Product::sku));
 
     assert_eq!(schema.indexes.len(), 1);
-    assert_eq!(schema.indexes[0].columns, vec!["sku"]);
+    assert_eq!(schema.indexes[0].columns, vec![IndexColumnDef::asc("sku")]);
     assert!(!schema.indexes[0].unique);
     assert_eq!(schema.indexes[0].kind, IndexKind::BTree);
 }
@@ -700,7 +774,10 @@ fn builder_composite_unique_index() {
 
     assert_eq!(schema.indexes.len(), 1);
     let idx = &schema.indexes[0];
-    assert_eq!(idx.columns, vec!["email", "status"]);
+    assert_eq!(
+        idx.columns,
+        vec![IndexColumnDef::asc("email"), IndexColumnDef::asc("status")]
+    );
     assert!(idx.unique);
     assert_eq!(idx.name, Some("idx_orders_email_status".to_string()));
 }
@@ -725,6 +802,148 @@ fn builder_multiple_indexes() {
         .index(|idx| idx.column(Event::tenant_id).column(Event::created_at));
 
     assert_eq!(schema.indexes.len(), 2);
-    assert_eq!(schema.indexes[0].columns, vec!["tenant_id"]);
-    assert_eq!(schema.indexes[1].columns, vec!["tenant_id", "created_at"]);
+    assert_eq!(
+        schema.indexes[0].columns,
+        vec![IndexColumnDef::asc("tenant_id")]
+    );
+    assert_eq!(
+        schema.indexes[1].columns,
+        vec![
+            IndexColumnDef::asc("tenant_id"),
+            IndexColumnDef::asc("created_at")
+        ]
+    );
+}
+
+// ── Sort direction (builder) ────────────────────────────────────────
+
+#[test]
+fn builder_column_desc() {
+    use reify::SortDirection;
+
+    let schema = reify::table::<Event>("events")
+        .column(Event::id, |c| c.primary_key())
+        .index(|idx| {
+            idx.column_asc(Event::tenant_id)
+                .column_desc(Event::created_at)
+                .name("idx_events_tenant_timeline")
+        });
+
+    assert_eq!(schema.indexes.len(), 1);
+    let idx = &schema.indexes[0];
+    assert_eq!(idx.columns.len(), 2);
+    assert_eq!(idx.columns[0].name, "tenant_id");
+    assert_eq!(idx.columns[0].direction, SortDirection::Asc);
+    assert_eq!(idx.columns[1].name, "created_at");
+    assert_eq!(idx.columns[1].direction, SortDirection::Desc);
+}
+
+// ── Sort direction (macro) ──────────────────────────────────────────
+
+#[derive(Table, Debug, Clone)]
+#[table(
+    name = "logs",
+    index(columns("tenant_id", "created_at DESC")),
+    index(columns("level DESC", "created_at DESC"), name = "idx_logs_level_time")
+)]
+pub struct Log {
+    #[column(primary_key)]
+    pub id: i64,
+    pub tenant_id: i64,
+    pub level: String,
+    pub created_at: i64,
+}
+
+#[test]
+fn macro_index_sort_direction() {
+    use reify::SortDirection;
+
+    let indexes = Log::indexes();
+    assert_eq!(indexes.len(), 2);
+
+    // First index: tenant_id ASC (default), created_at DESC
+    let idx0 = &indexes[0];
+    assert_eq!(idx0.columns.len(), 2);
+    assert_eq!(idx0.columns[0].name, "tenant_id");
+    assert_eq!(idx0.columns[0].direction, SortDirection::Asc);
+    assert_eq!(idx0.columns[1].name, "created_at");
+    assert_eq!(idx0.columns[1].direction, SortDirection::Desc);
+
+    // Second index: both DESC
+    let idx1 = &indexes[1];
+    assert_eq!(idx1.name, Some("idx_logs_level_time".to_string()));
+    assert_eq!(idx1.columns[0].name, "level");
+    assert_eq!(idx1.columns[0].direction, SortDirection::Desc);
+    assert_eq!(idx1.columns[1].name, "created_at");
+    assert_eq!(idx1.columns[1].direction, SortDirection::Desc);
+}
+
+// ── CHECK constraints (derive macro) ───────────────────────────────
+
+#[derive(Table, Debug, Clone)]
+#[table(name = "items")]
+pub struct Item {
+    #[column(primary_key, auto_increment)]
+    pub id: i64,
+    #[column(check = "price >= 0")]
+    pub price: f64,
+    #[column(check = "quantity >= 0")]
+    pub quantity: i32,
+    pub name: String,
+}
+
+#[test]
+fn column_check_via_derive() {
+    let defs = Item::column_defs();
+    let price_def = defs.iter().find(|d| d.name == "price").unwrap();
+    assert_eq!(price_def.check, Some("price >= 0".to_string()));
+
+    let qty_def = defs.iter().find(|d| d.name == "quantity").unwrap();
+    assert_eq!(qty_def.check, Some("quantity >= 0".to_string()));
+
+    // Columns without check should be None
+    let name_def = defs.iter().find(|d| d.name == "name").unwrap();
+    assert_eq!(name_def.check, None);
+}
+
+// ── CHECK constraints (builder) ────────────────────────────────────
+
+#[test]
+fn builder_column_check() {
+    use reify::ColumnBuilder;
+
+    let col = ColumnBuilder::<()>::new_pub("price")
+        .decimal(10, 2)
+        .check("price >= 0")
+        .build();
+    assert_eq!(col.check, Some("price >= 0".to_string()));
+}
+
+#[test]
+fn builder_column_no_check() {
+    use reify::ColumnBuilder;
+
+    let col = ColumnBuilder::<()>::new_pub("name").build();
+    assert_eq!(col.check, None);
+}
+
+#[test]
+fn builder_table_check() {
+    let schema = reify::table::<Event>("events")
+        .column(Event::id, |c| c.primary_key())
+        .column(Event::tenant_id, |c| c)
+        .column(Event::created_at, |c| c)
+        .check("created_at > 0")
+        .check("tenant_id > 0");
+
+    assert_eq!(schema.checks.len(), 2);
+    assert_eq!(schema.checks[0], "created_at > 0");
+    assert_eq!(schema.checks[1], "tenant_id > 0");
+}
+
+#[test]
+fn builder_table_no_checks() {
+    let schema = reify::table::<Event>("events").column(Event::id, |c| c.primary_key());
+
+    assert!(schema.checks.is_empty());
 }

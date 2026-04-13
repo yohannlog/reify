@@ -1,44 +1,32 @@
 //! PostgreSQL adapter for Reify.
 //!
-//! ```ignore
-//! use reify_postgres::{PostgresDb, PoolConfig};
+//! Uses [`deadpool_postgres::Config`] directly for full configuration control
+//! (host, port, SSL, keepalives, pool sizing, timeouts, etc.).
 //!
-//! let db = PostgresDb::connect("host=localhost user=app dbname=mydb", PoolConfig::default()).await?;
+//! ```ignore
+//! use reify_postgres::PostgresDb;
+//! use deadpool_postgres::{Config, Runtime, PoolConfig, Timeouts};
+//! use tokio_postgres::NoTls;
+//!
+//! let mut cfg = Config::new();
+//! cfg.host = Some("localhost".into());
+//! cfg.user = Some("app".into());
+//! cfg.dbname = Some("mydb".into());
+//! cfg.pool = Some(PoolConfig { max_size: 16, ..Default::default() });
+//!
+//! let db = PostgresDb::connect(cfg, NoTls).await?;
 //! let rows = reify_core::fetch_all(&db, &User::find().filter(User::id.eq(1i64))).await?;
 //! ```
 
-use std::time::Duration;
+pub use deadpool_postgres::{self, Config as DpConfig, Pool, Runtime};
+pub use tokio_postgres::{self, NoTls};
 
-use deadpool_postgres::{Config as DpConfig, Pool, Runtime};
-use tokio_postgres::{NoTls, types::ToSql as PgToSql};
+use tokio_postgres::types::ToSql as PgToSql;
 use tracing::{debug, error};
 
 use reify_core::db::{Database, DbError, Row, TransactionFn};
 use reify_core::range::{Bound, Range};
 use reify_core::value::Value;
-
-// ── Pool configuration ───────────────────────────────────────────────
-
-/// Configuration for the PostgreSQL connection pool.
-#[derive(Debug, Clone)]
-pub struct PoolConfig {
-    /// Minimum number of idle connections kept open. Default: 1.
-    pub min_connections: usize,
-    /// Maximum number of connections in the pool. Default: 10.
-    pub max_connections: usize,
-    /// Timeout when waiting for a connection from the pool. Default: 5 s.
-    pub connection_timeout: Duration,
-}
-
-impl Default for PoolConfig {
-    fn default() -> Self {
-        Self {
-            min_connections: 1,
-            max_connections: 10,
-            connection_timeout: Duration::from_secs(5),
-        }
-    }
-}
 
 /// PostgreSQL database backed by a `deadpool-postgres` connection pool.
 pub struct PostgresDb {
@@ -46,53 +34,38 @@ pub struct PostgresDb {
 }
 
 impl PostgresDb {
-    /// Connect to a PostgreSQL database and initialise a connection pool.
+    /// Connect to a PostgreSQL database using a [`deadpool_postgres::Config`].
     ///
-    /// `config` is a libpq-style connection string:
-    /// `"host=localhost port=5432 user=app password=secret dbname=mydb"`
-    pub async fn connect(config: &str, pool_cfg: PoolConfig) -> Result<Self, DbError> {
-        debug!(target: "reify::postgres", config, "Connecting to PostgreSQL (pool)");
+    /// This gives you full control over every connection and pool parameter
+    /// (host, port, SSL mode, keepalives, pool size, timeouts, etc.).
+    ///
+    /// ```ignore
+    /// use deadpool_postgres::{Config, Runtime};
+    /// use tokio_postgres::NoTls;
+    ///
+    /// let mut cfg = Config::new();
+    /// cfg.host = Some("localhost".into());
+    /// cfg.user = Some("app".into());
+    /// cfg.dbname = Some("mydb".into());
+    ///
+    /// let db = PostgresDb::connect(cfg, NoTls).await?;
+    /// ```
+    pub async fn connect<T>(config: DpConfig, tls: T) -> Result<Self, DbError>
+    where
+        T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>
+            + Clone
+            + Sync
+            + Send
+            + 'static,
+        T::Stream: Sync + Send,
+        T::TlsConnect: Sync + Send,
+        <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
+    {
+        debug!(target: "reify::postgres", ?config, "Connecting to PostgreSQL (pool)");
 
-        let mut dp = DpConfig::new();
-        // Parse the libpq connection string into individual fields that
-        // deadpool-postgres / tokio-postgres understand.
-        let pg_cfg: tokio_postgres::Config = config
-            .parse()
-            .map_err(|e: tokio_postgres::Error| DbError::Connection(e.to_string()))?;
-
-        dp.host = pg_cfg.get_hosts().first().and_then(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
-            _ => None,
-        });
-        dp.port = pg_cfg.get_ports().first().copied();
-        dp.user = pg_cfg.get_user().map(str::to_owned);
-        dp.password = pg_cfg
-            .get_password()
-            .map(|b| String::from_utf8_lossy(b).into_owned());
-        dp.dbname = pg_cfg.get_dbname().map(str::to_owned);
-
-        dp.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: pool_cfg.max_connections,
-            timeouts: deadpool_postgres::Timeouts {
-                wait: Some(pool_cfg.connection_timeout),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-
-        let pool = dp
-            .create_pool(Some(Runtime::Tokio1), NoTls)
+        let pool = config
+            .create_pool(Some(Runtime::Tokio1), tls)
             .map_err(|e| DbError::Connection(e.to_string()))?;
-
-        // Eagerly open `min_connections` connections so the pool is warm.
-        for _ in 0..pool_cfg.min_connections {
-            match pool.get().await {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(target: "reify::postgres", error = %e, "Failed to pre-warm pool connection");
-                }
-            }
-        }
 
         Ok(Self { pool })
     }

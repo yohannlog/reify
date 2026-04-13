@@ -1,4 +1,4 @@
-use reify::{IndexKind, Schema, Table, TableSchema};
+use reify::{IndexKind, Schema, SortDirection, Table, TableSchema};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Approach 1 — Macro-based indexes
@@ -11,9 +11,9 @@ use reify::{IndexKind, Schema, Table, TableSchema};
 #[derive(Table, Debug, Clone)]
 #[table(
     name = "orders",
-    // Composite index on (user_id, created_at) — for queries like
+    // Composite index on (user_id ASC, created_at DESC) — for queries like
     //   SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC
-    index(columns("user_id", "created_at")),
+    index(columns("user_id", "created_at DESC")),
     // Unique composite index with explicit name
     index(columns("user_id", "product_id"), unique, name = "idx_one_product_per_user"),
     // Three-column composite
@@ -61,10 +61,10 @@ impl Schema for Event {
             .column(Event::created_at, |c| c)
             // Single-column index
             .index(|idx| idx.column(Event::tenant_id))
-            // Composite: tenant scoped queries by time
+            // Composite: tenant scoped queries by time (tenant ASC, time DESC)
             .index(|idx| {
                 idx.column(Event::tenant_id)
-                    .column(Event::created_at)
+                    .column_desc(Event::created_at)
                     .name("idx_events_tenant_timeline")
             })
             // Composite unique: one action per user per timestamp
@@ -128,8 +128,13 @@ fn print_index(idx: &reify::IndexDef) {
         .as_deref()
         .map(|p| format!(" WHERE {p}"))
         .unwrap_or_default();
-    println!(
-        "  {name}:{unique} {kind} ({}){pred}",
-        idx.columns.join(", ")
-    );
+    let cols: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|c| match c.direction {
+            SortDirection::Asc => c.name.to_string(),
+            SortDirection::Desc => format!("{} DESC", c.name),
+        })
+        .collect();
+    println!("  {name}:{unique} {kind} ({}){pred}", cols.join(", "));
 }

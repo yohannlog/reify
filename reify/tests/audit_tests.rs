@@ -172,16 +172,16 @@ async fn add_audited_table_creates_both_tables() {
 
 #[tokio::test]
 async fn add_audited_table_with_schema_creates_both_tables() {
-    use reify::{schema::table, ColumnBuilder};
+    use reify::schema::table;
 
     let db = MockDb::new();
     db.push_rows(vec![]); // existing_columns for users
     db.push_rows(vec![]); // existing_columns for users_audit
 
     let schema = table::<AuditUser>("users")
-        .column(AuditUser::id, |c: ColumnBuilder| c.primary_key().auto_increment())
-        .column(AuditUser::email, |c: ColumnBuilder| c.unique())
-        .column(AuditUser::role, |c: ColumnBuilder| c.nullable());
+        .column(AuditUser::id, |c| c.primary_key().auto_increment())
+        .column(AuditUser::email, |c| c.unique())
+        .column(AuditUser::role, |c| c.nullable());
 
     let runner = MigrationRunner::new().add_audited_table_with_schema(schema);
     let plans = runner.dry_run(&db).await.unwrap();

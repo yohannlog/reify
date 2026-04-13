@@ -31,10 +31,11 @@ pub use reify_core::*;
 pub use reify_macros::DbEnum;
 pub use reify_macros::Relations;
 pub use reify_macros::Table;
+pub use reify_macros::View;
 
 // Database adapters behind feature flags
 #[cfg(feature = "postgres")]
-pub use reify_postgres::PostgresDb;
+pub use reify_postgres::{self, deadpool_postgres, tokio_postgres, NoTls, PostgresDb};
 
 #[cfg(feature = "mysql")]
-pub use reify_mysql::MysqlDb;
+pub use reify_mysql::{self, mysql_async, MysqlDb};

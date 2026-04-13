@@ -40,6 +40,29 @@ impl Schema for Post {
     }
 }
 
+// ── Parameterized types: Varchar, Char, Decimal ─────────────────────
+
+#[derive(Table, Debug, Clone)]
+#[table(name = "products")]
+pub struct Product {
+    pub id: i64,
+    pub name: String,
+    pub price: f64,
+    pub currency_code: String,
+}
+
+impl Schema for Product {
+    fn schema() -> TableSchema<Self> {
+        reify::table::<Self>("products")
+            .column(Product::id, |c| c.primary_key().auto_increment())
+            .column(Product::name, |c| c.varchar(255))
+            .column(Product::price, |c| c.decimal(10, 2).check("price >= 0"))
+            .column(Product::currency_code, |c| c.char_type(3))
+            // Table-level CHECK: cross-column business rule
+            .check("currency_code IN ('USD','EUR','GBP')")
+    }
+}
+
 fn main() {
     // ── Inspect schema metadata ─────────────────────────────────
     println!("=== User schema ===\n");
@@ -104,6 +127,25 @@ fn main() {
                 format!("[{}]", attrs.join(", "))
             }
         );
+    }
+
+    // ── Product schema (parameterized types) ────────────────────
+    println!("\n=== Product schema (parameterized types) ===\n");
+
+    let schema = Product::schema();
+    println!("Table: {}", schema.name);
+    for col in &schema.columns {
+        let check_info = match &col.check {
+            Some(expr) => format!(" CHECK ({expr})"),
+            None => String::new(),
+        };
+        println!("  {} → {:?}{}", col.name, col.sql_type, check_info);
+    }
+    if !schema.checks.is_empty() {
+        println!("  Table-level checks:");
+        for check in &schema.checks {
+            println!("    CHECK ({check})");
+        }
     }
 
     // ── The schema + query builder work together ────────────────

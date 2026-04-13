@@ -207,7 +207,9 @@ impl Expr {
 
 #[derive(Debug, Clone)]
 pub enum Order {
+    /// Sort ascending: `ORDER BY col ASC`.
     Asc(&'static str),
+    /// Sort descending: `ORDER BY col DESC`.
     Desc(&'static str),
 }
 
@@ -217,9 +219,11 @@ pub struct OrderExpr {
 }
 
 impl OrderExpr {
+    /// Wrap this column in an ascending [`Order`] expression.
     pub fn asc(self) -> Order {
         Order::Asc(self.col)
     }
+    /// Wrap this column in a descending [`Order`] expression.
     pub fn desc(self) -> Order {
         Order::Desc(self.col)
     }
@@ -227,6 +231,19 @@ impl OrderExpr {
 
 // ── SelectBuilder ───────────────────────────────────────────────────
 
+/// A fluent builder for `SELECT` statements.
+///
+/// Obtain one via the generated `Model::find()` method.
+///
+/// # Example
+///
+/// ```ignore
+/// let (sql, params) = User::find()
+///     .filter(User::active.eq(true))
+///     .order_by(User::name.asc())
+///     .limit(10)
+///     .build();
+/// ```
 #[derive(Clone)]
 pub struct SelectBuilder<M: Table> {
     columns: Option<Vec<&'static str>>,
@@ -241,6 +258,9 @@ pub struct SelectBuilder<M: Table> {
 }
 
 impl<M: Table> SelectBuilder<M> {
+    /// Construct an empty `SelectBuilder`.
+    ///
+    /// Prefer the generated `Model::find()` factory method over calling this directly.
     pub fn new() -> Self {
         Self {
             columns: None,
@@ -255,6 +275,9 @@ impl<M: Table> SelectBuilder<M> {
         }
     }
 
+    /// Restrict the SELECT list to the given column names.
+    ///
+    /// If not called, all columns (`SELECT *`) are returned.
     pub fn select(mut self, cols: &[&'static str]) -> Self {
         self.columns = Some(cols.to_vec());
         self
@@ -273,6 +296,9 @@ impl<M: Table> SelectBuilder<M> {
         self
     }
 
+    /// Append a WHERE condition.
+    ///
+    /// Multiple calls are combined with `AND`.
     pub fn filter(mut self, cond: Condition) -> Self {
         self.conditions.push(cond);
         self
@@ -290,16 +316,21 @@ impl<M: Table> SelectBuilder<M> {
         self
     }
 
+    /// Append an ORDER BY clause.
+    ///
+    /// Multiple calls add multiple sort keys in the order they are called.
     pub fn order_by(mut self, order: Order) -> Self {
         self.orders.push(order);
         self
     }
 
+    /// Set the LIMIT clause.
     pub fn limit(mut self, n: u64) -> Self {
         self.limit = Some(n);
         self
     }
 
+    /// Set the OFFSET clause.
     pub fn offset(mut self, n: u64) -> Self {
         self.offset = Some(n);
         self
@@ -381,6 +412,18 @@ impl<M: Table> Default for SelectBuilder<M> {
 
 // ── InsertBuilder ───────────────────────────────────────────────────
 
+/// A fluent builder for `INSERT` statements.
+///
+/// Obtain one via the generated `Model::insert(&model)` method.
+///
+/// # Example
+///
+/// ```ignore
+/// let (sql, params) = User::insert(&alice)
+///     .on_conflict_do_nothing()
+///     .build();
+/// // INSERT INTO users (name, email) VALUES (?, ?)
+/// ```
 pub struct InsertBuilder<M: Table> {
     values: Vec<Value>,
     on_conflict: Option<OnConflict>,
@@ -390,6 +433,9 @@ pub struct InsertBuilder<M: Table> {
 }
 
 impl<M: Table> InsertBuilder<M> {
+    /// Create a builder from a model instance.
+    ///
+    /// Extracts the writable column values from `model`.
     pub fn new(model: &M) -> Self {
         Self {
             values: model.writable_values(),
@@ -596,6 +642,7 @@ pub enum JoinKind {
 }
 
 impl JoinKind {
+    /// Returns the SQL keyword string for this join type (e.g. `"INNER JOIN"`).
     pub fn sql_keyword(self) -> &'static str {
         match self {
             JoinKind::Inner => "INNER JOIN",
@@ -866,6 +913,19 @@ impl<M: Table> SelectBuilder<M> {
 
 // ── UpdateBuilder ───────────────────────────────────────────────────
 
+/// A fluent builder for `UPDATE` statements.
+///
+/// Obtain one via the generated `Model::update()` method.
+///
+/// # Example
+///
+/// ```ignore
+/// let (sql, params) = User::update()
+///     .set(User::active, false)
+///     .filter(User::id.eq(42))
+///     .build();
+/// // UPDATE users SET active = ? WHERE id = ?
+/// ```
 #[derive(Clone)]
 pub struct UpdateBuilder<M: Table> {
     sets: Vec<(&'static str, Value)>,
@@ -876,6 +936,9 @@ pub struct UpdateBuilder<M: Table> {
 }
 
 impl<M: Table> UpdateBuilder<M> {
+    /// Construct an empty `UpdateBuilder`.
+    ///
+    /// Prefer the generated `Model::update()` factory method over calling this directly.
     pub fn new() -> Self {
         Self {
             sets: Vec::new(),
@@ -893,6 +956,7 @@ impl<M: Table> UpdateBuilder<M> {
         self
     }
 
+    /// Append a `SET col = val` assignment.
     pub fn set<T: crate::value::IntoValue>(
         mut self,
         col: crate::column::Column<M, T>,
@@ -902,16 +966,23 @@ impl<M: Table> UpdateBuilder<M> {
         self
     }
 
+    /// Append a WHERE condition.
+    ///
+    /// Multiple calls are combined with `AND`.
     pub fn filter(mut self, cond: Condition) -> Self {
         self.conditions.push(cond);
         self
     }
 
-    /// Build the SQL. Panics if no WHERE clause — safety by default.
+    /// Build the `UPDATE … SET … WHERE …` SQL string and parameter list.
     ///
-    /// Automatically injects `SET col = NOW()` for columns marked as
-    /// `update_timestamp` with `Vm` source, unless the caller already
-    /// set them explicitly via `.set()`.
+    /// Automatically injects `SET col = <now>` for any `update_timestamp` columns
+    /// not already set explicitly via `.set()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no `.filter()` has been called — bare `UPDATE` without a
+    /// `WHERE` clause is forbidden to prevent accidental full-table updates.
     #[allow(unused_mut)]
     pub fn build(&self) -> (String, Vec<Value>) {
         assert!(
@@ -965,6 +1036,18 @@ impl<M: Table> Default for UpdateBuilder<M> {
 
 // ── DeleteBuilder ───────────────────────────────────────────────────
 
+/// A fluent builder for `DELETE` statements.
+///
+/// Obtain one via the generated `Model::delete()` method.
+///
+/// # Example
+///
+/// ```ignore
+/// let (sql, params) = User::delete()
+///     .filter(User::id.eq(42))
+///     .build();
+/// // DELETE FROM users WHERE id = ?
+/// ```
 #[derive(Clone)]
 pub struct DeleteBuilder<M: Table> {
     conditions: Vec<Condition>,
@@ -974,6 +1057,9 @@ pub struct DeleteBuilder<M: Table> {
 }
 
 impl<M: Table> DeleteBuilder<M> {
+    /// Construct an empty `DeleteBuilder`.
+    ///
+    /// Prefer the generated `Model::delete()` factory method over calling this directly.
     pub fn new() -> Self {
         Self {
             conditions: Vec::new(),
@@ -990,6 +1076,9 @@ impl<M: Table> DeleteBuilder<M> {
         self
     }
 
+    /// Append a WHERE condition.
+    ///
+    /// Multiple calls are combined with `AND`.
     pub fn filter(mut self, cond: Condition) -> Self {
         self.conditions.push(cond);
         self
@@ -1006,7 +1095,12 @@ impl<M: Table> DeleteBuilder<M> {
         sel
     }
 
-    /// Build the SQL. Panics if no WHERE clause — safety by default.
+    /// Build the `DELETE FROM … WHERE …` SQL string and parameter list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no `.filter()` has been called — bare `DELETE` without a
+    /// `WHERE` clause is forbidden to prevent accidental full-table deletes.
     #[allow(unused_mut)]
     pub fn build(&self) -> (String, Vec<Value>) {
         assert!(

@@ -1,0 +1,8 @@
+error[E0599]: no method named `source_db` found for struct `ColumnBuilder<std::string::String>` in the current scope
+  --> tests/compile_fail/source_db_without_timestamp.rs:13:29
+   |
+13 |         .column(NAME, |c| c.source_db());
+   |                             ^^^^^^^^^ method not found in `ColumnBuilder<std::string::String>`
+   |
+   = note: the method was found for
+           - `ColumnBuilder<T, HasTimestamp>`

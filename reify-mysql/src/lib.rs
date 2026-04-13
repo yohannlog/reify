@@ -1,14 +1,28 @@
 //! MySQL / MariaDB adapter for Reify.
 //!
+//! Uses [`mysql_async::Opts`] (via [`mysql_async::OptsBuilder`]) directly for
+//! full configuration control (host, port, SSL, pool sizing, compression, etc.).
+//!
 //! ```ignore
 //! use reify_mysql::MysqlDb;
+//! use mysql_async::{OptsBuilder, PoolOpts, PoolConstraints};
 //!
-//! let db = MysqlDb::connect("mysql://app:secret@localhost:3306/mydb").await?;
+//! let opts = OptsBuilder::default()
+//!     .ip_or_hostname("localhost")
+//!     .tcp_port(3306)
+//!     .user(Some("app"))
+//!     .pass(Some("secret"))
+//!     .db_name(Some("mydb"))
+//!     .pool_opts(PoolOpts::default()
+//!         .with_constraints(PoolConstraints::new(2, 20).unwrap()));
+//!
+//! let db = MysqlDb::connect(opts).await?;
 //! let rows = reify_core::fetch_all(&db, &User::find().filter(User::id.eq(1i64))).await?;
 //! ```
 
+pub use mysql_async::{self, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
+
 use mysql_async::prelude::*;
-use mysql_async::{Opts, Pool};
 use tracing::{debug, error};
 
 use reify_core::db::{Database, DbError, Row, TransactionFn};
@@ -20,18 +34,27 @@ pub struct MysqlDb {
 }
 
 impl MysqlDb {
-    /// Connect to a MySQL / MariaDB database.
+    /// Connect to a MySQL / MariaDB database using [`mysql_async::Opts`].
     ///
-    /// `url` is a standard MySQL connection URL:
-    /// `"mysql://user:password@host:3306/database"`
+    /// Accepts anything that converts into [`Opts`]: an [`OptsBuilder`], a URL
+    /// string, or an `Opts` value directly. This gives you full control over
+    /// every connection and pool parameter (host, port, SSL, pool sizing,
+    /// compression, tcp_keepalive, statement cache, etc.).
     ///
-    /// `mysql_async::Pool` manages connections internally; use
-    /// [`mysql_async::PoolOpts`] via [`MysqlDb::from_pool`] for fine-grained
-    /// pool sizing (min/max connections, timeouts).
-    pub async fn connect(url: &str) -> Result<Self, DbError> {
-        debug!(target: "reify::mysql", url, "Connecting to MySQL/MariaDB");
-        let opts = Opts::from_url(url).map_err(|e| DbError::Connection(e.to_string()))?;
-        let pool = Pool::new(opts);
+    /// ```ignore
+    /// use mysql_async::OptsBuilder;
+    ///
+    /// let opts = OptsBuilder::default()
+    ///     .ip_or_hostname("localhost")
+    ///     .user(Some("app"))
+    ///     .db_name(Some("mydb"));
+    ///
+    /// let db = MysqlDb::connect(opts).await?;
+    /// ```
+    pub async fn connect(opts: impl Into<Opts>) -> Result<Self, DbError> {
+        let mysql_opts: Opts = opts.into();
+        debug!(target: "reify::mysql", "Connecting to MySQL/MariaDB");
+        let pool = Pool::new(mysql_opts);
         // Eagerly verify connectivity.
         pool.get_conn()
             .await
@@ -43,16 +66,6 @@ impl MysqlDb {
     }
 
     /// Build a `MysqlDb` from an already-constructed `mysql_async::Pool`.
-    ///
-    /// Use this when you need custom pool options (min/max size, timeouts):
-    /// ```ignore
-    /// use mysql_async::{Pool, PoolOpts, PoolConstraints, Opts};
-    /// let opts = Opts::from_url(url)?;
-    /// let pool_opts = PoolOpts::default()
-    ///     .with_constraints(PoolConstraints::new(2, 20).unwrap());
-    /// let pool = Pool::new(opts.clone().pool_opts(pool_opts));
-    /// let db = MysqlDb::from_pool(pool);
-    /// ```
     pub fn from_pool(pool: Pool) -> Self {
         Self { pool }
     }

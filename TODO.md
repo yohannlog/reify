@@ -1,3 +1,53 @@
+[NEWS]
+
+C. Drizzle Studio / Reify Studio Drizzle fournit une interface web générée à la volée pour explorer sa base.
+L'idée pour Reify : Une commande reify studio. Puisque tes structs Rust sont le schéma, la CLI pourrait compiler un petit serveur web embarqué (via axum par ex) qui expose une interface d'admin CRUD complète basée sur tes #[derive(Table)]. C'est un argument de vente énorme.
+
+D. Intégration de validation (TypeBox/Zod vs Serde/Validator) Drizzle permet de générer des schémas de validation directement depuis le schéma DB.
+L'idée pour Reify : Générer automatiquement l'implémentation du crate validator (ou générer des types de requêtes) pour vérifier les longueurs de string, les nullabilités ou les regex avant même de taper la DB.
+
+C. Soft Deletes "Invisibles" Hibernate gère les @Where(clause = "deleted = false").
+L'idée pour Reify : Si un modèle a #[column(soft_delete)], tous les User::find() cachent automatiquement les enregistrements supprimés sans que le développeur n'ait à rajouter .filter(User::deleted_at.is_null()) partout. Il faudrait juste une méthode .with_deleted() pour contourner cette règle quand c'est nécessaire.
+
+D. Génération de DTOs / Sérialisation sélective Souvent, on ne veut pas renvoyer le mot de passe hashé via l'API.
+L'idée pour Reify : Des attributs comme #[column(hidden)] ou générer automatiquement des "Views" Rust (ex: User::select_public()) qui omettent les champs sensibles lors du select et de la sérialisation serde.
+
+E. Feature pour générer des DTOs / Sérialisation sélective Souvent, on ne veut pas renvoyer le mot de passe hashé via l'API.
+L'idée pour Reify : Des attributs comme #[column(hidden)] ou générer automatiquement des "Views" Rust (ex: User::select_public()) qui omettent les champs sensibles lors du select et de la sérialisation serde.
+
+3. Valeurs par défaut (Default) et protection (Quoting)
+   La méthode .default(impl Into<String>) accepte une chaîne. Cependant, si j'écris .default("member"), le générateur DDL va-t-il émettre DEFAULT member (SQL invalide) ou DEFAULT 'member' ? Si je veux mettre DEFAULT NOW(), comment faire la différence entre l'expression SQL et la chaîne de caractères ? Amélioration : Différencier les valeurs littérales des expressions SQL :``` rust
+   pub enum DefaultValue {
+   String(String), // Sera quoté : DEFAULT 'member'
+   Integer(i64),   // DEFAULT 42
+   Boolean(bool),  // DEFAULT true
+   Expr(String),   // Ne sera pas quoté : DEFAULT NOW()
+   }
+
+// Sur le builder:
+pub fn default_value(mut self, val: impl Into<DefaultValue>) -> Self
+pub fn default_expr(mut self, expr: &str) -> Self
+```
+
+#### 4. Manque des Clés Étrangères (Foreign Keys)
+Dans une base de données relationnelle, la définition des relations (FK) est primordiale pour générer les DDL. Il manque une façon de les définir proprement dans le builder actuel. **Amélioration** : Ajouter un `ForeignKeyDef` et une méthode sur le ou sur . `ColumnBuilder``TableSchema```` rust
+// Sur ColumnBuilder
+.column(Post::user_id, |c| c.references(User::id).on_delete_cascade())
+
+// Ou sur TableSchema (pour les FK composites)
+.foreign_key(|fk| fk.column(Post::user_id).references(User::id))
+```
+
+
+
+1. Redondance avec le typage Rust (Inférence)
+   Actuellement, si le champ Rust est pub role: Option<String>, le développeur doit appeler .nullable() dans le builder :``` rust
+   .column(User::role, |c| c.nullable())
+
+Je pense qu'il serait intéressant d'avoir l'autocomplete ?
+```
+
+Amélioration : Puisque la macro #[derive(Table)] génère probablement les instances de Column<M, T>, vous pourriez enrichir la structure Column ou utiliser un trait pour que le nullability et le SqlType par défaut soient inférés à partir du type Rust (Option -> nullable = true, String -> SqlType::Text). Le builder de schéma ne servirait alors qu'à surcharger les comportements (index, contraintes, foreign key) et non à redéfinir la nullabilité.
 ## Noms possibles
 
 Quelques propositions avec leur angle :
