@@ -399,6 +399,10 @@ impl ToSql for Condition {
                 params.extend(sub_params.iter().cloned());
                 let _ = write!(buf, "{col} IN ({sub_sql})");
             }
+            Condition::Raw(sql, raw_params) => {
+                params.extend(raw_params.iter().cloned());
+                buf.push_str(sql);
+            }
             Condition::Logical(op) => match op {
                 LogicalOp::And(conds) => {
                     buf.push('(');

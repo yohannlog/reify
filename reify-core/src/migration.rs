@@ -342,6 +342,8 @@ pub fn create_table_sql<T: Table>(
     column_defs: &[crate::schema::ColumnDef],
     dialect: crate::query::Dialect,
 ) -> String {
+    use crate::schema::{ComputedColumn, TimestampKind, TimestampSource};
+
     let table = T::table_name();
     let names = T::column_names();
 
@@ -350,12 +352,22 @@ pub fn create_table_sql<T: Table>(
     for name in names.iter() {
         let def = column_defs.iter().find(|d| d.name == *name);
 
+        // Skip Rust-side virtual columns — they don't exist in the DB.
+        if let Some(d) = def {
+            if matches!(d.computed, Some(ComputedColumn::Virtual)) {
+                continue;
+            }
+        }
+
         let mut parts: Vec<String> = vec![format!("    {name}")];
 
         let is_nullable = def.map(|d| d.nullable).unwrap_or(false);
         let is_pk = def.map(|d| d.primary_key).unwrap_or(false);
         let is_unique = def.map(|d| d.unique).unwrap_or(false);
         let default_val = def.and_then(|d| d.default.as_deref());
+        let computed = def.and_then(|d| d.computed.as_ref());
+        let ts_kind = def.and_then(|d| d.timestamp_kind);
+        let ts_source = def.map(|d| d.timestamp_source).unwrap_or(TimestampSource::Vm);
 
         // Type — from metadata, not from column name heuristics
         let sql_type = def
@@ -363,18 +375,38 @@ pub fn create_table_sql<T: Table>(
             .unwrap_or("TEXT");
         parts.push(sql_type.into());
 
-        // Constraints
-        if is_pk {
-            parts.push("PRIMARY KEY".into());
-        }
-        if !is_nullable && !is_pk {
-            parts.push("NOT NULL".into());
-        }
-        if is_unique {
-            parts.push("UNIQUE".into());
-        }
-        if let Some(dv) = default_val {
-            parts.push(format!("DEFAULT {dv}"));
+        // DB-generated computed column: GENERATED ALWAYS AS (expr) STORED
+        if let Some(ComputedColumn::Stored(expr)) = computed {
+            parts.push(format!("GENERATED ALWAYS AS ({expr}) STORED"));
+        } else {
+            // Constraints (not applicable to generated columns)
+            if is_pk {
+                parts.push("PRIMARY KEY".into());
+            }
+            if !is_nullable && !is_pk {
+                parts.push("NOT NULL".into());
+            }
+            if is_unique {
+                parts.push("UNIQUE".into());
+            }
+
+            // DB-source timestamps: emit dialect-appropriate DEFAULT
+            if ts_source == TimestampSource::Db && ts_kind.is_some() {
+                let default_now = match dialect {
+                    crate::query::Dialect::Mysql => "DEFAULT CURRENT_TIMESTAMP",
+                    _ => "DEFAULT NOW()",
+                };
+                parts.push(default_now.into());
+
+                // MySQL: update_timestamp with Db source gets ON UPDATE CURRENT_TIMESTAMP
+                if ts_kind == Some(TimestampKind::Update)
+                    && dialect == crate::query::Dialect::Mysql
+                {
+                    parts.push("ON UPDATE CURRENT_TIMESTAMP".into());
+                }
+            } else if let Some(dv) = default_val {
+                parts.push(format!("DEFAULT {dv}"));
+            }
         }
 
         col_lines.push(parts.join(" "));
@@ -394,6 +426,18 @@ pub fn add_column_sql(
     def: Option<&crate::schema::ColumnDef>,
     dialect: crate::query::Dialect,
 ) -> String {
+    use crate::schema::ComputedColumn;
+
+    // DB-generated computed column
+    if let Some(d) = def {
+        if let Some(ComputedColumn::Stored(expr)) = &d.computed {
+            let sql_type = d.sql_type.to_sql(dialect);
+            return format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {sql_type} GENERATED ALWAYS AS ({expr}) STORED;"
+            );
+        }
+    }
+
     let is_nullable = def.map(|d| d.nullable).unwrap_or(false);
     let sql_type = def
         .map(|d| d.sql_type.to_sql(dialect))
@@ -489,6 +533,9 @@ impl MigrationRunner {
                         index: false,
                         nullable: false,
                         default: None,
+                        computed: None,
+                        timestamp_kind: None,
+                        timestamp_source: crate::schema::TimestampSource::Vm,
                     })
                     .collect()
             } else {
@@ -1283,6 +1330,9 @@ mod tests {
                     index: false,
                     nullable: false,
                     default: None,
+                    computed: None,
+                    timestamp_kind: None,
+                    timestamp_source: crate::schema::TimestampSource::Vm,
                 },
                 crate::schema::ColumnDef {
                     name: "email",
@@ -1293,6 +1343,9 @@ mod tests {
                     index: false,
                     nullable: false,
                     default: None,
+                    computed: None,
+                    timestamp_kind: None,
+                    timestamp_source: crate::schema::TimestampSource::Vm,
                 },
                 crate::schema::ColumnDef {
                     name: "role",
@@ -1303,6 +1356,9 @@ mod tests {
                     index: false,
                     nullable: false,
                     default: None,
+                    computed: None,
+                    timestamp_kind: None,
+                    timestamp_source: crate::schema::TimestampSource::Vm,
                 },
             ]
         }
@@ -1886,6 +1942,9 @@ mod tests {
                 index: false,
                 nullable: false,
                 default: None,
+                computed: None,
+                timestamp_kind: None,
+                timestamp_source: crate::schema::TimestampSource::Vm,
             },
             crate::schema::ColumnDef {
                 name: "email",
@@ -1896,6 +1955,9 @@ mod tests {
                 index: false,
                 nullable: false,
                 default: None,
+                computed: None,
+                timestamp_kind: None,
+                timestamp_source: crate::schema::TimestampSource::Vm,
             },
         ];
         let sql = create_table_sql::<Users>(&defs, crate::query::Dialect::Postgres);

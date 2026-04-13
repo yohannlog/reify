@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::marker::PhantomData;
 
 use crate::column::Column;
@@ -7,7 +8,7 @@ use crate::sql::{OrderFragment, SqlFragment};
 use crate::table::Table;
 use crate::value::{IntoValue, Value};
 
-// ── Page result ─────────────────────────────────────────────────────
+// ── Page result (offset-based) ─────────────────────────────────────
 
 /// A page of results with metadata for navigation.
 #[derive(Debug, Clone)]
@@ -127,7 +128,7 @@ impl<M: Table> Paginated<M> {
     }
 }
 
-// ── Cursor-based pagination ─────────────────────────────────────────
+// ── Simple cursor-based pagination (single column) ──────────────────
 
 /// Builder for cursor-based pagination (keyset pagination).
 ///
@@ -234,6 +235,594 @@ impl<M: Table> CursorPaginated<M> {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// ── Relay-style cursor pagination ──────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Opaque cursor encoding ─────────────────────────────────────────
+
+/// An opaque, base64-encoded cursor string safe for use in REST/GraphQL APIs.
+///
+/// Internally encodes one or more `Value`s as `col:type:value` pairs separated
+/// by `|`. The encoding is intentionally simple and deterministic.
+///
+/// ```ignore
+/// let cursor = Cursor::encode(&[("id", &Value::I64(42))]);
+/// assert_eq!(cursor.to_string(), "aWQ6aTY0OjQy");  // base64
+///
+/// let values = Cursor::decode(&cursor.to_string()).unwrap();
+/// assert_eq!(values, vec![("id".to_string(), Value::I64(42))]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor(pub String);
+
+impl Cursor {
+    /// Encode column values into an opaque cursor string.
+    pub fn encode(fields: &[(&str, &Value)]) -> Self {
+        let mut raw = String::new();
+        for (i, (col, val)) in fields.iter().enumerate() {
+            if i > 0 {
+                raw.push('|');
+            }
+            let _ = write!(raw, "{}:{}", col, encode_value(val));
+        }
+        Cursor(base64_encode(raw.as_bytes()))
+    }
+
+    /// Decode an opaque cursor string back into column name + value pairs.
+    ///
+    /// Returns `None` if the cursor is malformed.
+    pub fn decode(cursor: &str) -> Option<Vec<(String, Value)>> {
+        let bytes = base64_decode(cursor)?;
+        let raw = std::str::from_utf8(&bytes).ok()?;
+        let mut result = Vec::new();
+        for part in raw.split('|') {
+            let (col, val) = decode_field(part)?;
+            result.push((col, val));
+        }
+        if result.is_empty() {
+            return None;
+        }
+        Some(result)
+    }
+
+    /// The raw opaque string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn encode_value(val: &Value) -> String {
+    match val {
+        Value::I16(v) => format!("i16:{v}"),
+        Value::I32(v) => format!("i32:{v}"),
+        Value::I64(v) => format!("i64:{v}"),
+        Value::F32(v) => format!("f32:{v}"),
+        Value::F64(v) => format!("f64:{v}"),
+        Value::String(s) => format!("str:{s}"),
+        Value::Bool(b) => format!("bool:{b}"),
+        #[cfg(feature = "postgres")]
+        Value::Uuid(u) => format!("uuid:{u}"),
+        #[cfg(feature = "postgres")]
+        Value::Timestamptz(t) => format!("tstz:{}", t.to_rfc3339()),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        Value::Timestamp(t) => format!("ts:{t}"),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        Value::Date(d) => format!("date:{d}"),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        Value::Time(t) => format!("time:{t}"),
+        _ => "null:".to_string(),
+    }
+}
+
+fn decode_field(part: &str) -> Option<(String, Value)> {
+    // Format: "col_name:type:value"
+    let colon1 = part.find(':')?;
+    let col = &part[..colon1];
+    let rest = &part[colon1 + 1..];
+    let colon2 = rest.find(':')?;
+    let typ = &rest[..colon2];
+    let raw = &rest[colon2 + 1..];
+
+    let val = match typ {
+        "i16" => Value::I16(raw.parse().ok()?),
+        "i32" => Value::I32(raw.parse().ok()?),
+        "i64" => Value::I64(raw.parse().ok()?),
+        "f32" => Value::F32(raw.parse().ok()?),
+        "f64" => Value::F64(raw.parse().ok()?),
+        "str" => Value::String(raw.to_string()),
+        "bool" => Value::Bool(raw.parse().ok()?),
+        #[cfg(feature = "postgres")]
+        "uuid" => Value::Uuid(raw.parse().ok()?),
+        #[cfg(feature = "postgres")]
+        "tstz" => Value::Timestamptz(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .ok()?
+                .with_timezone(&chrono::Utc),
+        ),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        "ts" => Value::Timestamp(raw.parse().ok()?),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        "date" => Value::Date(raw.parse().ok()?),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        "time" => Value::Time(raw.parse().ok()?),
+        _ => return None,
+    };
+    Some((col.to_string(), val))
+}
+
+// ── Minimal base64 (no external dependency) ────────────────────────
+
+const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(B64_CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(B64_CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(B64_CHARS[(triple & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let remaining = bytes.len() - i;
+        let b0 = b64_val(bytes[i])?;
+        let b1 = if i + 1 < bytes.len() {
+            b64_val(bytes[i + 1])?
+        } else {
+            return None;
+        };
+        let b2 = if i + 2 < bytes.len() {
+            b64_val(bytes[i + 2])?
+        } else {
+            0
+        };
+        let b3 = if i + 3 < bytes.len() {
+            b64_val(bytes[i + 3])?
+        } else {
+            0
+        };
+        let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if remaining > 2 {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if remaining > 3 {
+            out.push((triple & 0xFF) as u8);
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+fn b64_val(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+        b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+// ── CursorPage — Relay Connection result ───────────────────────────
+
+/// A single edge in a cursor-paginated result.
+///
+/// Pairs a row's cursor with its position in the result set.
+/// The `node` field is not included — the caller maps rows to edges
+/// using [`CursorPage::from_rows`].
+#[derive(Debug, Clone)]
+pub struct Edge {
+    /// Opaque cursor for this row.
+    pub cursor: Cursor,
+}
+
+/// Relay Connection-style page info.
+///
+/// Returned by [`CursorPage`] after processing query results.
+///
+/// ```ignore
+/// // After executing the query:
+/// let page = cursor_builder.into_page(&rows, |row| {
+///     vec![("id", row.get("id").unwrap().clone())]
+/// });
+///
+/// if page.page_info.has_next_page {
+///     let next_cursor = page.page_info.end_cursor.as_ref().unwrap();
+///     // Use next_cursor in the next request
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct PageInfo {
+    /// Whether there are more items after the last edge.
+    pub has_next_page: bool,
+    /// Whether there are more items before the first edge.
+    pub has_previous_page: bool,
+    /// Cursor of the first edge (if any).
+    pub start_cursor: Option<Cursor>,
+    /// Cursor of the last edge (if any).
+    pub end_cursor: Option<Cursor>,
+}
+
+/// A complete cursor-paginated result set (Relay Connection-compatible).
+///
+/// Contains edges with opaque cursors and page navigation info.
+///
+/// # Usage
+///
+/// ```ignore
+/// // 1. Build the query
+/// let builder = User::find()
+///     .filter(User::role.eq("admin"))
+///     .cursor(User::id)
+///     .first(25)
+///     .after_cursor("aWQ6aTY0OjQy");
+///
+/// let (sql, params) = builder.build();
+///
+/// // 2. Execute the query (your DB adapter)
+/// let rows = db.query(&sql, &params).await?;
+///
+/// // 3. Process into a CursorPage
+/// let page = builder.into_page(&rows);
+///
+/// // 4. Use the result
+/// println!("has_next: {}", page.page_info.has_next_page);
+/// for (i, edge) in page.edges.iter().enumerate() {
+///     println!("  row {i}: cursor={}", edge.cursor);
+/// }
+/// if let Some(end) = &page.page_info.end_cursor {
+///     println!("next page: after={end}");
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct CursorPage {
+    /// Edges with opaque cursors (one per result row, excluding the extra probe row).
+    pub edges: Vec<Edge>,
+    /// Navigation metadata.
+    pub page_info: PageInfo,
+}
+
+// ── CursorBuilder — Relay-style fluent API ─────────────────────────
+
+/// A cursor column definition: column name + sort direction.
+#[derive(Debug, Clone)]
+pub struct CursorCol {
+    pub name: &'static str,
+    pub descending: bool,
+}
+
+/// Fluent builder for Relay-style cursor pagination.
+///
+/// Supports single and multi-column cursors, forward (`first`/`after`) and
+/// backward (`last`/`before`) pagination, and optional total count.
+///
+/// # Single-column cursor
+///
+/// ```ignore
+/// let builder = User::find()
+///     .cursor(User::id)
+///     .first(25);
+///
+/// let (sql, params) = builder.build();
+/// // SELECT * FROM users ORDER BY id ASC LIMIT 26
+/// ```
+///
+/// # Multi-column cursor (composite key)
+///
+/// ```ignore
+/// let builder = Post::find()
+///     .cursor_by(vec![
+///         Post::created_at.desc_cursor(),
+///         Post::id.desc_cursor(),
+///     ])
+///     .first(20)
+///     .after_cursor("Y3JlYXRlZF9hdDp0czo...");
+///
+/// let (sql, params) = builder.build();
+/// // SELECT * FROM posts
+/// //   WHERE (created_at, id) < (?, ?)
+/// //   ORDER BY created_at DESC, id DESC
+/// //   LIMIT 21
+/// ```
+///
+/// # With total count
+///
+/// ```ignore
+/// let (data_sql, count_sql, params) = builder.build_with_count();
+/// ```
+pub struct CursorBuilder<M: Table> {
+    inner: SelectBuilder<M>,
+    columns: Vec<CursorCol>,
+    limit: u64,
+    backward: bool,
+    cursor: Option<String>,
+    with_count: bool,
+}
+
+impl<M: Table> CursorBuilder<M> {
+    fn new(inner: SelectBuilder<M>, columns: Vec<CursorCol>) -> Self {
+        assert!(!columns.is_empty(), "cursor requires at least one column");
+        Self {
+            inner,
+            columns,
+            limit: 25,
+            backward: false,
+            cursor: None,
+            with_count: false,
+        }
+    }
+
+    /// Set the page size (forward direction). Default: 25.
+    pub fn first(mut self, n: u64) -> Self {
+        assert!(n >= 1, "first must be >= 1");
+        self.limit = n;
+        self.backward = false;
+        self
+    }
+
+    /// Set the page size (backward direction).
+    pub fn last(mut self, n: u64) -> Self {
+        assert!(n >= 1, "last must be >= 1");
+        self.limit = n;
+        self.backward = true;
+        self
+    }
+
+    /// Paginate after the given opaque cursor (forward).
+    pub fn after_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.cursor = Some(cursor.into());
+        self.backward = false;
+        self
+    }
+
+    /// Paginate before the given opaque cursor (backward).
+    pub fn before_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.cursor = Some(cursor.into());
+        self.backward = true;
+        self
+    }
+
+    /// Also generate a COUNT query (for UIs that need total count).
+    pub fn with_total_count(mut self) -> Self {
+        self.with_count = true;
+        self
+    }
+
+    /// Build the cursor-paginated SQL query.
+    ///
+    /// Fetches `limit + 1` rows to detect whether more pages exist.
+    pub fn build(&self) -> (String, Vec<Value>) {
+        let ast = self.apply_cursor(self.inner.build_ast());
+        let mut params = Vec::new();
+        let sql = ast.render(&mut params);
+        (sql, params)
+    }
+
+    /// Build both the data query and a COUNT query.
+    ///
+    /// Returns `(data_sql, count_sql, data_params, count_params)`.
+    pub fn build_with_count(&self) -> (String, String, Vec<Value>, Vec<Value>) {
+        let count_ast = self.inner.build_ast().to_count_query();
+        let mut count_params = Vec::new();
+        let count_sql = count_ast.render(&mut count_params);
+
+        let data_ast = self.apply_cursor(self.inner.build_ast());
+        let mut data_params = Vec::new();
+        let data_sql = data_ast.render(&mut data_params);
+
+        (data_sql, count_sql, data_params, count_params)
+    }
+
+    fn apply_cursor(&self, ast: SqlFragment) -> SqlFragment {
+        match ast {
+            SqlFragment::Select {
+                columns,
+                from,
+                joins,
+                mut conditions,
+                group_by,
+                having,
+                ..
+            } => {
+                // Decode cursor and add WHERE condition
+                if let Some(ref cursor_str) = self.cursor {
+                    if let Some(decoded) = Cursor::decode(cursor_str) {
+                        let cond = build_cursor_condition(&self.columns, &decoded, self.backward);
+                        if let Some(c) = cond {
+                            conditions.push(c);
+                        }
+                    }
+                }
+
+                // Build ORDER BY from cursor columns
+                let order_by: Vec<OrderFragment> = self
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let descending = if self.backward {
+                            !c.descending
+                        } else {
+                            c.descending
+                        };
+                        OrderFragment {
+                            column: c.name.to_string(),
+                            descending,
+                        }
+                    })
+                    .collect();
+
+                SqlFragment::Select {
+                    columns,
+                    from,
+                    joins,
+                    conditions,
+                    group_by,
+                    having,
+                    order_by,
+                    limit: Some(self.limit + 1),
+                    offset: None,
+                }
+            }
+            raw => raw,
+        }
+    }
+
+    /// Process raw database rows into a [`CursorPage`].
+    ///
+    /// Call this after executing the query returned by [`build()`](Self::build).
+    /// The `cursor_extractor` closure extracts cursor column values from each row.
+    ///
+    /// ```ignore
+    /// let page = builder.into_page(&rows, |row| {
+    ///     vec![("id", row.get("id").unwrap().clone())]
+    /// });
+    /// ```
+    pub fn into_page(
+        &self,
+        rows: &[crate::db::Row],
+        cursor_extractor: impl Fn(&crate::db::Row) -> Vec<(&str, Value)>,
+    ) -> CursorPage {
+        let has_extra = rows.len() as u64 > self.limit;
+        let actual_rows = if has_extra {
+            &rows[..self.limit as usize]
+        } else {
+            rows
+        };
+
+        let mut edges: Vec<Edge> = actual_rows
+            .iter()
+            .map(|row| {
+                let fields = cursor_extractor(row);
+                let refs: Vec<(&str, &Value)> = fields.iter().map(|(k, v)| (*k, v)).collect();
+                Edge {
+                    cursor: Cursor::encode(&refs),
+                }
+            })
+            .collect();
+
+        // For backward pagination, reverse to restore natural order
+        if self.backward {
+            edges.reverse();
+        }
+
+        let (has_next_page, has_previous_page) = if self.backward {
+            (self.cursor.is_some(), has_extra)
+        } else {
+            (has_extra, self.cursor.is_some())
+        };
+
+        let start_cursor = edges.first().map(|e| e.cursor.clone());
+        let end_cursor = edges.last().map(|e| e.cursor.clone());
+
+        CursorPage {
+            edges,
+            page_info: PageInfo {
+                has_next_page,
+                has_previous_page,
+                start_cursor,
+                end_cursor,
+            },
+        }
+    }
+}
+
+/// Build a multi-column cursor WHERE condition.
+///
+/// For a single column `(id)` with forward direction:
+///   `id > ?`
+///
+/// For two columns `(created_at DESC, id DESC)` with forward direction:
+///   `(created_at, id) < (?, ?)`
+///
+/// The comparison operator flips based on the sort direction of the
+/// *first* cursor column and whether we're going backward.
+fn build_cursor_condition(
+    columns: &[CursorCol],
+    decoded: &[(String, Value)],
+    backward: bool,
+) -> Option<Condition> {
+    if columns.len() != decoded.len() {
+        return None;
+    }
+
+    if columns.len() == 1 {
+        // Single-column: simple comparison
+        let col = &columns[0];
+        let (_, val) = &decoded[0];
+        // Forward + ASC → GT, Forward + DESC → LT
+        // Backward + ASC → LT, Backward + DESC → GT
+        let use_gt = col.descending == backward;
+        if use_gt {
+            Some(Condition::Gt(col.name, val.clone()))
+        } else {
+            Some(Condition::Lt(col.name, val.clone()))
+        }
+    } else {
+        // Multi-column: row-value comparison `(a, b) < (?, ?)`
+        // Determine operator from first column's direction
+        let first_desc = columns[0].descending;
+        let use_gt = first_desc == backward;
+        let op = if use_gt { ">" } else { "<" };
+
+        let col_list: Vec<&str> = columns.iter().map(|c| c.name).collect();
+        let placeholders: Vec<&str> = vec!["?"; columns.len()];
+
+        let raw_sql = format!(
+            "({}) {} ({})",
+            col_list.join(", "),
+            op,
+            placeholders.join(", ")
+        );
+
+        let raw_params: Vec<Value> = decoded.iter().map(|(_, v)| v.clone()).collect();
+
+        Some(Condition::Raw(raw_sql, raw_params))
+    }
+}
+
+// ── Column cursor helpers ──────────────────────────────────────────
+
+impl<M: 'static, T: 'static> Column<M, T> {
+    /// Create an ascending cursor column definition.
+    pub fn asc_cursor(&self) -> CursorCol {
+        CursorCol {
+            name: self.name,
+            descending: false,
+        }
+    }
+
+    /// Create a descending cursor column definition.
+    pub fn desc_cursor(&self) -> CursorCol {
+        CursorCol {
+            name: self.name,
+            descending: true,
+        }
+    }
+}
+
 // ── SelectBuilder integration ───────────────────────────────────────
 
 impl<M: Table> SelectBuilder<M> {
@@ -291,6 +880,59 @@ impl<M: Table> SelectBuilder<M> {
             CursorDirection::Backward,
             limit,
         )
+    }
+
+    /// Start building a Relay-style cursor-paginated query on a single column.
+    ///
+    /// ```ignore
+    /// let builder = User::find()
+    ///     .cursor(User::id)
+    ///     .first(25)
+    ///     .after_cursor("aWQ6aTY0OjQy");
+    ///
+    /// let (sql, params) = builder.build();
+    /// ```
+    pub fn cursor<T: 'static>(self, col: Column<M, T>) -> CursorBuilder<M> {
+        CursorBuilder::new(
+            self,
+            vec![CursorCol {
+                name: col.name,
+                descending: false,
+            }],
+        )
+    }
+
+    /// Start building a Relay-style cursor-paginated query on a single column
+    /// with descending order.
+    ///
+    /// ```ignore
+    /// let builder = Post::find()
+    ///     .cursor_desc(Post::created_at)
+    ///     .first(20);
+    /// ```
+    pub fn cursor_desc<T: 'static>(self, col: Column<M, T>) -> CursorBuilder<M> {
+        CursorBuilder::new(
+            self,
+            vec![CursorCol {
+                name: col.name,
+                descending: true,
+            }],
+        )
+    }
+
+    /// Start building a Relay-style cursor-paginated query with multiple
+    /// cursor columns (composite key).
+    ///
+    /// ```ignore
+    /// let builder = Post::find()
+    ///     .cursor_by(vec![
+    ///         Post::created_at.desc_cursor(),
+    ///         Post::id.desc_cursor(),
+    ///     ])
+    ///     .first(20);
+    /// ```
+    pub fn cursor_by(self, columns: Vec<CursorCol>) -> CursorBuilder<M> {
+        CursorBuilder::new(self, columns)
     }
 }
 

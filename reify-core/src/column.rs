@@ -9,11 +9,23 @@ use crate::value::IntoValue;
 ///
 /// Generated as associated constants by `#[derive(Table)]`.
 /// Provides type-safe filter methods that depend on `T`.
+///
+/// `Copy + Clone` because the struct only holds a `&'static str` and
+/// `PhantomData` — this lets free functions in [`crate::func`] accept
+/// columns by value without requiring explicit `.clone()`.
 pub struct Column<M, T> {
     pub name: &'static str,
     _model: PhantomData<M>,
     _type: PhantomData<T>,
 }
+
+impl<M, T> Clone for Column<M, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M, T> Copy for Column<M, T> {}
 
 impl<M, T> Column<M, T> {
     pub const fn new(name: &'static str) -> Self {

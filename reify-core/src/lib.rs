@@ -2,6 +2,7 @@ pub mod column;
 pub mod condition;
 pub mod db;
 pub mod enumeration;
+pub mod func;
 pub mod hooks;
 pub mod paginate;
 pub mod query;
@@ -30,11 +31,14 @@ pub use table::Table;
 pub use value::Value;
 
 pub use schema::{
-    table, ColumnBuilder, ColumnDef, IndexBuilder, IndexDef, IndexKind, Schema, SqlType,
-    TableSchema,
+    table, ColumnBuilder, ColumnDef, ComputedColumn, IndexBuilder, IndexDef, IndexKind, Schema,
+    SqlType, TableSchema, TimestampKind, TimestampSource,
 };
 
-pub use paginate::{CursorDirection, CursorPaginated, Page, Paginated};
+pub use paginate::{
+    Cursor, CursorBuilder, CursorCol, CursorDirection, CursorPage, CursorPaginated, Edge, Page,
+    PageInfo, Paginated,
+};
 
 pub use db::{Database, DynDatabase, DbError, FromRow, Row, BoxFuture, TransactionFn, delete, fetch, fetch_all, insert, insert_many, update, sqlstate};
 

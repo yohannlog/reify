@@ -116,6 +116,54 @@ impl Value {
             | Value::ArrayUuid(_) => SqlType::Text,
         }
     }
+
+    /// Render this value as a SQL literal (for use in generated SQL fragments
+    /// like `COALESCE(col, <literal>)`).
+    ///
+    /// Strings are single-quoted with inner quotes escaped. `NULL` is rendered
+    /// as the keyword `NULL`. Numeric and boolean types use their natural
+    /// representation.
+    pub fn to_sql_literal(&self) -> String {
+        match self {
+            Value::Null => "NULL".to_string(),
+            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Value::I16(v) => v.to_string(),
+            Value::I32(v) => v.to_string(),
+            Value::I64(v) => v.to_string(),
+            Value::F32(v) => v.to_string(),
+            Value::F64(v) => v.to_string(),
+            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Bytes(_) => "NULL".to_string(),
+            #[cfg(feature = "postgres")]
+            Value::Uuid(u) => format!("'{u}'"),
+            #[cfg(feature = "postgres")]
+            Value::Timestamptz(t) => format!("'{t}'"),
+            #[cfg(feature = "postgres")]
+            Value::Jsonb(j) => format!("'{}'", j.to_string().replace('\'', "''")),
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Value::Timestamp(t) => format!("'{t}'"),
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Value::Date(d) => format!("'{d}'"),
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Value::Time(t) => format!("'{t}'"),
+            // Ranges and arrays — fall back to NULL for literal rendering.
+            #[cfg(feature = "postgres")]
+            Value::Int4Range(_)
+            | Value::Int8Range(_)
+            | Value::TsRange(_)
+            | Value::TstzRange(_)
+            | Value::DateRange(_) => "NULL".to_string(),
+            #[cfg(feature = "postgres")]
+            Value::ArrayBool(_)
+            | Value::ArrayI16(_)
+            | Value::ArrayI32(_)
+            | Value::ArrayI64(_)
+            | Value::ArrayF32(_)
+            | Value::ArrayF64(_)
+            | Value::ArrayString(_)
+            | Value::ArrayUuid(_) => "NULL".to_string(),
+        }
+    }
 }
 
 /// Trait for types that can be converted into a `Value`.

@@ -194,3 +194,5 @@ Temporary Items
 #*.db3
 #*.db-wal
 #*.db-shm
+# Added by code-review-graph
+.code-review-graph/

@@ -412,6 +412,9 @@ fn create_table_uses_metadata_types_not_heuristics() {
             index: false,
             nullable: false,
             default: None,
+            computed: None,
+            timestamp_kind: None,
+            timestamp_source: reify::TimestampSource::Vm,
         },
         ColumnDef {
             name: "email",
@@ -422,6 +425,9 @@ fn create_table_uses_metadata_types_not_heuristics() {
             index: false,
             nullable: false,
             default: None,
+            computed: None,
+            timestamp_kind: None,
+            timestamp_source: reify::TimestampSource::Vm,
         },
         ColumnDef {
             name: "role",
@@ -432,6 +438,9 @@ fn create_table_uses_metadata_types_not_heuristics() {
             index: false,
             nullable: true,
             default: None,
+            computed: None,
+            timestamp_kind: None,
+            timestamp_source: reify::TimestampSource::Vm,
         },
     ];
 

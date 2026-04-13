@@ -325,6 +325,7 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let mut col_types = Vec::new();
     let mut value_conversions = Vec::new();
     let mut single_col_indexes: Vec<String> = Vec::new();
+    let mut update_ts_vm_cols: Vec<String> = Vec::new();
 
     let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
@@ -342,9 +343,24 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             single_col_indexes.push(name_str.clone());
         }
 
-        value_conversions.push(quote! {
-            reify_core::value::IntoValue::into_value(self.#ident.clone())
-        });
+        // Track VM-source update_timestamp columns for override generation
+        if col_attrs.update_timestamp && col_attrs.timestamp_source.as_deref() != Some("db") {
+            update_ts_vm_cols.push(name_str.clone());
+        }
+
+        // Determine if this is a VM-source timestamp (inject Utc::now())
+        let is_vm_timestamp = (col_attrs.creation_timestamp || col_attrs.update_timestamp)
+            && col_attrs.timestamp_source.as_deref() != Some("db");
+
+        if is_vm_timestamp {
+            value_conversions.push(quote! {
+                reify_core::value::IntoValue::into_value(chrono::Utc::now())
+            });
+        } else {
+            value_conversions.push(quote! {
+                reify_core::value::IntoValue::into_value(self.#ident.clone())
+            });
+        }
 
         // Determine SqlType and nullable from the Rust type + attributes
         let (is_option, inner_ty) = unwrap_option_type(ty);
@@ -362,9 +378,36 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let is_auto = col_attrs.auto_increment;
         let is_unique = col_attrs.unique;
         let is_index = col_attrs.index;
+
+        // For db-source timestamps, auto-set default to NOW() if not explicitly provided
+        let is_db_source = col_attrs.timestamp_source.as_deref() == Some("db");
         let default_token = match &col_attrs.default {
             Some(d) => quote! { Some(#d.to_string()) },
+            None if is_db_source => quote! { Some("NOW()".to_string()) },
             None => quote! { None },
+        };
+
+        let computed_token = if let Some(ref expr) = col_attrs.computed {
+            quote! { Some(reify_core::schema::ComputedColumn::Stored(#expr.to_string())) }
+        } else if col_attrs.computed_rust {
+            quote! { Some(reify_core::schema::ComputedColumn::Virtual) }
+        } else {
+            quote! { None }
+        };
+
+        // Timestamp kind & source tokens
+        let timestamp_kind_token = if col_attrs.creation_timestamp {
+            quote! { Some(reify_core::schema::TimestampKind::Creation) }
+        } else if col_attrs.update_timestamp {
+            quote! { Some(reify_core::schema::TimestampKind::Update) }
+        } else {
+            quote! { None }
+        };
+
+        let timestamp_source_token = if is_db_source {
+            quote! { reify_core::schema::TimestampSource::Db }
+        } else {
+            quote! { reify_core::schema::TimestampSource::Vm }
         };
 
         col_defs_tokens.push(quote! {
@@ -377,6 +420,9 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 index: #is_index,
                 nullable: #is_nullable,
                 default: #default_token,
+                computed: #computed_token,
+                timestamp_kind: #timestamp_kind_token,
+                timestamp_source: #timestamp_source_token,
             }
         });
     }
@@ -463,6 +509,10 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
             fn indexes() -> Vec<reify_core::IndexDef> {
                 vec![#(#all_index_tokens),*]
+            }
+
+            fn update_timestamp_columns() -> Vec<&'static str> {
+                vec![#(#update_ts_vm_cols),*]
             }
         }
 
@@ -698,6 +748,16 @@ struct ColumnAttrs {
     index: bool,
     default: Option<String>,
     sql_type: Option<String>,
+    /// DB-generated computed column: `GENERATED ALWAYS AS (expr) STORED`.
+    computed: Option<String>,
+    /// Rust-side virtual column: not in the DB, computed after fetch.
+    computed_rust: bool,
+    /// Auto-set on INSERT (like Hibernate's `@CreationTimestamp`).
+    creation_timestamp: bool,
+    /// Auto-set on INSERT and UPDATE (like Hibernate's `@UpdateTimestamp`).
+    update_timestamp: bool,
+    /// Source of the current date: `"vm"` (default) or `"db"`.
+    timestamp_source: Option<String>,
 }
 
 /// Parse `#[column(...)]` attributes using proper `syn` parsing.
@@ -729,6 +789,24 @@ fn parse_column_attrs(attrs: &[Attribute]) -> ColumnAttrs {
                 let lit: Lit = value.parse()?;
                 if let Lit::Str(s) = lit {
                     result.sql_type = Some(s.value());
+                }
+            } else if meta.path.is_ident("computed") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.computed = Some(s.value());
+                }
+            } else if meta.path.is_ident("computed_rust") {
+                result.computed_rust = true;
+            } else if meta.path.is_ident("creation_timestamp") {
+                result.creation_timestamp = true;
+            } else if meta.path.is_ident("update_timestamp") {
+                result.update_timestamp = true;
+            } else if meta.path.is_ident("source") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.timestamp_source = Some(s.value());
                 }
             }
             Ok(())

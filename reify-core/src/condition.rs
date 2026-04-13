@@ -70,6 +70,11 @@ pub enum Condition {
     AggregateEq(Expr, Value),
     /// `col IN (SELECT ...)` — subquery filter.
     InSubquery(&'static str, String, Vec<Value>),
+    /// Raw SQL condition with bound parameters.
+    ///
+    /// Used internally for row-value comparisons in cursor pagination
+    /// (e.g. `(created_at, id) < (?, ?)`).
+    Raw(String, Vec<Value>),
 }
 
 #[derive(Debug, Clone)]

@@ -115,6 +115,66 @@ impl Default for SqlType {
     }
 }
 
+// ── Timestamp generation ────────────────────────────────────────────
+
+/// Identifies the role of an auto-managed timestamp column.
+///
+/// Equivalent to Hibernate's `@CreationTimestamp` / `@UpdateTimestamp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampKind {
+    /// Set once on INSERT (like Hibernate's `@CreationTimestamp`).
+    Creation,
+    /// Set on INSERT **and** every UPDATE (like Hibernate's `@UpdateTimestamp`).
+    Update,
+}
+
+/// Where the current date/time value comes from.
+///
+/// Equivalent to Hibernate's `CurrentTimestampGeneration` source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampSource {
+    /// Application-side: Rust generates `Utc::now()` and binds it as a parameter.
+    ///
+    /// This is the default — the ORM controls the value, ensuring consistency
+    /// across all database backends.
+    #[default]
+    Vm,
+    /// Database-side: the column uses `DEFAULT NOW()` / `CURRENT_TIMESTAMP`.
+    ///
+    /// The column is excluded from INSERT/UPDATE parameter lists and the
+    /// database engine provides the value. For `Update` + `Db` on MySQL,
+    /// `ON UPDATE CURRENT_TIMESTAMP` is emitted in DDL.
+    Db,
+}
+
+// ── Computed column ─────────────────────────────────────────────────
+
+/// Describes how a column value is computed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComputedColumn {
+    /// Database-generated column: `GENERATED ALWAYS AS (expr) STORED`.
+    ///
+    /// The expression is raw SQL evaluated by the database engine.
+    /// The column exists in the table but is never included in INSERT/UPDATE.
+    ///
+    /// ```ignore
+    /// #[column(computed = "first_name || ' ' || last_name")]
+    /// pub full_name: String,
+    /// ```
+    Stored(String),
+
+    /// Rust-side virtual column: computed in application code after fetch.
+    ///
+    /// The column does **not** exist in the database at all — it is populated
+    /// by a closure or `Default` after the row is read.
+    ///
+    /// ```ignore
+    /// #[column(computed_rust)]
+    /// pub display_name: String,
+    /// ```
+    Virtual,
+}
+
 // ── Column attributes ───────────────────────────────────────────────
 
 /// Metadata for a single column, built via the fluent `ColumnBuilder`.
@@ -128,6 +188,12 @@ pub struct ColumnDef {
     pub index: bool,
     pub nullable: bool,
     pub default: Option<String>,
+    /// When set, the column is computed and excluded from INSERT/UPDATE.
+    pub computed: Option<ComputedColumn>,
+    /// Auto-managed timestamp role (`Creation` or `Update`).
+    pub timestamp_kind: Option<TimestampKind>,
+    /// Where the timestamp value comes from (`Vm` or `Db`).
+    pub timestamp_source: TimestampSource,
 }
 
 /// Fluent builder for column attributes — fully autocompleted by rust-analyzer.
@@ -147,6 +213,9 @@ impl ColumnBuilder {
                 index: false,
                 nullable: false,
                 default: None,
+                computed: None,
+                timestamp_kind: None,
+                timestamp_source: TimestampSource::Vm,
             },
         }
     }
@@ -184,6 +253,61 @@ impl ColumnBuilder {
 
     pub fn default(mut self, value: impl Into<String>) -> Self {
         self.def.default = Some(value.into());
+        self
+    }
+
+    /// Mark this column as a database-generated computed column.
+    ///
+    /// The column will be defined as `GENERATED ALWAYS AS (expr) STORED`
+    /// and excluded from INSERT/UPDATE statements.
+    pub fn computed_stored(mut self, expr: impl Into<String>) -> Self {
+        self.def.computed = Some(ComputedColumn::Stored(expr.into()));
+        self
+    }
+
+    /// Mark this column as a Rust-side virtual column.
+    ///
+    /// The column will not exist in the database — it is computed in
+    /// application code after fetching.
+    pub fn computed_virtual(mut self) -> Self {
+        self.def.computed = Some(ComputedColumn::Virtual);
+        self
+    }
+
+    /// Mark as a creation timestamp — set once on INSERT.
+    ///
+    /// By default uses `Vm` source (Rust-side `Utc::now()`). Chain
+    /// `.source_db()` to let the database provide the value instead.
+    ///
+    /// ```ignore
+    /// .column(User::created_at, |c| c.creation_timestamp())
+    /// .column(User::created_at, |c| c.creation_timestamp().source_db())
+    /// ```
+    pub fn creation_timestamp(mut self) -> Self {
+        self.def.timestamp_kind = Some(TimestampKind::Creation);
+        self
+    }
+
+    /// Mark as an update timestamp — set on INSERT **and** every UPDATE.
+    ///
+    /// By default uses `Vm` source (Rust-side `Utc::now()`). Chain
+    /// `.source_db()` to let the database provide the value instead.
+    ///
+    /// ```ignore
+    /// .column(User::updated_at, |c| c.update_timestamp())
+    /// .column(User::updated_at, |c| c.update_timestamp().source_db())
+    /// ```
+    pub fn update_timestamp(mut self) -> Self {
+        self.def.timestamp_kind = Some(TimestampKind::Update);
+        self
+    }
+
+    /// Use the database as the source of the current date/time.
+    ///
+    /// The column will get `DEFAULT NOW()` / `CURRENT_TIMESTAMP` in DDL
+    /// and be excluded from INSERT/UPDATE parameter lists.
+    pub fn source_db(mut self) -> Self {
+        self.def.timestamp_source = TimestampSource::Db;
         self
     }
 }

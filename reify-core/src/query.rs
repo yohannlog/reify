@@ -128,6 +128,8 @@ pub enum Expr {
     Col(&'static str),
     /// `COUNT(col)` or `COUNT(*)`.
     Count(Option<&'static str>),
+    /// `COUNT(DISTINCT col)`.
+    CountDistinct(&'static str),
     /// `SUM(col)`.
     Sum(&'static str),
     /// `AVG(col)`.
@@ -136,6 +138,18 @@ pub enum Expr {
     Min(&'static str),
     /// `MAX(col)`.
     Max(&'static str),
+    /// `UPPER(col)`.
+    Upper(&'static str),
+    /// `LOWER(col)`.
+    Lower(&'static str),
+    /// `LENGTH(col)`.
+    Length(&'static str),
+    /// `ABS(col)`.
+    Abs(&'static str),
+    /// `ROUND(col)` or `ROUND(col, precision)`.
+    Round(&'static str, Option<i32>),
+    /// `COALESCE(col, default)`.
+    Coalesce(&'static str, Box<Value>),
 }
 
 impl Expr {
@@ -145,10 +159,18 @@ impl Expr {
             Expr::Col(c) => c.to_string(),
             Expr::Count(None) => "COUNT(*)".to_string(),
             Expr::Count(Some(c)) => format!("COUNT({c})"),
+            Expr::CountDistinct(c) => format!("COUNT(DISTINCT {c})"),
             Expr::Sum(c) => format!("SUM({c})"),
             Expr::Avg(c) => format!("AVG({c})"),
             Expr::Min(c) => format!("MIN({c})"),
             Expr::Max(c) => format!("MAX({c})"),
+            Expr::Upper(c) => format!("UPPER({c})"),
+            Expr::Lower(c) => format!("LOWER({c})"),
+            Expr::Length(c) => format!("LENGTH({c})"),
+            Expr::Abs(c) => format!("ABS({c})"),
+            Expr::Round(c, None) => format!("ROUND({c})"),
+            Expr::Round(c, Some(p)) => format!("ROUND({c}, {p})"),
+            Expr::Coalesce(c, default) => format!("COALESCE({c}, {})", default.to_sql_literal()),
         }
     }
 }
@@ -370,7 +392,7 @@ pub struct InsertBuilder<M: Table> {
 impl<M: Table> InsertBuilder<M> {
     pub fn new(model: &M) -> Self {
         Self {
-            values: model.into_values(),
+            values: model.writable_values(),
             on_conflict: None,
             #[cfg(feature = "postgres")]
             returning: None,
@@ -424,7 +446,7 @@ impl<M: Table> InsertBuilder<M> {
     /// Build SQL for a specific [`Dialect`].
     #[allow(unused_mut)]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        let col_names = M::column_names();
+        let col_names = M::writable_column_names();
         let num_cols = self.values.len();
 
         // MySQL INSERT IGNORE prefix
@@ -435,7 +457,7 @@ impl<M: Table> InsertBuilder<M> {
 
         let mut sql = String::with_capacity(64 + num_cols * 3);
         let _ = write!(sql, "{insert_kw} INTO {} (", M::table_name());
-        write_joined(&mut sql, col_names, ", ", |buf, c| buf.push_str(c));
+        write_joined(&mut sql, &col_names, ", ", |buf, c| buf.push_str(c));
         sql.push_str(") VALUES (");
         for i in 0..num_cols {
             if i > 0 {
@@ -477,7 +499,7 @@ impl<M: Table> InsertManyBuilder<M> {
     pub fn new(models: &[M]) -> Self {
         assert!(!models.is_empty(), "insert_many requires at least one row");
         Self {
-            rows: models.iter().map(|m| m.into_values()).collect(),
+            rows: models.iter().map(|m| m.writable_values()).collect(),
             on_conflict: None,
             #[cfg(feature = "postgres")]
             returning: None,
@@ -519,7 +541,7 @@ impl<M: Table> InsertManyBuilder<M> {
     /// Build SQL for a specific [`Dialect`].
     #[allow(unused_mut)]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        let col_names = M::column_names();
+        let col_names = M::writable_column_names();
         let num_cols = col_names.len();
         let num_rows = self.rows.len();
 
@@ -534,7 +556,7 @@ impl<M: Table> InsertManyBuilder<M> {
         // Capacity: keyword + table + cols + VALUES rows
         let mut sql = String::with_capacity(64 + num_cols * 3 + num_rows * (num_cols * 3 + 4));
         let _ = write!(sql, "{insert_kw} INTO {} (", M::table_name());
-        write_joined(&mut sql, col_names, ", ", |buf, c| buf.push_str(c));
+        write_joined(&mut sql, &col_names, ", ", |buf, c| buf.push_str(c));
         sql.push_str(") VALUES ");
 
         // Write (?, ?, ?), (?, ?, ?), … directly
@@ -886,6 +908,10 @@ impl<M: Table> UpdateBuilder<M> {
     }
 
     /// Build the SQL. Panics if no WHERE clause — safety by default.
+    ///
+    /// Automatically injects `SET col = NOW()` for columns marked as
+    /// `update_timestamp` with `Vm` source, unless the caller already
+    /// set them explicitly via `.set()`.
     #[allow(unused_mut)]
     pub fn build(&self) -> (String, Vec<Value>) {
         assert!(
@@ -893,11 +919,27 @@ impl<M: Table> UpdateBuilder<M> {
             "UPDATE without WHERE is forbidden. Use .filter() or .filter_all() explicitly."
         );
 
+        // Auto-inject update_timestamp columns (Vm source) that the caller didn't set.
+        let mut all_sets = self.sets.clone();
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        {
+            let ts_cols = M::update_timestamp_columns();
+            for col_name in ts_cols {
+                if !all_sets.iter().any(|(c, _)| *c == col_name) {
+                    #[cfg(feature = "postgres")]
+                    let now_val = Value::Timestamptz(chrono::Utc::now());
+                    #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+                    let now_val = Value::Timestamp(chrono::Utc::now().naive_utc());
+                    all_sets.push((col_name, now_val));
+                }
+            }
+        }
+
         let mut params = Vec::new();
-        let mut sql = String::with_capacity(64 + self.sets.len() * 16);
+        let mut sql = String::with_capacity(64 + all_sets.len() * 16);
         let _ = write!(sql, "UPDATE {} SET ", M::table_name());
 
-        write_joined(&mut sql, &self.sets, ", ", |buf, (col, val)| {
+        write_joined(&mut sql, &all_sets, ", ", |buf, (col, val)| {
             params.push(val.clone());
             let _ = write!(buf, "{col} = ?");
         });
