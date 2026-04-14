@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: reify
+      POSTGRES_PASSWORD: reify
+      POSTGRES_DB: reify_test
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reify -d reify_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: reify
+      MYSQL_DATABASE: reify_test
+      MYSQL_USER: reify
+      MYSQL_PASSWORD: reify
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "reify", "-preify"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
