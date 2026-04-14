@@ -5,8 +5,8 @@ edition.workspace = true
 
 [features]
 default = []
-postgres = ["dep:reify-postgres", "reify-core/postgres"]
-mysql = ["dep:reify-mysql", "reify-core/mysql"]
+postgres = ["dep:reify-postgres", "reify-core/postgres", "reify-sqlite?/postgres", "reify-mysql?/postgres"]
+mysql = ["dep:reify-mysql", "reify-core/mysql", "reify-sqlite?/mysql"]
 sqlite = ["dep:reify-sqlite"]
 dto = ["reify-macros/dto"]
 dto-validation = ["reify-macros/dto-validation", "dto", "dep:validator"]

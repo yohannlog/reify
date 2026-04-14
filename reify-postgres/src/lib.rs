@@ -463,19 +463,43 @@ async fn get_conn(pool: &Pool) -> Result<deadpool_postgres::Object, DbError> {
         .map_err(|e| DbError::Connection(e.to_string()))
 }
 
+/// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params.
+///
+/// Raw SQL helpers (e.g. `raw_execute`, `MigrationRunner::mark_applied`) use `?`
+/// as the canonical placeholder. The postgres adapter normalises them to `$N`
+/// at execution time so callers never need to know which dialect they're on.
+/// SQL that already uses `$N` (from `build_pg()`) passes through unchanged.
+fn rewrite_placeholders_pg(sql: &str) -> String {
+    reify_core::query::rewrite_placeholders_pg(sql)
+}
+
+/// Rewrite placeholders and marshal `Value` params into postgres-typed refs.
+///
+/// Returns `(rewritten_sql, owned_wrappers, param_refs)`. The refs borrow from
+/// the owned wrappers, so all three must be kept alive for the duration of the
+/// client call.
+fn prepare_pg_params<'a>(
+    sql: &str,
+    params: &'a [Value],
+    pg_params: &'a mut Vec<PgValue<'a>>,
+) -> (String, Vec<&'a (dyn PgToSql + Sync)>) {
+    let sql = rewrite_placeholders_pg(sql);
+    *pg_params = params.iter().map(PgValue).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> =
+        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    (sql, param_refs)
+}
+
 /// Prepare params and execute a statement on a `tokio_postgres::Client`.
 async fn pg_execute(
     client: &tokio_postgres::Client,
     sql: &str,
     params: &[Value],
 ) -> Result<u64, DbError> {
-    let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-    let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
-        .iter()
-        .map(|p| p as &(dyn PgToSql + Sync))
-        .collect();
+    let mut pg_params = Vec::new();
+    let (sql, param_refs) = prepare_pg_params(sql, params, &mut pg_params);
     debug!(target: "reify::postgres", sql = %sql, "Executing");
-    client.execute(sql, &param_refs[..]).await.map_err(pg_err)
+    client.execute(&sql, &param_refs[..]).await.map_err(pg_err)
 }
 
 /// Prepare params and run a query on a `tokio_postgres::Client`.
@@ -484,13 +508,10 @@ async fn pg_query(
     sql: &str,
     params: &[Value],
 ) -> Result<Vec<Row>, DbError> {
-    let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-    let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
-        .iter()
-        .map(|p| p as &(dyn PgToSql + Sync))
-        .collect();
+    let mut pg_params = Vec::new();
+    let (sql, param_refs) = prepare_pg_params(sql, params, &mut pg_params);
     debug!(target: "reify::postgres", sql = %sql, "Querying");
-    let rows = client.query(sql, &param_refs[..]).await.map_err(pg_err)?;
+    let rows = client.query(&sql, &param_refs[..]).await.map_err(pg_err)?;
     Ok(rows.iter().map(pg_row_to_row).collect())
 }
 
@@ -500,14 +521,11 @@ async fn pg_query_one(
     sql: &str,
     params: &[Value],
 ) -> Result<Row, DbError> {
-    let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-    let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
-        .iter()
-        .map(|p| p as &(dyn PgToSql + Sync))
-        .collect();
+    let mut pg_params = Vec::new();
+    let (sql, param_refs) = prepare_pg_params(sql, params, &mut pg_params);
     debug!(target: "reify::postgres", sql = %sql, "Querying one");
     let row = client
-        .query_one(sql, &param_refs[..])
+        .query_one(&sql, &param_refs[..])
         .await
         .map_err(pg_err)?;
     Ok(pg_row_to_row(&row))
@@ -532,6 +550,7 @@ impl Database for PostgresDb {
         params: Vec<Value>,
     ) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
         let conn = get_conn(&self.pool).await?;
+        let sql = rewrite_placeholders_pg(&sql);
         let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
         let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
             .iter()

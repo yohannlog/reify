@@ -3,6 +3,10 @@ name = "reify-sqlite"
 version.workspace = true
 edition.workspace = true
 
+[features]
+postgres = ["reify-core/postgres"]
+mysql = ["reify-core/mysql"]
+
 [dependencies]
 reify-core = { path = "../reify-core", version = "0.1.0" }
 rusqlite = { version = "0.31", features = ["bundled"] }

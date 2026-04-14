@@ -1,0 +1,5 @@
+error: unknown `db_enum` attribute `Rename`; expected `rename`
+ --> tests/compile_fail/db_enum_unknown_attr.rs:9:15
+  |
+9 |     #[db_enum(Rename = "moderator")]
+  |               ^^^^^^

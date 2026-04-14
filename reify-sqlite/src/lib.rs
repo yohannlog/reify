@@ -53,8 +53,15 @@ fn value_to_sqlite(v: &Value) -> rusqlite::types::Value {
         Value::F64(f) => rusqlite::types::Value::Real(*f),
         Value::String(s) => rusqlite::types::Value::Text(s.clone()),
         Value::Bytes(b) => rusqlite::types::Value::Blob(b.clone()),
+        // Any Value variant not handled above (e.g. temporal types from the
+        // mysql/postgres feature, or PostgreSQL-only types like Uuid, Jsonb,
+        // range and array types) cannot be silently converted to NULL.
+        // Panic immediately with a clear message instead.
         #[allow(unreachable_patterns)]
-        _ => rusqlite::types::Value::Null,
+        other => unreachable!(
+            "{other:?} cannot be bound as a SQLite parameter; \
+             use only Value variants supported by SQLite"
+        ),
     }
 }
 
@@ -89,6 +96,20 @@ fn map_rusqlite_err(e: rusqlite::Error) -> DbError {
 }
 
 // ── Shared helpers for rusqlite operations ──────────────────────────
+
+/// Run a blocking rusqlite closure on a pooled thread, mapping join errors to `DbError`.
+async fn sqlite_spawn<F, T>(conn: Arc<Mutex<rusqlite::Connection>>, f: F) -> Result<T, DbError>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<T, DbError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
+        f(&conn)
+    })
+    .await
+    .map_err(|e| DbError::Other(e.to_string()))?
+}
 
 /// Execute a statement on a locked connection. Returns rows affected.
 fn sqlite_execute(
@@ -147,12 +168,7 @@ impl Database for SqliteDb {
         let conn = Arc::clone(&self.conn);
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-            sqlite_execute(&conn, &sql, &params)
-        })
-        .await
-        .map_err(|e| DbError::Other(e.to_string()))?
+        sqlite_spawn(conn, move |c| sqlite_execute(c, &sql, &params)).await
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
@@ -160,12 +176,7 @@ impl Database for SqliteDb {
         let conn = Arc::clone(&self.conn);
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-            sqlite_query(&conn, &sql, &params)
-        })
-        .await
-        .map_err(|e| DbError::Other(e.to_string()))?
+        sqlite_spawn(conn, move |c| sqlite_query(c, &sql, &params)).await
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
@@ -183,16 +194,7 @@ impl Database for SqliteDb {
         // this transaction.
         let _txn_guard = self.txn_lock.lock().await;
 
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking({
-            let conn = Arc::clone(&conn);
-            move || {
-                let c = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-                sqlite_execute(&c, "BEGIN", &[])
-            }
-        })
-        .await
-        .map_err(|e| DbError::Other(e.to_string()))??;
+        sqlite_spawn(Arc::clone(&self.conn), |c| sqlite_execute(c, "BEGIN", &[])).await?;
 
         let txn = SqliteTransaction {
             conn: Arc::clone(&self.conn),
@@ -200,22 +202,14 @@ impl Database for SqliteDb {
 
         match f(&txn).await {
             Ok(()) => {
-                let conn = Arc::clone(&txn.conn);
-                tokio::task::spawn_blocking(move || {
-                    let c = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-                    sqlite_execute(&c, "COMMIT", &[])
-                })
-                .await
-                .map_err(|e| DbError::Other(e.to_string()))??;
-                Ok(())
+                sqlite_spawn(Arc::clone(&txn.conn), |c| sqlite_execute(c, "COMMIT", &[]))
+                    .await
+                    .map(|_| ())
             }
             Err(e) => {
-                let conn = Arc::clone(&txn.conn);
-                let _ = tokio::task::spawn_blocking(move || {
-                    let c = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-                    sqlite_execute(&c, "ROLLBACK", &[])
-                })
-                .await;
+                let _ =
+                    sqlite_spawn(Arc::clone(&txn.conn), |c| sqlite_execute(c, "ROLLBACK", &[]))
+                        .await;
                 Err(e)
             }
         }
@@ -237,24 +231,14 @@ impl Database for SqliteTransaction {
         let conn = Arc::clone(&self.conn);
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-            sqlite_execute(&conn, &sql, &params)
-        })
-        .await
-        .map_err(|e| DbError::Other(e.to_string()))?
+        sqlite_spawn(conn, move |c| sqlite_execute(c, &sql, &params)).await
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
         let conn = Arc::clone(&self.conn);
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-            sqlite_query(&conn, &sql, &params)
-        })
-        .await
-        .map_err(|e| DbError::Other(e.to_string()))?
+        sqlite_spawn(conn, move |c| sqlite_query(c, &sql, &params)).await
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
@@ -268,30 +252,22 @@ impl Database for SqliteTransaction {
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         // Nested transaction via SAVEPOINT
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
-            let c = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-            sqlite_execute(&c, "SAVEPOINT nested_txn", &[])
+        sqlite_spawn(Arc::clone(&self.conn), |c| {
+            sqlite_execute(c, "SAVEPOINT nested_txn", &[])
         })
-        .await
-        .map_err(|e| DbError::Other(e.to_string()))??;
+        .await?;
 
         match f(self).await {
             Ok(()) => {
-                let conn = Arc::clone(&self.conn);
-                tokio::task::spawn_blocking(move || {
-                    let c = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-                    sqlite_execute(&c, "RELEASE SAVEPOINT nested_txn", &[])
+                sqlite_spawn(Arc::clone(&self.conn), |c| {
+                    sqlite_execute(c, "RELEASE SAVEPOINT nested_txn", &[])
                 })
                 .await
-                .map_err(|e| DbError::Other(e.to_string()))??;
-                Ok(())
+                .map(|_| ())
             }
             Err(e) => {
-                let conn = Arc::clone(&self.conn);
-                let _ = tokio::task::spawn_blocking(move || {
-                    let c = conn.lock().map_err(|e| DbError::Other(e.to_string()))?;
-                    sqlite_execute(&c, "ROLLBACK TO SAVEPOINT nested_txn", &[])
+                let _ = sqlite_spawn(Arc::clone(&self.conn), |c| {
+                    sqlite_execute(c, "ROLLBACK TO SAVEPOINT nested_txn", &[])
                 })
                 .await;
                 Err(e)

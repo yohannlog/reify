@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Attribute, Data, DeriveInput, Fields, Lit, Path, parse::Parse, parse_macro_input};
+use syn::{parse::Parse, parse_macro_input, Attribute, Data, DeriveInput, Fields, Lit, Path};
 
 /// Derive macro that implements `Table` and generates typed column constants + query builder helpers.
 ///
@@ -350,7 +350,7 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         col_idents.push(ident.clone());
         col_types.push(ty.clone());
 
-        let col_attrs = parse_column_attrs(&field.attrs);
+        let col_attrs = parse_column_attrs(&field.attrs)?;
         if col_attrs.index {
             single_col_indexes.push(name_str.clone());
         }
@@ -875,7 +875,7 @@ fn impl_db_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
 
         let ident = &variant.ident;
-        let db_name = parse_db_enum_rename(&variant.attrs)
+        let db_name = parse_db_enum_rename(&variant.attrs)?
             .unwrap_or_else(|| to_snake_case(&ident.to_string()));
 
         variant_idents.push(ident.clone());
@@ -948,27 +948,34 @@ fn impl_db_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 }
 
 /// Parse `#[db_enum(rename = "...")]` on a variant.
-fn parse_db_enum_rename(attrs: &[Attribute]) -> Option<String> {
+fn parse_db_enum_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     for attr in attrs {
         if !attr.path().is_ident("db_enum") {
             continue;
         }
         let mut rename = None;
-        let _ = attr.parse_nested_meta(|meta| {
+        attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
                 let value = meta.value()?;
                 let lit: Lit = value.parse()?;
                 if let Lit::Str(s) = lit {
                     rename = Some(s.value());
                 }
+                Ok(())
+            } else {
+                Err(meta.error(format!(
+                    "unknown `db_enum` attribute `{}`; expected `rename`",
+                    meta.path
+                        .get_ident()
+                        .map_or("?".to_string(), |i| i.to_string())
+                )))
             }
-            Ok(())
-        });
+        })?;
         if rename.is_some() {
-            return rename;
+            return Ok(rename);
         }
     }
-    None
+    Ok(None)
 }
 
 /// Convert `PascalCase` to `snake_case`.
@@ -1020,13 +1027,13 @@ struct ColumnAttrs {
 }
 
 /// Parse `#[column(...)]` attributes using proper `syn` parsing.
-fn parse_column_attrs(attrs: &[Attribute]) -> ColumnAttrs {
+fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs> {
     let mut result = ColumnAttrs::default();
     for attr in attrs {
         if !attr.path().is_ident("column") {
             continue;
         }
-        let _ = attr.parse_nested_meta(|meta| {
+        attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("primary_key") {
                 result.primary_key = true;
             } else if meta.path.is_ident("auto_increment") {
@@ -1099,11 +1106,21 @@ fn parse_column_attrs(attrs: &[Attribute]) -> ColumnAttrs {
                 syn::parenthesized!(content in meta.input);
                 let tokens: proc_macro2::TokenStream = content.parse()?;
                 result.validate = Some(tokens.to_string());
+            } else {
+                return Err(meta.error(format!(
+                    "unknown `column` attribute `{}`; expected one of: \
+primary_key, auto_increment, unique, nullable, index, default, sql_type, \
+computed, computed_rust, creation_timestamp, update_timestamp, source, \
+check, references, on_delete, on_update, validate",
+                    meta.path
+                        .get_ident()
+                        .map_or("?".to_string(), |i| i.to_string())
+                )));
             }
             Ok(())
-        });
+        })?;
     }
-    result
+    Ok(result)
 }
 
 /// Derive macro that generates `FromRow` and a `select_columns()` helper
@@ -1418,7 +1435,7 @@ fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         col_idents.push(ident.clone());
         col_types.push(ty.clone());
 
-        let col_attrs = parse_column_attrs(&field.attrs);
+        let col_attrs = parse_column_attrs(&field.attrs)?;
         let (is_option, inner_ty) = unwrap_option_type(ty);
         let is_nullable = col_attrs.nullable || is_option;
         let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {

@@ -7,12 +7,17 @@
 //!   reify new <name>       — generate a migration file
 //!   reify rollback         — roll back the last migration
 //!   reify rollback --to <version> — roll back to a specific version
+//!
+//! All commands that connect to the database require a connection URL, provided
+//! via `--database-url` or the `DATABASE_URL` environment variable.
+//!
+//! URL format:
+//!   postgres://user:pass@host/dbname
+//!   mysql://user:pass@host/dbname
+//!   sqlite:./path/to/db.sqlite   (or  sqlite::memory:)
 
 use clap::{Parser, Subcommand};
-use reify_core::migration::{
-    MigrationError, MigrationRunner, MigrationStatus, generate_migration_file,
-    generate_view_migration_file,
-};
+use reify_core::migration::{MigrationRunner, generate_migration_file, generate_view_migration_file};
 
 // ── CLI definition ───────────────────────────────────────────────────
 
@@ -23,6 +28,12 @@ use reify_core::migration::{
     version
 )]
 struct Cli {
+    /// Database connection URL (overrides DATABASE_URL env var).
+    ///
+    /// Supported schemes: postgres://, mysql://, sqlite:
+    #[arg(long, global = true, env = "DATABASE_URL")]
+    database_url: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -58,56 +69,218 @@ enum Commands {
 
 // ── Entry point ──────────────────────────────────────────────────────
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
-    match &cli.command {
-        Commands::Migrate { dry_run } => cmd_migrate(*dry_run),
-        Commands::Status => cmd_status(),
-        Commands::New { name, dir, view } => cmd_new(name, dir, *view),
-        Commands::Rollback { to } => cmd_rollback(to.as_deref()),
+    let result = match &cli.command {
+        Commands::Migrate { dry_run } => {
+            let url = require_database_url(&cli.database_url);
+            cmd_migrate(&url, *dry_run).await
+        }
+        Commands::Status => {
+            let url = require_database_url(&cli.database_url);
+            cmd_status(&url).await
+        }
+        Commands::New { name, dir, view } => {
+            cmd_new(name, dir, *view);
+            return;
+        }
+        Commands::Rollback { to } => {
+            let url = require_database_url(&cli.database_url);
+            cmd_rollback(&url, to.as_deref()).await
+        }
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
+}
+
+// ── Database connection ──────────────────────────────────────────────
+
+fn require_database_url(url: &Option<String>) -> String {
+    match url {
+        Some(u) => u.clone(),
+        None => {
+            eprintln!("error: no database URL provided.");
+            eprintln!("Set DATABASE_URL or pass --database-url <URL>.");
+            eprintln!();
+            eprintln!("Examples:");
+            eprintln!("  postgres://user:pass@localhost/mydb");
+            eprintln!("  mysql://user:pass@localhost/mydb");
+            eprintln!("  sqlite:./mydb.sqlite");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Connect to the database described by `url` and run `f` with a boxed
+/// `DynDatabase` handle. Driver is selected by URL scheme at runtime.
+async fn with_db<F, Fut>(url: &str, f: F) -> Result<(), String>
+where
+    F: FnOnce(Box<dyn reify_core::db::DynDatabase>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        connect_postgres(url, f).await
+    } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+        connect_mysql(url, f).await
+    } else if url.starts_with("sqlite:") {
+        connect_sqlite(url, f).await
+    } else {
+        Err(format!(
+            "unsupported database URL scheme in '{url}'.\n\
+             Supported: postgres://, mysql://, sqlite:"
+        ))
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn connect_postgres<F, Fut>(url: &str, f: F) -> Result<(), String>
+where
+    F: FnOnce(Box<dyn reify_core::db::DynDatabase>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    use reify_postgres::{DpConfig, NoTls, PostgresDb};
+
+    let pg_cfg = url
+        .parse::<tokio_postgres::Config>()
+        .map_err(|e| format!("invalid postgres URL: {e}"))?;
+
+    let mut dp_cfg = DpConfig::new();
+    dp_cfg.host = pg_cfg.get_hosts().first().and_then(|h| match h {
+        tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
+        _ => None,
+    });
+    dp_cfg.port = pg_cfg.get_ports().first().copied();
+    dp_cfg.user = pg_cfg.get_user().map(str::to_string);
+    dp_cfg.password = pg_cfg
+        .get_password()
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    dp_cfg.dbname = pg_cfg.get_dbname().map(str::to_string);
+
+    let db = PostgresDb::connect(dp_cfg, NoTls)
+        .await
+        .map_err(|e| format!("postgres connection failed: {e}"))?;
+
+    f(Box::new(db)).await
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn connect_postgres<F, Fut>(_url: &str, _f: F) -> Result<(), String>
+where
+    F: FnOnce(Box<dyn reify_core::db::DynDatabase>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    Err("reify-cli was compiled without the 'postgres' feature".into())
+}
+
+#[cfg(feature = "mysql")]
+async fn connect_mysql<F, Fut>(url: &str, f: F) -> Result<(), String>
+where
+    F: FnOnce(Box<dyn reify_core::db::DynDatabase>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    use reify_mysql::{MysqlDb, Opts};
+
+    let opts = url
+        .parse::<Opts>()
+        .map_err(|e| format!("invalid mysql URL: {e}"))?;
+    let db = MysqlDb::connect(opts)
+        .await
+        .map_err(|e| format!("mysql connection failed: {e}"))?;
+
+    f(Box::new(db)).await
+}
+
+#[cfg(not(feature = "mysql"))]
+async fn connect_mysql<F, Fut>(_url: &str, _f: F) -> Result<(), String>
+where
+    F: FnOnce(Box<dyn reify_core::db::DynDatabase>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    Err("reify-cli was compiled without the 'mysql' feature".into())
+}
+
+#[cfg(feature = "sqlite")]
+async fn connect_sqlite<F, Fut>(url: &str, f: F) -> Result<(), String>
+where
+    F: FnOnce(Box<dyn reify_core::db::DynDatabase>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    use reify_sqlite::SqliteDb;
+
+    // Strip the "sqlite:" scheme prefix
+    let path = url.strip_prefix("sqlite:").unwrap_or(url);
+    let db = if path == ":memory:" || path.is_empty() {
+        SqliteDb::open_in_memory()
+    } else {
+        SqliteDb::open(path)
+    }
+    .map_err(|e| format!("sqlite open failed: {e}"))?;
+
+    f(Box::new(db)).await
+}
+
+#[cfg(not(feature = "sqlite"))]
+async fn connect_sqlite<F, Fut>(_url: &str, _f: F) -> Result<(), String>
+where
+    F: FnOnce(Box<dyn reify_core::db::DynDatabase>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    Err("reify-cli was compiled without the 'sqlite' feature".into())
 }
 
 // ── Command implementations ──────────────────────────────────────────
 
 /// `reify migrate [--dry-run]`
-///
-/// In a real project the user wires their own `MigrationRunner` (with their
-/// registered tables and migrations) and calls `.run()` / `.dry_run()` on it.
-/// The CLI binary is a thin wrapper that prints instructions when run without
-/// a project-specific runner configured.
-fn cmd_migrate(dry_run: bool) {
-    if dry_run {
-        println!("┌─ DRY RUN — nothing will be written ──────────────────────────┐");
-        println!("│ No runner configured. Wire your MigrationRunner in main.rs.  │");
-        println!("│                                                               │");
-        println!("│ Example:                                                      │");
-        println!("│   MigrationRunner::new()                                      │");
-        println!("│       .add_table::<User>()                                    │");
-        println!("│       .add(MyMigration)                                       │");
-        println!("│       .dry_run(&db).await?;                                   │");
-        println!("└───────────────────────────────────────────────────────────────┘");
-    } else {
-        println!("reify migrate: apply your MigrationRunner in your project's main.");
-        println!();
-        println!("  MigrationRunner::new()");
-        println!("      .add_table::<User>()");
-        println!("      .run(&db).await?;");
-    }
+async fn cmd_migrate(url: &str, dry_run: bool) -> Result<(), String> {
+    with_db(url, |db: Box<dyn reify_core::db::DynDatabase>| async move {
+        let runner = MigrationRunner::new();
+        if dry_run {
+            let plans = runner
+                .dry_run(&db)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if plans.is_empty() {
+                println!("✓ No pending migrations.");
+            } else {
+                println!("DRY RUN — nothing will be written\n");
+                for plan in &plans {
+                    print!("{}", plan.display());
+                }
+            }
+        } else {
+            runner.run(&db).await.map_err(|e| e.to_string())?;
+            println!("✓ Migrations applied.");
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// `reify status`
-fn cmd_status() {
-    println!("reify status: wire your MigrationRunner to query live status.");
-    println!();
-    println!("  let statuses = MigrationRunner::new()");
-    println!("      .add_table::<User>()");
-    println!("      .status(&db).await?;");
-    println!();
-    println!("  for s in statuses {{");
-    println!("      println!(\"{{}}\", s.display());");
-    println!("  }}");
+async fn cmd_status(url: &str) -> Result<(), String> {
+    with_db(url, |db: Box<dyn reify_core::db::DynDatabase>| async move {
+        let runner = MigrationRunner::new();
+        let statuses = runner
+            .status(&db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if statuses.is_empty() {
+            println!("No migrations registered.");
+        } else {
+            for s in &statuses {
+                println!("{}", s.display());
+            }
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// `reify new <name> [--view]`
@@ -156,23 +329,23 @@ fn cmd_new(name: &str, dir: &str, view: bool) {
 }
 
 /// `reify rollback [--to <version>]`
-fn cmd_rollback(to: Option<&str>) {
-    match to {
-        Some(version) => {
-            println!("reify rollback --to {version}: wire your runner:");
-            println!();
-            println!("  MigrationRunner::new()");
-            println!("      .add(MyMigration)");
-            println!("      .rollback_to(&db, \"{version}\").await?;");
+async fn cmd_rollback(url: &str, to: Option<&str>) -> Result<(), String> {
+    with_db(url, |db: Box<dyn reify_core::db::DynDatabase>| async move {
+        let runner = MigrationRunner::new();
+        match to {
+            Some(version) => runner
+                .rollback_to(&db, version)
+                .await
+                .map_err(|e| e.to_string())?,
+            None => runner
+                .rollback(&db)
+                .await
+                .map_err(|e| e.to_string())?,
         }
-        None => {
-            println!("reify rollback: wire your runner:");
-            println!();
-            println!("  MigrationRunner::new()");
-            println!("      .add(MyMigration)");
-            println!("      .rollback(&db).await?;");
-        }
-    }
+        println!("✓ Rollback complete.");
+        Ok(())
+    })
+    .await
 }
 
 // ── Utilities ────────────────────────────────────────────────────────

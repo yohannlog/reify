@@ -262,6 +262,28 @@ impl<T: Database> DynDatabase for T {
     }
 }
 
+impl Database for Box<dyn DynDatabase> {
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        DynDatabase::execute(self.as_ref(), sql, params).await
+    }
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        DynDatabase::query(self.as_ref(), sql, params).await
+    }
+    async fn query_stream<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+    ) -> Result<BoxStream<'a, Row>, DbError> {
+        DynDatabase::query_stream(self.as_ref(), sql, params).await
+    }
+    async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        DynDatabase::query_one(self.as_ref(), sql, params).await
+    }
+    async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
+        DynDatabase::transaction(self.as_ref(), f).await
+    }
+}
+
 impl Database for dyn DynDatabase + '_ {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
         DynDatabase::execute(self, sql, params).await

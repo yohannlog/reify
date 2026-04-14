@@ -95,8 +95,15 @@ fn value_to_mysql(val: &Value) -> mysql_async::Value {
         Value::Timestamp(v) => mysql_async::Value::from(v.to_string()),
         Value::Date(v) => mysql_async::Value::from(v.to_string()),
         Value::Time(v) => mysql_async::Value::from(v.to_string()),
+        // Any Value variant not handled above (e.g. PostgreSQL-only types
+        // like Uuid, Timestamptz, Jsonb, range and array types) cannot be
+        // bound as a MySQL parameter. Panic immediately with a clear message
+        // rather than silently converting to NULL.
         #[allow(unreachable_patterns)]
-        _ => mysql_async::Value::NULL,
+        other => unreachable!(
+            "{other:?} cannot be bound as a MySQL parameter; \
+             use only Value variants supported by MySQL"
+        ),
     }
 }
 
@@ -148,7 +155,20 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
             }
         }
         Some(MV::Int(v)) => Value::I64(*v),
-        Some(MV::UInt(v)) => Value::I64(*v as i64),
+        Some(MV::UInt(v)) => {
+            // MySQL UNSIGNED BIGINT can exceed i64::MAX. Values that do not
+            // fit are clamped to i64::MAX rather than wrapping silently.
+            if *v > i64::MAX as u64 {
+                tracing::warn!(
+                    target: "reify::mysql",
+                    value = v,
+                    "UNSIGNED BIGINT value exceeds i64::MAX; clamping to i64::MAX"
+                );
+                Value::I64(i64::MAX)
+            } else {
+                Value::I64(*v as i64)
+            }
+        }
         Some(MV::Float(v)) => Value::F32(*v),
         Some(MV::Double(v)) => Value::F64(*v),
         Some(MV::Date(year, month, day, hour, min, sec, _micro)) => {
@@ -205,6 +225,29 @@ fn mysql_err(e: mysql_async::Error) -> DbError {
 
 // ── SQL identifier rewriting ─────────────────────────────────────────
 
+/// Rewrite PostgreSQL-style `$N` placeholders to MySQL `?` placeholders.
+///
+/// When the `postgres` feature is enabled alongside `mysql`, the shared query
+/// helpers (`insert`, `fetch`, `update`, `delete`) call `build_pg()` which
+/// emits `$1`, `$2`, … positional placeholders. MySQL requires `?` instead,
+/// so we rewrite them here at execution time.
+fn rewrite_placeholders_mysql(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+            result.push('?');
+            // consume all digits of the placeholder number
+            while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                chars.next();
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Rewrite double-quoted identifiers (`"name"`) to MySQL backtick style (`` `name` ``).
 ///
 /// The query builder always emits `"ident"` (ANSI SQL / Generic dialect).
@@ -238,12 +281,18 @@ fn rewrite_quotes_mysql(sql: &str) -> String {
     result
 }
 
+/// Rewrite SQL to MySQL dialect and marshal params in one step.
+fn prepare_mysql(sql: &str, params: &[Value]) -> (String, mysql_async::Params) {
+    let sql = rewrite_quotes_mysql(&rewrite_placeholders_mysql(sql));
+    let mysql_params = values_to_mysql_params(params);
+    (sql, mysql_params)
+}
+
 // ── Database trait implementation ───────────────────────────────────
 
 impl Database for MysqlDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-        let sql = rewrite_quotes_mysql(sql);
-        let mysql_params = values_to_mysql_params(params);
+        let (sql, mysql_params) = prepare_mysql(sql, params);
         debug!(target: "reify::mysql", sql, "Executing");
         let mut conn = self
             .pool
@@ -255,8 +304,7 @@ impl Database for MysqlDb {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
-        let sql = rewrite_quotes_mysql(sql);
-        let mysql_params = values_to_mysql_params(params);
+        let (sql, mysql_params) = prepare_mysql(sql, params);
         debug!(target: "reify::mysql", sql, "Querying");
         let mut conn = self
             .pool
@@ -268,8 +316,7 @@ impl Database for MysqlDb {
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
-        let sql = rewrite_quotes_mysql(sql);
-        let mysql_params = values_to_mysql_params(params);
+        let (sql, mysql_params) = prepare_mysql(sql, params);
         debug!(target: "reify::mysql", sql, "Querying one");
         let mut conn = self
             .pool
@@ -333,8 +380,7 @@ struct MysqlTransaction {
 
 impl Database for MysqlTransaction {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-        let sql = rewrite_quotes_mysql(sql);
-        let mysql_params = values_to_mysql_params(params);
+        let (sql, mysql_params) = prepare_mysql(sql, params);
         debug!(target: "reify::mysql", sql, "Executing (txn)");
         let mut conn = self.conn.lock().await;
         conn.exec_drop(sql, mysql_params).await.map_err(mysql_err)?;
@@ -342,8 +388,7 @@ impl Database for MysqlTransaction {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
-        let sql = rewrite_quotes_mysql(sql);
-        let mysql_params = values_to_mysql_params(params);
+        let (sql, mysql_params) = prepare_mysql(sql, params);
         debug!(target: "reify::mysql", sql, "Querying (txn)");
         let mut conn = self.conn.lock().await;
         let rows: Vec<mysql_async::Row> = conn.exec(sql, mysql_params).await.map_err(mysql_err)?;
@@ -351,8 +396,7 @@ impl Database for MysqlTransaction {
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
-        let sql = rewrite_quotes_mysql(sql);
-        let mysql_params = values_to_mysql_params(params);
+        let (sql, mysql_params) = prepare_mysql(sql, params);
         debug!(target: "reify::mysql", sql, "Querying one (txn)");
         let mut conn = self.conn.lock().await;
         let row: Option<mysql_async::Row> = conn

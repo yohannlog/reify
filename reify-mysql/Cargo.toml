@@ -3,6 +3,9 @@ name = "reify-mysql"
 version.workspace = true
 edition.workspace = true
 
+[features]
+postgres = ["reify-core/postgres"]
+
 [dependencies]
 reify-core = { path = "../reify-core", version = "0.1.0", features = ["mysql"] }
 mysql_async = { version = "0.35", default-features = false, features = ["default-rustls"] }

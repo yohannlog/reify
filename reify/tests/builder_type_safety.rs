@@ -1,7 +1,7 @@
-//! Compile-time type-safety tests for `ColumnBuilder`.
+//! Compile-time type-safety tests for `ColumnBuilder` and derive macros.
 //!
-//! These tests verify that invalid builder configurations are rejected at
-//! compile time by the type-state pattern on `ColumnBuilder<T, S>`.
+//! These tests verify that invalid builder configurations and unknown macro
+//! attributes are rejected at compile time.
 
 #[test]
 #[cfg(any(feature = "postgres", feature = "mysql"))]
@@ -14,4 +14,16 @@ fn creation_timestamp_on_non_temporal_type_fails_to_compile() {
 fn source_db_without_timestamp_fails_to_compile() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/source_db_without_timestamp.rs");
+}
+
+#[test]
+fn column_unknown_attribute_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/column_unknown_attr.rs");
+}
+
+#[test]
+fn db_enum_unknown_attribute_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/db_enum_unknown_attr.rs");
 }
