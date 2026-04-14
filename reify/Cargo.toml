@@ -27,7 +27,7 @@ reify-macros = { path = "../reify-macros", version = "0.1.0" }
 reify-postgres = { path = "../reify-postgres", version = "0.1.0", optional = true }
 reify-mysql = { path = "../reify-mysql", version = "0.1.0", optional = true }
 reify-sqlite = { path = "../reify-sqlite", version = "0.1.0", optional = true }
-validator = { version = "0.19", features = ["derive"], optional = true }
+validator = { version = "0.20", features = ["derive"], optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
