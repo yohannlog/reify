@@ -23,7 +23,7 @@ ignore = [
 version = 2
 # Accept any OSI-approved license (covers MIT, Apache-2.0, BSD-*, ISC, Zlib,
 # Unicode-*, CC0-1.0 and all their SPDX compound expressions like "Apache-2.0 OR MIT").
-allow-osi-approved = true
+allow-osi-fsf-free = "osi-only"
 # Confidence threshold for license detection (0.0–1.0)
 confidence-threshold = 0.8
 
