@@ -223,6 +223,17 @@ impl<M: Table> SelectBuilder<M> {
         trace_query("select", M::table_name(), &sql, &params);
         (sql, params)
     }
+
+    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    ///
+    /// Equivalent to calling `build()` followed by `rewrite_placeholders_pg`, but
+    /// performs the rewrite once at build time so the adapter can skip it at execution time.
+    #[cfg(feature = "postgres")]
+    pub fn build_pg(&self) -> crate::built_query::BuiltQuery {
+        let (sql, params) = self.build();
+        let pg_sql = rewrite_placeholders_pg(&sql);
+        crate::built_query::BuiltQuery::new(pg_sql, params)
+    }
 }
 
 impl<M: Table> Default for SelectBuilder<M> {

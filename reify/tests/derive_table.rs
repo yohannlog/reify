@@ -1023,3 +1023,84 @@ fn builder_table_no_checks() {
 
     assert!(schema.checks.is_empty());
 }
+
+// ── Foreign key constraints (derive macro) ──────────────────────────
+
+#[derive(Table, Debug, Clone)]
+#[table(name = "posts")]
+pub struct Post {
+    #[column(primary_key, auto_increment)]
+    pub id: i64,
+    #[column(references = "User::id", on_delete = "CASCADE")]
+    pub user_id: i64,
+    pub title: String,
+}
+
+#[test]
+fn column_foreign_key_via_derive() {
+    use reify::{ForeignKeyAction, Table};
+
+    let defs = Post::column_defs();
+    let fk_def = defs.iter().find(|d| d.name == "user_id").unwrap();
+    let fk = fk_def.foreign_key.as_ref().expect("expected foreign_key on user_id");
+
+    assert_eq!(fk.references_table, "users");
+    assert_eq!(fk.references_column, "id");
+    assert_eq!(fk.on_delete, ForeignKeyAction::Cascade);
+    assert_eq!(fk.on_update, ForeignKeyAction::NoAction);
+
+    // Columns without FK should be None
+    let id_def = defs.iter().find(|d| d.name == "id").unwrap();
+    assert!(id_def.foreign_key.is_none());
+}
+
+#[test]
+fn foreign_keys_helper_returns_fk_defs() {
+    use reify::{ForeignKeyAction, Table};
+
+    let fks = Post::foreign_keys();
+    assert_eq!(fks.len(), 1);
+    assert_eq!(fks[0].references_table, "users");
+    assert_eq!(fks[0].references_column, "id");
+    assert_eq!(fks[0].on_delete, ForeignKeyAction::Cascade);
+}
+
+#[test]
+fn foreign_key_ddl_contains_references_clause() {
+    use reify::create_table_sql;
+    use reify::query::Dialect;
+
+    let defs = Post::column_defs();
+    let sql = create_table_sql::<Post>(&defs, Dialect::Postgres);
+
+    assert!(sql.contains("FOREIGN KEY"), "missing FOREIGN KEY: {sql}");
+    assert!(sql.contains("REFERENCES \"users\" (\"id\")"), "missing REFERENCES: {sql}");
+    assert!(sql.contains("ON DELETE CASCADE"), "missing ON DELETE CASCADE: {sql}");
+    assert!(!sql.contains("ON UPDATE"), "unexpected ON UPDATE: {sql}");
+}
+
+// ── Foreign key constraints (builder API) ──────────────────────────
+
+#[test]
+fn builder_column_references() {
+    use reify::{ColumnBuilder, ForeignKeyAction};
+
+    let col = ColumnBuilder::<i64>::new_pub("user_id")
+        .references("users", "id")
+        .on_delete(ForeignKeyAction::Cascade)
+        .build();
+
+    let fk = col.foreign_key.as_ref().expect("expected foreign_key");
+    assert_eq!(fk.references_table, "users");
+    assert_eq!(fk.references_column, "id");
+    assert_eq!(fk.on_delete, ForeignKeyAction::Cascade);
+    assert_eq!(fk.on_update, ForeignKeyAction::NoAction);
+}
+
+#[test]
+fn builder_column_no_references() {
+    use reify::ColumnBuilder;
+
+    let col = ColumnBuilder::<i64>::new_pub("amount").build();
+    assert!(col.foreign_key.is_none());
+}

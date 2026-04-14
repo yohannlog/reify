@@ -438,10 +438,6 @@ fn pg_column_to_value(
     }
 }
 
-// ── Rewrite `?` placeholders to `$N` for PostgreSQL ─────────────────
-
-use reify_core::rewrite_placeholders_pg as rewrite_placeholders;
-
 // ── Error conversion helpers ─────────────────────────────────────────
 
 /// Map a `tokio_postgres::Error` to a `DbError`, promoting constraint
@@ -473,15 +469,14 @@ async fn pg_execute(
     sql: &str,
     params: &[Value],
 ) -> Result<u64, DbError> {
-    let pg_sql = rewrite_placeholders(sql);
     let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
     let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
         .iter()
         .map(|p| p as &(dyn PgToSql + Sync))
         .collect();
-    debug!(target: "reify::postgres", sql = %pg_sql, "Executing");
+    debug!(target: "reify::postgres", sql = %sql, "Executing");
     client
-        .execute(&*pg_sql, &param_refs[..])
+        .execute(sql, &param_refs[..])
         .await
         .map_err(pg_err)
 }
@@ -492,15 +487,14 @@ async fn pg_query(
     sql: &str,
     params: &[Value],
 ) -> Result<Vec<Row>, DbError> {
-    let pg_sql = rewrite_placeholders(sql);
     let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
     let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
         .iter()
         .map(|p| p as &(dyn PgToSql + Sync))
         .collect();
-    debug!(target: "reify::postgres", sql = %pg_sql, "Querying");
+    debug!(target: "reify::postgres", sql = %sql, "Querying");
     let rows = client
-        .query(&*pg_sql, &param_refs[..])
+        .query(sql, &param_refs[..])
         .await
         .map_err(pg_err)?;
     Ok(rows.iter().map(pg_row_to_row).collect())
@@ -512,15 +506,14 @@ async fn pg_query_one(
     sql: &str,
     params: &[Value],
 ) -> Result<Row, DbError> {
-    let pg_sql = rewrite_placeholders(sql);
     let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
     let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
         .iter()
         .map(|p| p as &(dyn PgToSql + Sync))
         .collect();
-    debug!(target: "reify::postgres", sql = %pg_sql, "Querying one");
+    debug!(target: "reify::postgres", sql = %sql, "Querying one");
     let row = client
-        .query_one(&*pg_sql, &param_refs[..])
+        .query_one(sql, &param_refs[..])
         .await
         .map_err(pg_err)?;
     Ok(pg_row_to_row(&row))

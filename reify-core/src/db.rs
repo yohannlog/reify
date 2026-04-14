@@ -242,8 +242,16 @@ pub async fn fetch_all<M: Table>(
     db: &impl Database,
     builder: &crate::query::SelectBuilder<M>,
 ) -> Result<Vec<Row>, DbError> {
-    let (sql, params) = builder.build();
-    db.query(&sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return db.query(&q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.query(&sql, &params).await
+    }
 }
 
 /// Execute a SELECT and return typed results.
@@ -290,8 +298,16 @@ pub async fn insert<M: Table>(
     db: &impl Database,
     builder: &crate::query::InsertBuilder<M>,
 ) -> Result<u64, DbError> {
-    let (sql, params) = builder.build();
-    db.execute(&sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return db.execute(&q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.execute(&sql, &params).await
+    }
 }
 
 /// Execute a batch INSERT (multiple rows in one statement).
@@ -299,8 +315,16 @@ pub async fn insert_many<M: Table>(
     db: &impl Database,
     builder: &crate::query::InsertManyBuilder<M>,
 ) -> Result<u64, DbError> {
-    let (sql, params) = builder.build();
-    db.execute(&sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return db.execute(&q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.execute(&sql, &params).await
+    }
 }
 
 /// Execute a batch INSERT … RETURNING and return typed results (PostgreSQL only).
@@ -309,8 +333,8 @@ pub async fn insert_many_returning<M: Table + FromRow>(
     db: &impl Database,
     builder: &crate::query::InsertManyBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
-    let (sql, params) = builder.build();
-    let rows = db.query(&sql, &params).await?;
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
 }
 
@@ -320,8 +344,8 @@ pub async fn insert_returning<M: Table + FromRow>(
     db: &impl Database,
     builder: &crate::query::InsertBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
-    let (sql, params) = builder.build();
-    let rows = db.query(&sql, &params).await?;
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
 }
 
@@ -330,8 +354,16 @@ pub async fn update<M: Table>(
     db: &impl Database,
     builder: &crate::query::UpdateBuilder<M>,
 ) -> Result<u64, DbError> {
-    let (sql, params) = builder.build();
-    db.execute(&sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return db.execute(&q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.execute(&sql, &params).await
+    }
 }
 
 /// Execute an UPDATE … RETURNING and return typed results (PostgreSQL only).
@@ -340,8 +372,8 @@ pub async fn update_returning<M: Table + FromRow>(
     db: &impl Database,
     builder: &crate::query::UpdateBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
-    let (sql, params) = builder.build();
-    let rows = db.query(&sql, &params).await?;
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
 }
 
@@ -350,8 +382,16 @@ pub async fn delete<M: Table>(
     db: &impl Database,
     builder: &crate::query::DeleteBuilder<M>,
 ) -> Result<u64, DbError> {
-    let (sql, params) = builder.build();
-    db.execute(&sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return db.execute(&q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.execute(&sql, &params).await
+    }
 }
 
 /// Execute a DELETE … RETURNING and return typed results (PostgreSQL only).
@@ -360,8 +400,8 @@ pub async fn delete_returning<M: Table + FromRow>(
     db: &impl Database,
     builder: &crate::query::DeleteBuilder<M>,
 ) -> Result<Vec<M>, DbError> {
-    let (sql, params) = builder.build();
-    let rows = db.query(&sql, &params).await?;
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
 }
 

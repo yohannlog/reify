@@ -86,11 +86,34 @@ pub fn create_table_sql<T: Table>(
         col_lines.push(parts.join(" "));
     }
 
-    format!(
-        "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
-        qi(table),
-        col_lines.join(",\n")
-    )
+    // Append FOREIGN KEY constraints as table-level lines
+    let fk_lines: Vec<String> = names
+        .iter()
+        .filter_map(|name| {
+            let def = column_defs.iter().find(|d| d.name == *name)?;
+            let fk = def.foreign_key.as_ref()?;
+            Some(format!(
+                "    FOREIGN KEY ({}) {}",
+                qi(name),
+                fk.to_references_clause()
+            ))
+        })
+        .collect();
+
+    if fk_lines.is_empty() {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
+            qi(table),
+            col_lines.join(",\n")
+        )
+    } else {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (\n{},\n{}\n);",
+            qi(table),
+            col_lines.join(",\n"),
+            fk_lines.join(",\n")
+        )
+    }
 }
 
 /// Generate a `CREATE TABLE IF NOT EXISTS` statement with optional table-level

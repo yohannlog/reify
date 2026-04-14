@@ -196,6 +196,95 @@ pub enum ComputedColumn {
     Virtual,
 }
 
+// ── Foreign key action ─────────────────────────────────────────────
+
+/// Action to perform on the referencing row when the referenced row is
+/// deleted or updated.
+///
+/// Used in [`ForeignKeyDef`] via `#[column(on_delete = "...")]` /
+/// `#[column(on_update = "...")]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ForeignKeyAction {
+    /// Do nothing — the default SQL behaviour.
+    #[default]
+    NoAction,
+    /// Reject the operation if any referencing rows exist.
+    Restrict,
+    /// Automatically delete/update the referencing rows.
+    Cascade,
+    /// Set the referencing column(s) to `NULL`.
+    SetNull,
+    /// Set the referencing column(s) to their column default.
+    SetDefault,
+}
+
+impl ForeignKeyAction {
+    /// Return the SQL keyword for this action.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            ForeignKeyAction::NoAction => "NO ACTION",
+            ForeignKeyAction::Restrict => "RESTRICT",
+            ForeignKeyAction::Cascade => "CASCADE",
+            ForeignKeyAction::SetNull => "SET NULL",
+            ForeignKeyAction::SetDefault => "SET DEFAULT",
+        }
+    }
+
+    /// Parse from a string (case-insensitive).
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "NO ACTION" | "NOACTION" => Some(ForeignKeyAction::NoAction),
+            "RESTRICT" => Some(ForeignKeyAction::Restrict),
+            "CASCADE" => Some(ForeignKeyAction::Cascade),
+            "SET NULL" | "SETNULL" => Some(ForeignKeyAction::SetNull),
+            "SET DEFAULT" | "SETDEFAULT" => Some(ForeignKeyAction::SetDefault),
+            _ => None,
+        }
+    }
+}
+
+/// Describes a foreign-key constraint on a single column.
+///
+/// Produced by `#[column(references = "User::id")]` on a struct field.
+///
+/// # Example
+/// ```ignore
+/// #[column(references = "User::id", on_delete = "CASCADE")]
+/// pub user_id: i64,
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyDef {
+    /// Name of the referenced table (snake_case, e.g. `"users"`).
+    pub references_table: String,
+    /// Name of the referenced column (e.g. `"id"`).
+    pub references_column: String,
+    /// Action when the referenced row is deleted.
+    pub on_delete: ForeignKeyAction,
+    /// Action when the referenced row is updated.
+    pub on_update: ForeignKeyAction,
+}
+
+impl ForeignKeyDef {
+    /// Render the inline `REFERENCES` clause for DDL.
+    ///
+    /// Example output: `REFERENCES "users" ("id") ON DELETE CASCADE`
+    pub fn to_references_clause(&self) -> String {
+        use crate::ident::qi;
+        let mut s = format!(
+            "REFERENCES {} ({})",
+            qi(&self.references_table),
+            qi(&self.references_column)
+        );
+        if self.on_delete != ForeignKeyAction::NoAction {
+            s.push_str(&format!(" ON DELETE {}", self.on_delete.as_sql()));
+        }
+        if self.on_update != ForeignKeyAction::NoAction {
+            s.push_str(&format!(" ON UPDATE {}", self.on_update.as_sql()));
+        }
+        s
+    }
+}
+
 // ── Column attributes ───────────────────────────────────────────────
 
 /// Metadata for a single column, built via the fluent `ColumnBuilder`.
@@ -224,6 +313,10 @@ pub struct ColumnDef {
     /// // → price DECIMAL(10,2) NOT NULL CHECK (price >= 0)
     /// ```
     pub check: Option<String>,
+    /// Optional foreign-key constraint for this column.
+    ///
+    /// Set via `#[column(references = "Table::column")]` on a struct field.
+    pub foreign_key: Option<ForeignKeyDef>,
 }
 
 // ── Type-state for timestamp builder ────────────────────────────────
@@ -283,6 +376,7 @@ impl<T> ColumnBuilder<T, NoTimestamp> {
                 timestamp_kind: None,
                 timestamp_source: TimestampSource::Vm,
                 check: None,
+                foreign_key: None,
             },
             _type: PhantomData,
             _state: PhantomData,
@@ -441,6 +535,41 @@ impl<T, S: TimestampState> ColumnBuilder<T, S> {
     /// ```
     pub fn check(mut self, expr: impl Into<String>) -> Self {
         self.def.check = Some(expr.into());
+        self
+    }
+
+    /// Add a foreign-key constraint to this column.
+    ///
+    /// ```ignore
+    /// .column(Post::user_id, |c| c.references("users", "id").on_delete(ForeignKeyAction::Cascade))
+    /// ```
+    pub fn references(mut self, table: impl Into<String>, column: impl Into<String>) -> Self {
+        self.def.foreign_key = Some(ForeignKeyDef {
+            references_table: table.into(),
+            references_column: column.into(),
+            on_delete: ForeignKeyAction::NoAction,
+            on_update: ForeignKeyAction::NoAction,
+        });
+        self
+    }
+
+    /// Set the `ON DELETE` action for the foreign-key constraint on this column.
+    ///
+    /// Has no effect if `.references()` was not called first.
+    pub fn on_delete(mut self, action: ForeignKeyAction) -> Self {
+        if let Some(ref mut fk) = self.def.foreign_key {
+            fk.on_delete = action;
+        }
+        self
+    }
+
+    /// Set the `ON UPDATE` action for the foreign-key constraint on this column.
+    ///
+    /// Has no effect if `.references()` was not called first.
+    pub fn on_update(mut self, action: ForeignKeyAction) -> Self {
+        if let Some(ref mut fk) = self.def.foreign_key {
+            fk.on_update = action;
+        }
         self
     }
 }

@@ -154,6 +154,31 @@ impl<M: Table> UpdateBuilder<M> {
         trace_query("update", M::table_name(), &sql, &params);
         Ok((sql, params))
     }
+
+    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    ///
+    /// Delegates to `try_build()` (enforcing the no-bare-update guard) and rewrites
+    /// placeholders once at build time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no `.filter()` or `.unfiltered()` has been called.
+    #[cfg(feature = "postgres")]
+    pub fn build_pg(&self) -> crate::built_query::BuiltQuery {
+        let (sql, params) = self.build();
+        let pg_sql = rewrite_placeholders_pg(&sql);
+        crate::built_query::BuiltQuery::new(pg_sql, params)
+    }
+
+    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    ///
+    /// Returns `Err(BuildError::MissingFilter)` if no `.filter()` or `.unfiltered()` has been called.
+    #[cfg(feature = "postgres")]
+    pub fn try_build_pg(&self) -> Result<crate::built_query::BuiltQuery, BuildError> {
+        let (sql, params) = self.try_build()?;
+        let pg_sql = rewrite_placeholders_pg(&sql);
+        Ok(crate::built_query::BuiltQuery::new(pg_sql, params))
+    }
 }
 
 impl<M: Table> Default for UpdateBuilder<M> {

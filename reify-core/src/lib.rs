@@ -41,9 +41,9 @@ pub use table::Table;
 pub use value::{FromValue, Value};
 
 pub use schema::{
-    ColumnBuilder, ColumnDef, ComputedColumn, HasTimestamp, IndexBuilder, IndexColumnDef, IndexDef,
-    IndexKind, NoTimestamp, Schema, SortDirection, SqlType, TableSchema, TimestampKind,
-    TimestampSource, TimestampState, table,
+    ColumnBuilder, ColumnDef, ComputedColumn, ForeignKeyAction, ForeignKeyDef, HasTimestamp,
+    IndexBuilder, IndexColumnDef, IndexDef, IndexKind, NoTimestamp, Schema, SortDirection, SqlType,
+    TableSchema, TimestampKind, TimestampSource, TimestampState, table,
 };
 
 pub use paginate::{
@@ -70,7 +70,8 @@ pub use migration::{
 };
 
 pub use rls::{
-    Policy, RlsContext, Scoped, scoped_delete, scoped_fetch, scoped_fetch_all, scoped_update,
+    Policy, RlsContext, Scoped, ScopedTransactionFn, scoped_delete, scoped_fetch, scoped_fetch_all,
+    scoped_update,
 };
 
 pub use audit::{

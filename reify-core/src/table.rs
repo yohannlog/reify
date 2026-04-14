@@ -1,4 +1,4 @@
-use crate::schema::{ColumnDef, ComputedColumn, IndexDef, TimestampKind, TimestampSource};
+use crate::schema::{ColumnDef, ComputedColumn, ForeignKeyDef, IndexDef, TimestampKind, TimestampSource};
 use crate::value::Value;
 
 /// Trait implemented by `#[derive(Table)]` on user structs.
@@ -23,6 +23,18 @@ pub trait Table: Sized {
     /// Index definitions for this table (from `#[column(index)]` and `#[table(index(...))]`).
     fn indexes() -> Vec<IndexDef> {
         Vec::new()
+    }
+
+    /// Foreign-key constraints derived from `#[column(references = "Table::col")]`.
+    ///
+    /// Returns one [`ForeignKeyDef`] per column that carries a foreign-key
+    /// annotation.  The default implementation collects them from
+    /// [`column_defs()`](Table::column_defs).
+    fn foreign_keys() -> Vec<ForeignKeyDef> {
+        Self::column_defs()
+            .into_iter()
+            .filter_map(|d| d.foreign_key)
+            .collect()
     }
 
     /// Column names that are writable (excludes computed and DB-managed timestamp columns).

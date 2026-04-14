@@ -420,6 +420,39 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             None => quote! { None },
         };
 
+        // Foreign key token
+        let fk_token = if let Some(ref refs) = col_attrs.references {
+            // Parse "Table::column" → split on "::"
+            let parts: Vec<&str> = refs.splitn(2, "::").collect();
+            let (ref_table_raw, ref_col) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                (refs.as_str(), "id")
+            };
+            // Convert PascalCase struct name to snake_case table name
+            let ref_table = to_snake_case(ref_table_raw);
+            // Pluralise naively: append 's' if not already ending in 's'
+            let ref_table = if ref_table.ends_with('s') {
+                ref_table
+            } else {
+                format!("{ref_table}s")
+            };
+            let on_delete_str = col_attrs.on_delete.as_deref().unwrap_or("NO ACTION");
+            let on_update_str = col_attrs.on_update.as_deref().unwrap_or("NO ACTION");
+            quote! {
+                Some(reify_core::schema::ForeignKeyDef {
+                    references_table: #ref_table.to_string(),
+                    references_column: #ref_col.to_string(),
+                    on_delete: reify_core::schema::ForeignKeyAction::from_str(#on_delete_str)
+                        .unwrap_or(reify_core::schema::ForeignKeyAction::NoAction),
+                    on_update: reify_core::schema::ForeignKeyAction::from_str(#on_update_str)
+                        .unwrap_or(reify_core::schema::ForeignKeyAction::NoAction),
+                })
+            }
+        } else {
+            quote! { None }
+        };
+
         col_defs_tokens.push(quote! {
             reify_core::schema::ColumnDef {
                 name: #name_str,
@@ -434,6 +467,7 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 timestamp_kind: #timestamp_kind_token,
                 timestamp_source: #timestamp_source_token,
                 check: #check_token,
+                foreign_key: #fk_token,
             }
         });
     }
@@ -870,6 +904,12 @@ struct ColumnAttrs {
     timestamp_source: Option<String>,
     /// SQL CHECK constraint expression.
     check: Option<String>,
+    /// Foreign key: `"Table::column"` from `references = "..."`.
+    references: Option<String>,
+    /// Foreign key ON DELETE action string.
+    on_delete: Option<String>,
+    /// Foreign key ON UPDATE action string.
+    on_update: Option<String>,
 }
 
 /// Parse `#[column(...)]` attributes using proper `syn` parsing.
@@ -925,6 +965,24 @@ fn parse_column_attrs(attrs: &[Attribute]) -> ColumnAttrs {
                 let lit: Lit = value.parse()?;
                 if let Lit::Str(s) = lit {
                     result.check = Some(s.value());
+                }
+            } else if meta.path.is_ident("references") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.references = Some(s.value());
+                }
+            } else if meta.path.is_ident("on_delete") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.on_delete = Some(s.value());
+                }
+            } else if meta.path.is_ident("on_update") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.on_update = Some(s.value());
                 }
             }
             Ok(())

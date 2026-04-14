@@ -114,6 +114,7 @@ mod tests {
                     timestamp_kind: None,
                     timestamp_source: crate::schema::TimestampSource::Vm,
                     check: None,
+                    foreign_key: None,
                 },
                 crate::schema::ColumnDef {
                     name: "email",
@@ -128,6 +129,7 @@ mod tests {
                     timestamp_kind: None,
                     timestamp_source: crate::schema::TimestampSource::Vm,
                     check: None,
+                    foreign_key: None,
                 },
                 crate::schema::ColumnDef {
                     name: "role",
@@ -142,6 +144,7 @@ mod tests {
                     timestamp_kind: None,
                     timestamp_source: crate::schema::TimestampSource::Vm,
                     check: None,
+                    foreign_key: None,
                 },
             ]
         }
@@ -791,6 +794,7 @@ mod tests {
                 timestamp_kind: None,
                 timestamp_source: crate::schema::TimestampSource::Vm,
                 check: None,
+                foreign_key: None,
             },
             crate::schema::ColumnDef {
                 name: "email",
@@ -805,6 +809,7 @@ mod tests {
                 timestamp_kind: None,
                 timestamp_source: crate::schema::TimestampSource::Vm,
                 check: None,
+                foreign_key: None,
             },
         ];
         let sql = create_table_sql::<Users>(&defs, crate::query::Dialect::Postgres);
@@ -813,6 +818,65 @@ mod tests {
         assert!(sql.contains("email"));
         assert!(sql.contains("BIGSERIAL"));
         assert!(sql.contains("PRIMARY KEY"));
+    }
+
+    #[test]
+    fn create_table_sql_emits_foreign_key_constraint() {
+        use crate::schema::{ForeignKeyAction, ForeignKeyDef};
+
+        struct Posts;
+        impl Table for Posts {
+            fn table_name() -> &'static str { "posts" }
+            fn column_names() -> &'static [&'static str] { &["id", "user_id"] }
+            fn into_values(&self) -> Vec<Value> { vec![] }
+        }
+
+        let defs: Vec<crate::schema::ColumnDef> = vec![
+            crate::schema::ColumnDef {
+                name: "id",
+                sql_type: crate::schema::SqlType::BigSerial,
+                primary_key: true,
+                auto_increment: true,
+                unique: false,
+                index: false,
+                nullable: false,
+                default: None,
+                computed: None,
+                timestamp_kind: None,
+                timestamp_source: crate::schema::TimestampSource::Vm,
+                check: None,
+                foreign_key: None,
+            },
+            crate::schema::ColumnDef {
+                name: "user_id",
+                sql_type: crate::schema::SqlType::BigInt,
+                primary_key: false,
+                auto_increment: false,
+                unique: false,
+                index: false,
+                nullable: false,
+                default: None,
+                computed: None,
+                timestamp_kind: None,
+                timestamp_source: crate::schema::TimestampSource::Vm,
+                check: None,
+                foreign_key: Some(ForeignKeyDef {
+                    references_table: "users".to_string(),
+                    references_column: "id".to_string(),
+                    on_delete: ForeignKeyAction::Cascade,
+                    on_update: ForeignKeyAction::NoAction,
+                }),
+            },
+        ];
+        let sql = create_table_sql::<Posts>(&defs, crate::query::Dialect::Postgres);
+        assert!(sql.contains("FOREIGN KEY"), "missing FOREIGN KEY: {sql}");
+        assert!(
+            sql.contains("REFERENCES \"users\" (\"id\")"),
+            "missing REFERENCES clause: {sql}"
+        );
+        assert!(sql.contains("ON DELETE CASCADE"), "missing ON DELETE CASCADE: {sql}");
+        // ON UPDATE NO ACTION should be omitted (default)
+        assert!(!sql.contains("ON UPDATE"), "unexpected ON UPDATE clause: {sql}");
     }
 
     // ── View migration tests ────────────────────────────────────────

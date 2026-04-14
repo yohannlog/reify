@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::condition::Condition;
-use crate::db::{Database, DbError, DynDatabase, Row, TransactionFn};
+use crate::db::{BoxFuture, Database, DbError, DynDatabase, Row, TransactionFn};
 use crate::value::Value;
 
 // ── Policy context ─────────────────────────────────────────────────
@@ -68,6 +68,14 @@ pub trait Policy: crate::table::Table {
     fn policy(ctx: &RlsContext) -> Option<Condition>;
 }
 
+/// The closure accepted by [`Scoped::scoped_transaction`].
+///
+/// Unlike [`TransactionFn`], this closure receives `&Scoped` so that
+/// RLS helpers (`scoped_fetch_all`, `scoped_update`, `scoped_delete`)
+/// remain usable inside the transaction body.
+pub type ScopedTransactionFn<'a> =
+    Box<dyn FnOnce(&'a Scoped<'a>) -> BoxFuture<'a, ()> + Send + 'a>;
+
 // ── Scoped database wrapper ────────────────────────────────────────
 
 /// A database wrapper that enforces row-level security policies.
@@ -95,6 +103,40 @@ impl<'a> Scoped<'a> {
     /// Access the RLS context.
     pub fn context(&self) -> &RlsContext {
         &self.ctx
+    }
+
+    /// Run a closure inside a transaction, passing `&Scoped` so that
+    /// RLS helpers (`scoped_fetch_all`, `scoped_update`, `scoped_delete`)
+    /// remain usable inside the transaction body.
+    ///
+    /// ```ignore
+    /// scoped.scoped_transaction(|s| Box::pin(async move {
+    ///     scoped_fetch_all::<Post>(s, Post::find()).await?;
+    ///     Ok(())
+    /// })).await?;
+    /// ```
+    pub fn scoped_transaction<'s>(
+        &'s self,
+        f: ScopedTransactionFn<'s>,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 's {
+        let ctx = self.ctx.clone();
+        async move {
+            self.inner
+                .transaction(Box::new(move |tx_db: &'s dyn DynDatabase| {
+                    let scoped_tx: Box<Scoped<'s>> = Box::new(Scoped::new(tx_db, ctx));
+                    // SAFETY: `scoped_tx` is moved into the async block and lives
+                    // until the future completes. The raw pointer cast extends the
+                    // borrow lifetime to match `'s`.
+                    let scoped_ref: &'s Scoped<'s> =
+                        unsafe { &*(&*scoped_tx as *const Scoped<'s>) };
+                    let fut = f(scoped_ref);
+                    Box::pin(async move {
+                        let _guard = scoped_tx;
+                        fut.await
+                    })
+                }))
+                .await
+        }
     }
 }
 
@@ -306,6 +348,36 @@ mod tests {
         assert!(
             queries[0].contains("\"tenant_id\" = ?"),
             "RLS filter should be applied, got: {}",
+            queries[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_transaction_applies_rls_inside_transaction() {
+        let (db, log) = RecordingDb::new();
+        let ctx = RlsContext::new().set("tenant_id", 55i64);
+        let scoped = Scoped::new(&db, ctx);
+
+        // Use scoped_transaction so the closure receives &Scoped and can
+        // call scoped_fetch_all — the RLS filter must be injected even
+        // inside the transaction body.
+        let result = scoped
+            .scoped_transaction(Box::new(|s: &Scoped<'_>| {
+                Box::pin(async move {
+                    let builder = crate::query::SelectBuilder::<TenantPost>::new();
+                    scoped_fetch_all::<TenantPost>(s, builder).await?;
+                    Ok(())
+                })
+            }))
+            .await;
+
+        assert!(result.is_ok());
+
+        let queries = log.lock().unwrap();
+        assert_eq!(queries.len(), 1, "expected exactly one query");
+        assert!(
+            queries[0].contains("\"tenant_id\" = ?"),
+            "RLS filter must be applied inside transaction, got: {}",
             queries[0]
         );
     }

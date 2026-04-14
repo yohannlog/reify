@@ -90,6 +90,17 @@ impl<M: Table> InsertBuilder<M> {
         self.build_with_dialect(Dialect::Generic)
     }
 
+    /// Build a [`BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
+    ///
+    /// Uses `build_with_dialect(Dialect::Postgres)` so that `ON CONFLICT … DO UPDATE SET`
+    /// syntax is generated correctly, then rewrites `?` → `$N` once at build time.
+    #[cfg(feature = "postgres")]
+    pub fn build_pg(&self) -> crate::built_query::BuiltQuery {
+        let (sql, params) = self.build_with_dialect(Dialect::Postgres);
+        let pg_sql = rewrite_placeholders_pg(&sql);
+        crate::built_query::BuiltQuery::new(pg_sql, params)
+    }
+
     /// Build SQL for a specific [`Dialect`].
     #[allow(unused_mut)]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
@@ -217,6 +228,17 @@ impl<M: Table> InsertManyBuilder<M> {
     /// Build with the default (generic) dialect.
     pub fn build(&self) -> (String, Vec<Value>) {
         self.build_with_dialect(Dialect::Generic)
+    }
+
+    /// Build a [`BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
+    ///
+    /// Uses `build_with_dialect(Dialect::Postgres)` so that `ON CONFLICT … DO UPDATE SET`
+    /// syntax is generated correctly, then rewrites `?` → `$N` once at build time.
+    #[cfg(feature = "postgres")]
+    pub fn build_pg(&self) -> crate::built_query::BuiltQuery {
+        let (sql, params) = self.build_with_dialect(Dialect::Postgres);
+        let pg_sql = rewrite_placeholders_pg(&sql);
+        crate::built_query::BuiltQuery::new(pg_sql, params)
     }
 
     /// Build SQL for a specific [`Dialect`].

@@ -100,6 +100,7 @@ impl MigrationRunner {
                         timestamp_kind: None,
                         timestamp_source: crate::schema::TimestampSource::Vm,
                         check: None,
+                        foreign_key: None,
                     })
                     .collect()
             } else {
