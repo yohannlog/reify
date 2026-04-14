@@ -95,7 +95,7 @@ jobs:
           --output-dir coverage/
           --exclude-files "reify-macros/*"
           --exclude-files "reify/tests/compile_fail/*"
-          -- --skip builder_type_safety
+          --exclude-files "reify/tests/builder_type_safety.rs"
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
