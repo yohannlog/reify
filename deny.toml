@@ -1,0 +1,48 @@
+[graph]
+targets = []
+all-features = true
+
+# ── Advisories (cargo audit equivalent) ──────────────────────────────────────
+[advisories]
+version = 2
+# Deny crates with known security vulnerabilities
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+
+# Advisories ignored because they are transitive deps we don't control
+# and no safe upgrade is available upstream.
+ignore = [
+  # rustls-pemfile is unmaintained (RUSTSEC-2025-0134), pulled in by
+  # mysql_async — no fix available until mysql_async drops the dependency.
+  "RUSTSEC-2025-0134",
+]
+
+# ── Licenses ─────────────────────────────────────────────────────────────────
+[licenses]
+version = 2
+# Accept any OSI-approved license (covers MIT, Apache-2.0, BSD-*, ISC, Zlib,
+# Unicode-*, CC0-1.0 and all their SPDX compound expressions like "Apache-2.0 OR MIT").
+allow-osi-approved = true
+# Confidence threshold for license detection (0.0–1.0)
+confidence-threshold = 0.8
+
+# ── Bans (duplicate dependencies) ────────────────────────────────────────────
+[bans]
+# Deny multiple versions of the same crate
+multiple-versions = "warn"
+# Deny wildcard dependencies
+wildcards = "deny"
+# Deny crates known to be problematic
+deny = []
+# Skip duplicate-version checks for crates where it's unavoidable
+skip = []
+skip-tree = []
+
+# ── Sources ──────────────────────────────────────────────────────────────────
+[sources]
+# Only allow crates from crates.io and this workspace
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
