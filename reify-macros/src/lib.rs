@@ -1441,6 +1441,7 @@ fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 timestamp_kind: None,
                 timestamp_source: reify_core::schema::TimestampSource::Vm,
                 check: None,
+                foreign_key: None,
             }
         });
     }

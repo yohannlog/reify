@@ -137,8 +137,8 @@ fn update_builder_auto_injects_update_timestamp() {
         .build();
 
     // Should contain both the explicit set AND the auto-injected updated_at
-    assert!(sql.contains("title = ?"));
-    assert!(sql.contains("updated_at = ?"));
+    assert!(sql.contains("\"title\" = ?"));
+    assert!(sql.contains("\"updated_at\" = ?"));
     // params: title value, updated_at timestamp, id filter value
     assert_eq!(params.len(), 3);
     assert!(matches!(params[1], Value::Timestamptz(_)));

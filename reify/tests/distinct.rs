@@ -63,7 +63,8 @@ fn distinct_idempotent() {
 
 #[test]
 fn distinct_count_query_has_no_distinct() {
-    let ast = User::find().distinct().build_ast();
+    let builder = User::find().distinct();
+    let ast = builder.build_ast();
     let count_ast = ast.to_count_query();
     let mut params = Vec::new();
     let sql = count_ast.render(&mut params);

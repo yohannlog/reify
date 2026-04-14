@@ -103,7 +103,7 @@ mod postgres_tests {
         let (sql, params) = Event::insert(&event).build();
         assert_eq!(
             sql,
-            "INSERT INTO events (id, name, duration) VALUES (?, ?, ?)"
+            "INSERT INTO \"events\" (\"id\", \"name\", \"duration\") VALUES (?, ?, ?)"
         );
         assert_eq!(
             params,
@@ -120,7 +120,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.contains_element(50i32))
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE duration @> ?");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE \"duration\" @> ?");
         assert_eq!(params, vec![Value::I32(50)]);
     }
 
@@ -129,7 +129,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.contains_range(Range::closed(10, 20)))
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE duration @> ?");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE \"duration\" @> ?");
         assert_eq!(params, vec![Value::Int4Range(Range::closed(10, 20))]);
     }
 
@@ -138,7 +138,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.contained_by(Range::closed_open(0, 1000)))
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE duration <@ ?");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE \"duration\" <@ ?");
         assert_eq!(params, vec![Value::Int4Range(Range::closed_open(0, 1000))]);
     }
 
@@ -147,7 +147,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.overlaps(Range::closed(50, 150)))
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE duration && ?");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE \"duration\" && ?");
         assert_eq!(params, vec![Value::Int4Range(Range::closed(50, 150))]);
     }
 
@@ -156,7 +156,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.left_of(Range::closed(200, 300)))
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE duration << ?");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE \"duration\" << ?");
         assert_eq!(params, vec![Value::Int4Range(Range::closed(200, 300))]);
     }
 
@@ -165,7 +165,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.right_of(Range::closed(0, 5)))
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE duration >> ?");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE \"duration\" >> ?");
         assert_eq!(params, vec![Value::Int4Range(Range::closed(0, 5))]);
     }
 
@@ -174,7 +174,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.adjacent(Range::closed_open(120, 240)))
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE duration -|- ?");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE \"duration\" -|- ?");
         assert_eq!(params, vec![Value::Int4Range(Range::closed_open(120, 240))]);
     }
 
@@ -183,7 +183,7 @@ mod postgres_tests {
         let (sql, params) = Event::find()
             .filter(Event::duration.is_empty_range())
             .build();
-        assert_eq!(sql, "SELECT * FROM events WHERE isempty(duration)");
+        assert_eq!(sql, "SELECT * FROM \"events\" WHERE isempty(\"duration\")");
         assert!(params.is_empty());
     }
 
@@ -193,7 +193,7 @@ mod postgres_tests {
             .set(Event::duration, Range::closed(0, 60))
             .filter(Event::id.eq(1i64))
             .build();
-        assert_eq!(sql, "UPDATE events SET duration = ? WHERE id = ?");
+        assert_eq!(sql, "UPDATE \"events\" SET \"duration\" = ? WHERE \"id\" = ?");
         assert_eq!(
             params,
             vec![Value::Int4Range(Range::closed(0, 60)), Value::I64(1)]

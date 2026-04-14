@@ -104,9 +104,59 @@ Two modes:
 - **Offset-based**: `.paginate(page, per_page)` → returns `Paginated<M>` with `PageInfo` (has_next, has_prev, total_pages)
 - **Cursor-based**: `.after(column, value, limit)` / `.before()` → returns `CursorPaginated<M>` with `has_more`
 
+### DTO Generation (feature: `dto`, `dto-validation`)
+
+Two opt-in features on the `reify` crate:
+
+- **`dto`** — `#[derive(Table)]` automatically generates a `{Name}Dto` struct that excludes auto-increment primary keys and timestamp fields. Use `#[table(dto(skip = "field1,field2"))]` to skip additional fields.
+- **`dto-validation`** — Extends DTOs with `#[derive(validator::Validate)]`. Add validation rules via `#[column(validate(email))]`, `#[column(validate(length(min = 1, max = 255)))]`, etc. The `validator` crate is re-exported automatically.
+
+Generated DTO provides:
+- `{Name}Dto::column_names()` — column names for the DTO fields
+- `dto.into_values()` — convert to `Vec<Value>` for query building
+
 ## Design Principles
 
 1. **IDE-first**: all column references are typed constants — rust-analyzer autocompletes everything
 2. **Code is source of truth**: structs define tables, no external schema files
 3. **Compile-time safety**: renaming a field breaks compilation wherever it's used
 4. **Safe by default**: UPDATE/DELETE require filters; no accidental data loss
+
+<!-- code-review-graph MCP tools -->
+## MCP Tools: code-review-graph
+
+**IMPORTANT: This project has a knowledge graph. ALWAYS use the
+code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
+the codebase.** The graph is faster, cheaper (fewer tokens), and gives
+you structural context (callers, dependents, test coverage) that file
+scanning cannot.
+
+### When to use graph tools FIRST
+
+- **Exploring code**: `semantic_search_nodes` or `query_graph` instead of Grep
+- **Understanding impact**: `get_impact_radius` instead of manually tracing imports
+- **Code review**: `detect_changes` + `get_review_context` instead of reading entire files
+- **Finding relationships**: `query_graph` with callers_of/callees_of/imports_of/tests_for
+- **Architecture questions**: `get_architecture_overview` + `list_communities`
+
+Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
+
+### Key Tools
+
+| Tool | Use when |
+|------|----------|
+| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
+| `get_review_context` | Need source snippets for review — token-efficient |
+| `get_impact_radius` | Understanding blast radius of a change |
+| `get_affected_flows` | Finding which execution paths are impacted |
+| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
+| `semantic_search_nodes` | Finding functions/classes by name or keyword |
+| `get_architecture_overview` | Understanding high-level codebase structure |
+| `refactor_tool` | Planning renames, finding dead code |
+
+### Workflow
+
+1. The graph auto-updates on file changes (via hooks).
+2. Use `detect_changes` for code review.
+3. Use `get_affected_flows` to understand impact.
+4. Use `query_graph` pattern="tests_for" to check coverage.

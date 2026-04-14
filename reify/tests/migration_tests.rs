@@ -354,7 +354,7 @@ async fn rollback_executes_down_and_removes_tracking_entry() {
     );
     assert!(
         sql.iter()
-            .any(|s| s.contains("DELETE FROM _reify_migrations")),
+            .any(|s| s.contains("DELETE FROM \"_reify_migrations\"")),
         "expected DELETE FROM tracking: {sql:?}"
     );
 }
