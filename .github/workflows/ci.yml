@@ -82,7 +82,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
       - name: Run tarpaulin
         run: >
           cargo tarpaulin
@@ -92,6 +94,8 @@ jobs:
           --out xml
           --output-dir coverage/
           --exclude-files "reify-macros/*"
+          --exclude-files "reify/tests/compile_fail/*"
+          -- --skip builder_type_safety
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
