@@ -475,10 +475,7 @@ async fn pg_execute(
         .map(|p| p as &(dyn PgToSql + Sync))
         .collect();
     debug!(target: "reify::postgres", sql = %sql, "Executing");
-    client
-        .execute(sql, &param_refs[..])
-        .await
-        .map_err(pg_err)
+    client.execute(sql, &param_refs[..]).await.map_err(pg_err)
 }
 
 /// Prepare params and run a query on a `tokio_postgres::Client`.
@@ -493,10 +490,7 @@ async fn pg_query(
         .map(|p| p as &(dyn PgToSql + Sync))
         .collect();
     debug!(target: "reify::postgres", sql = %sql, "Querying");
-    let rows = client
-        .query(sql, &param_refs[..])
-        .await
-        .map_err(pg_err)?;
+    let rows = client.query(sql, &param_refs[..]).await.map_err(pg_err)?;
     Ok(rows.iter().map(pg_row_to_row).collect())
 }
 
@@ -532,30 +526,32 @@ impl Database for PostgresDb {
         pg_query(&conn, sql, params).await
     }
 
-    async fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
+    async fn query_stream<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+    ) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
         let conn = get_conn(&self.pool).await?;
         let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
         let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
             .iter()
             .map(|p| p as &(dyn PgToSql + Sync))
             .collect();
-            
+
         debug!(target: "reify::postgres", sql = %sql, "Querying (stream)");
         let row_stream = Box::pin(conn.query_raw(&sql, param_refs).await.map_err(pg_err)?);
 
-        let stream = futures_util::stream::unfold(
-            (row_stream, conn),
-            |(mut row_stream, conn)| async move {
+        let stream =
+            futures_util::stream::unfold((row_stream, conn), |(mut row_stream, conn)| async move {
                 use futures_util::StreamExt;
                 match row_stream.next().await {
                     Some(res) => Some((
                         res.map(|r| pg_row_to_row(&r)).map_err(pg_err),
-                        (row_stream, conn)
+                        (row_stream, conn),
                     )),
                     None => None,
                 }
-            }
-        );
+            });
 
         Ok(Box::pin(stream))
     }

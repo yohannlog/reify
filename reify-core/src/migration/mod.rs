@@ -71,7 +71,10 @@ mod tests {
             Err(DbError::Query("no rows".into()))
         }
 
-        fn transaction<'a>(&'a self, f: crate::db::TransactionFn<'a>) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+        fn transaction<'a>(
+            &'a self,
+            f: crate::db::TransactionFn<'a>,
+        ) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
             async move { f(self).await }
         }
     }
@@ -816,9 +819,15 @@ mod tests {
 
         struct Posts;
         impl Table for Posts {
-            fn table_name() -> &'static str { "posts" }
-            fn column_names() -> &'static [&'static str] { &["id", "user_id"] }
-            fn into_values(&self) -> Vec<Value> { vec![] }
+            fn table_name() -> &'static str {
+                "posts"
+            }
+            fn column_names() -> &'static [&'static str] {
+                &["id", "user_id"]
+            }
+            fn into_values(&self) -> Vec<Value> {
+                vec![]
+            }
         }
 
         let defs: Vec<crate::schema::ColumnDef> = vec![
@@ -864,9 +873,15 @@ mod tests {
             sql.contains("REFERENCES \"users\" (\"id\")"),
             "missing REFERENCES clause: {sql}"
         );
-        assert!(sql.contains("ON DELETE CASCADE"), "missing ON DELETE CASCADE: {sql}");
+        assert!(
+            sql.contains("ON DELETE CASCADE"),
+            "missing ON DELETE CASCADE: {sql}"
+        );
         // ON UPDATE NO ACTION should be omitted (default)
-        assert!(!sql.contains("ON UPDATE"), "unexpected ON UPDATE clause: {sql}");
+        assert!(
+            !sql.contains("ON UPDATE"),
+            "unexpected ON UPDATE clause: {sql}"
+        );
     }
 
     // ── View migration tests ────────────────────────────────────────

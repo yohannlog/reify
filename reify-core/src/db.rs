@@ -142,7 +142,8 @@ pub type BoxStream<'a, T> =
 /// Receives a `&dyn DynDatabase` representing the isolated transaction
 /// connection and returns a [`BoxFuture`] that resolves when the
 /// transaction body completes.
-pub type TransactionFn<'a> = Box<dyn for<'c> FnOnce(&'c dyn DynDatabase) -> BoxFuture<'c, ()> + Send + 'a>;
+pub type TransactionFn<'a> =
+    Box<dyn for<'c> FnOnce(&'c dyn DynDatabase) -> BoxFuture<'c, ()> + Send + 'a>;
 
 // ── Database trait ──────────────────────────────────────────────────
 
@@ -187,7 +188,10 @@ pub trait Database: Send + Sync {
         use futures_util::StreamExt;
         async move {
             let rows = self.query(&sql, &params).await?;
-            Ok(Box::pin(futures_util::stream::iter(rows.into_iter().map(Ok))) as BoxStream<'a, Row>)
+            Ok(
+                Box::pin(futures_util::stream::iter(rows.into_iter().map(Ok)))
+                    as BoxStream<'a, Row>,
+            )
         }
     }
 
@@ -221,7 +225,11 @@ pub trait DynDatabase: Send + Sync {
 
     fn query<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Vec<Row>>;
 
-    fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> BoxFuture<'a, BoxStream<'a, Row>>;
+    fn query_stream<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+    ) -> BoxFuture<'a, BoxStream<'a, Row>>;
 
     fn query_one<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Row>;
 
@@ -237,7 +245,11 @@ impl<T: Database> DynDatabase for T {
         Box::pin(Database::query(self, sql, params))
     }
 
-    fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> BoxFuture<'a, BoxStream<'a, Row>> {
+    fn query_stream<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+    ) -> BoxFuture<'a, BoxStream<'a, Row>> {
         Box::pin(Database::query_stream(self, sql, params))
     }
 
@@ -257,7 +269,11 @@ impl Database for dyn DynDatabase + '_ {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
         DynDatabase::query(self, sql, params).await
     }
-    async fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> Result<BoxStream<'a, Row>, DbError> {
+    async fn query_stream<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+    ) -> Result<BoxStream<'a, Row>, DbError> {
         DynDatabase::query_stream(self, sql, params).await
     }
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
@@ -323,7 +339,9 @@ pub async fn fetch_stream<'a, M: Table + FromRow>(
 ) -> Result<BoxStream<'a, M>, DbError> {
     use futures_util::StreamExt;
     let stream = fetch_all_stream(db, builder).await?;
-    Ok(Box::pin(stream.map(|res| res.and_then(|r| M::from_row(&r)))))
+    Ok(Box::pin(
+        stream.map(|res| res.and_then(|r| M::from_row(&r))),
+    ))
 }
 
 /// Execute a SELECT and return exactly one typed result.
@@ -557,7 +575,10 @@ mod tests {
                 .ok_or_else(|| DbError::Query("no rows".into()))
         }
 
-        fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+        fn transaction<'a>(
+            &'a self,
+            f: TransactionFn<'a>,
+        ) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
             async move { f(self).await }
         }
     }

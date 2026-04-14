@@ -442,10 +442,8 @@ impl<M: Table> InsertManyBuilder<M> {
 
         // We need to move chunks into the closure. Clone the data.
         #[cfg(feature = "postgres")]
-        let owned_chunks: Vec<(String, Vec<Value>)> = chunks
-            .into_iter()
-            .map(|q| (q.sql, q.params))
-            .collect();
+        let owned_chunks: Vec<(String, Vec<Value>)> =
+            chunks.into_iter().map(|q| (q.sql, q.params)).collect();
         #[cfg(not(feature = "postgres"))]
         let owned_chunks = chunks;
 

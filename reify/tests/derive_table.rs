@@ -156,10 +156,7 @@ fn select_build_emits_trace() {
             .build()
     });
 
-    assert_eq!(
-        sql,
-        "SELECT * FROM \"users\" WHERE \"email\" = ?"
-    );
+    assert_eq!(sql, "SELECT * FROM \"users\" WHERE \"email\" = ?");
 }
 
 #[test]
@@ -1042,7 +1039,10 @@ fn column_foreign_key_via_derive() {
 
     let defs = Post::column_defs();
     let fk_def = defs.iter().find(|d| d.name == "user_id").unwrap();
-    let fk = fk_def.foreign_key.as_ref().expect("expected foreign_key on user_id");
+    let fk = fk_def
+        .foreign_key
+        .as_ref()
+        .expect("expected foreign_key on user_id");
 
     assert_eq!(fk.references_table, "users");
     assert_eq!(fk.references_column, "id");
@@ -1074,8 +1074,14 @@ fn foreign_key_ddl_contains_references_clause() {
     let sql = create_table_sql::<Post>(&defs, Dialect::Postgres);
 
     assert!(sql.contains("FOREIGN KEY"), "missing FOREIGN KEY: {sql}");
-    assert!(sql.contains("REFERENCES \"users\" (\"id\")"), "missing REFERENCES: {sql}");
-    assert!(sql.contains("ON DELETE CASCADE"), "missing ON DELETE CASCADE: {sql}");
+    assert!(
+        sql.contains("REFERENCES \"users\" (\"id\")"),
+        "missing REFERENCES: {sql}"
+    );
+    assert!(
+        sql.contains("ON DELETE CASCADE"),
+        "missing ON DELETE CASCADE: {sql}"
+    );
     assert!(!sql.contains("ON UPDATE"), "unexpected ON UPDATE: {sql}");
 }
 

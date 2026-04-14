@@ -1,4 +1,6 @@
-use crate::schema::{ColumnDef, ComputedColumn, ForeignKeyDef, IndexDef, TimestampKind, TimestampSource};
+use crate::schema::{
+    ColumnDef, ComputedColumn, ForeignKeyDef, IndexDef, TimestampKind, TimestampSource,
+};
 use crate::value::Value;
 
 /// Trait implemented by `#[derive(Table)]` on user structs.

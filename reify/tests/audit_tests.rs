@@ -69,7 +69,10 @@ impl Database for MockDb {
         Err(DbError::Query("no rows".into()))
     }
 
-    fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+    fn transaction<'a>(
+        &'a self,
+        f: TransactionFn<'a>,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
         async move { f(self).await }
     }
 }
