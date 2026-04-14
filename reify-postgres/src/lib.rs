@@ -485,8 +485,10 @@ fn prepare_pg_params<'a>(
 ) -> (String, Vec<&'a (dyn PgToSql + Sync)>) {
     let sql = rewrite_placeholders_pg(sql);
     *pg_params = params.iter().map(PgValue).collect();
-    let param_refs: Vec<&(dyn PgToSql + Sync)> =
-        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
+        .iter()
+        .map(|p| p as &(dyn PgToSql + Sync))
+        .collect();
     (sql, param_refs)
 }
 

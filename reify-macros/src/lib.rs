@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse::Parse, parse_macro_input, Attribute, Data, DeriveInput, Fields, Lit, Path};
+use syn::{Attribute, Data, DeriveInput, Fields, Lit, Path, parse::Parse, parse_macro_input};
 
 /// Derive macro that implements `Table` and generates typed column constants + query builder helpers.
 ///

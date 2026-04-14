@@ -201,15 +201,14 @@ impl Database for SqliteDb {
         };
 
         match f(&txn).await {
-            Ok(()) => {
-                sqlite_spawn(Arc::clone(&txn.conn), |c| sqlite_execute(c, "COMMIT", &[]))
-                    .await
-                    .map(|_| ())
-            }
+            Ok(()) => sqlite_spawn(Arc::clone(&txn.conn), |c| sqlite_execute(c, "COMMIT", &[]))
+                .await
+                .map(|_| ()),
             Err(e) => {
-                let _ =
-                    sqlite_spawn(Arc::clone(&txn.conn), |c| sqlite_execute(c, "ROLLBACK", &[]))
-                        .await;
+                let _ = sqlite_spawn(Arc::clone(&txn.conn), |c| {
+                    sqlite_execute(c, "ROLLBACK", &[])
+                })
+                .await;
                 Err(e)
             }
         }
@@ -258,13 +257,11 @@ impl Database for SqliteTransaction {
         .await?;
 
         match f(self).await {
-            Ok(()) => {
-                sqlite_spawn(Arc::clone(&self.conn), |c| {
-                    sqlite_execute(c, "RELEASE SAVEPOINT nested_txn", &[])
-                })
-                .await
-                .map(|_| ())
-            }
+            Ok(()) => sqlite_spawn(Arc::clone(&self.conn), |c| {
+                sqlite_execute(c, "RELEASE SAVEPOINT nested_txn", &[])
+            })
+            .await
+            .map(|_| ()),
             Err(e) => {
                 let _ = sqlite_spawn(Arc::clone(&self.conn), |c| {
                     sqlite_execute(c, "ROLLBACK TO SAVEPOINT nested_txn", &[])

@@ -17,7 +17,9 @@
 //!   sqlite:./path/to/db.sqlite   (or  sqlite::memory:)
 
 use clap::{Parser, Subcommand};
-use reify_core::migration::{MigrationRunner, generate_migration_file, generate_view_migration_file};
+use reify_core::migration::{
+    MigrationRunner, generate_migration_file, generate_view_migration_file,
+};
 
 // ── CLI definition ───────────────────────────────────────────────────
 
@@ -240,10 +242,7 @@ async fn cmd_migrate(url: &str, dry_run: bool) -> Result<(), String> {
     with_db(url, |db: Box<dyn reify_core::db::DynDatabase>| async move {
         let runner = MigrationRunner::new();
         if dry_run {
-            let plans = runner
-                .dry_run(&db)
-                .await
-                .map_err(|e| e.to_string())?;
+            let plans = runner.dry_run(&db).await.map_err(|e| e.to_string())?;
 
             if plans.is_empty() {
                 println!("✓ No pending migrations.");
@@ -266,10 +265,7 @@ async fn cmd_migrate(url: &str, dry_run: bool) -> Result<(), String> {
 async fn cmd_status(url: &str) -> Result<(), String> {
     with_db(url, |db: Box<dyn reify_core::db::DynDatabase>| async move {
         let runner = MigrationRunner::new();
-        let statuses = runner
-            .status(&db)
-            .await
-            .map_err(|e| e.to_string())?;
+        let statuses = runner.status(&db).await.map_err(|e| e.to_string())?;
 
         if statuses.is_empty() {
             println!("No migrations registered.");
@@ -337,10 +333,7 @@ async fn cmd_rollback(url: &str, to: Option<&str>) -> Result<(), String> {
                 .rollback_to(&db, version)
                 .await
                 .map_err(|e| e.to_string())?,
-            None => runner
-                .rollback(&db)
-                .await
-                .map_err(|e| e.to_string())?,
+            None => runner.rollback(&db).await.map_err(|e| e.to_string())?,
         }
         println!("✓ Rollback complete.");
         Ok(())
