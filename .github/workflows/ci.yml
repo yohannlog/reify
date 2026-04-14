@@ -74,6 +74,30 @@ jobs:
           --test sql_injection
           --test subquery
 
+  coverage:
+    name: Coverage (tarpaulin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Run tarpaulin
+        run: >
+          cargo tarpaulin
+          --all-features
+          --workspace
+          --timeout 120
+          --out xml
+          --output-dir coverage/
+          --exclude-files "reify-macros/*"
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage/cobertura.xml
+          fail_ci_if_error: false
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
