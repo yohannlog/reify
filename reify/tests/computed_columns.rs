@@ -64,7 +64,7 @@ fn computed_stored_excluded_from_insert() {
         "should have 3 params (id, price, quantity)"
     );
     assert!(
-        sql.contains("id, price, quantity"),
+        sql.contains("\"id\", \"price\", \"quantity\""),
         "should list writable columns: {sql}"
     );
 }
@@ -200,11 +200,11 @@ fn virtual_excluded_from_create_table() {
         "CREATE TABLE should not include virtual column: {sql}"
     );
     assert!(
-        sql.contains("first_name"),
+        sql.contains("\"first_name\""),
         "should include real columns: {sql}"
     );
     assert!(
-        sql.contains("last_name"),
+        sql.contains("\"last_name\""),
         "should include real columns: {sql}"
     );
 }
@@ -243,7 +243,7 @@ fn no_computed_columns_insert_includes_all() {
     };
     let (sql, _) = Simple::insert(&s).build();
     assert!(
-        sql.contains("id, name"),
+        sql.contains("\"id\", \"name\""),
         "should include all columns: {sql}"
     );
 }
@@ -260,7 +260,7 @@ pub struct Item {
 
 #[test]
 fn schema_builder_computed_stored() {
-    use reify::{table, Schema, SqlType, TableSchema};
+    use reify::{Schema, SqlType, TableSchema, table};
 
     let schema: TableSchema<Item> = table::<Item>("items")
         .column(Item::id, |c| c.primary_key())
@@ -278,7 +278,7 @@ fn schema_builder_computed_stored() {
 
 #[test]
 fn schema_builder_computed_virtual() {
-    use reify::{table, TableSchema};
+    use reify::{TableSchema, table};
 
     let schema: TableSchema<Item> = table::<Item>("items")
         .column(Item::id, |c| c.primary_key())

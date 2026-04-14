@@ -1,4 +1,4 @@
-use reify::{count_all, Expr, Table, Value};
+use reify::{Expr, Table, Value, count_all};
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "orders")]
@@ -16,7 +16,10 @@ fn group_by_single_column() {
         .select_expr(&[Expr::Col("status"), count_all()])
         .group_by(&["status"])
         .build();
-    assert_eq!(sql, "SELECT status, COUNT(*) FROM orders GROUP BY status");
+    assert_eq!(
+        sql,
+        "SELECT \"status\", COUNT(*) FROM \"orders\" GROUP BY \"status\""
+    );
     assert!(params.is_empty());
 }
 
@@ -28,7 +31,7 @@ fn group_by_multiple_columns() {
         .build();
     assert_eq!(
         sql,
-        "SELECT customer_id, status, COUNT(*) FROM orders GROUP BY customer_id, status"
+        "SELECT \"customer_id\", \"status\", COUNT(*) FROM \"orders\" GROUP BY \"customer_id\", \"status\""
     );
     assert!(params.is_empty());
 }
@@ -42,7 +45,7 @@ fn group_by_with_having_gt() {
         .build();
     assert_eq!(
         sql,
-        "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > ?"
+        "SELECT \"status\", COUNT(*) FROM \"orders\" GROUP BY \"status\" HAVING COUNT(*) > ?"
     );
     assert_eq!(params, vec![Value::I64(5)]);
 }
@@ -56,7 +59,7 @@ fn group_by_with_having_gte() {
         .build();
     assert_eq!(
         sql,
-        "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) >= ?"
+        "SELECT \"status\", COUNT(*) FROM \"orders\" GROUP BY \"status\" HAVING COUNT(*) >= ?"
     );
     assert_eq!(params, vec![Value::I64(10)]);
 }
@@ -70,7 +73,7 @@ fn group_by_with_having_lt() {
         .build();
     assert_eq!(
         sql,
-        "SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id HAVING COUNT(*) < ?"
+        "SELECT \"customer_id\", COUNT(*) FROM \"orders\" GROUP BY \"customer_id\" HAVING COUNT(*) < ?"
     );
     assert_eq!(params, vec![Value::I64(3)]);
 }
@@ -84,7 +87,7 @@ fn group_by_with_having_eq() {
         .build();
     assert_eq!(
         sql,
-        "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) = ?"
+        "SELECT \"status\", COUNT(*) FROM \"orders\" GROUP BY \"status\" HAVING COUNT(*) = ?"
     );
     assert_eq!(params, vec![Value::I64(1)]);
 }
@@ -97,7 +100,7 @@ fn sum_aggregate() {
         .build();
     assert_eq!(
         sql,
-        "SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id"
+        "SELECT \"customer_id\", SUM(\"amount\") FROM \"orders\" GROUP BY \"customer_id\""
     );
     assert!(params.is_empty());
 }
@@ -110,7 +113,7 @@ fn avg_aggregate() {
         .build();
     assert_eq!(
         sql,
-        "SELECT status, AVG(amount) FROM orders GROUP BY status"
+        "SELECT \"status\", AVG(\"amount\") FROM \"orders\" GROUP BY \"status\""
     );
     assert!(params.is_empty());
 }
@@ -127,7 +130,7 @@ fn min_max_aggregate() {
         .build();
     assert_eq!(
         sql,
-        "SELECT status, MIN(amount), MAX(amount) FROM orders GROUP BY status"
+        "SELECT \"status\", MIN(\"amount\"), MAX(\"amount\") FROM \"orders\" GROUP BY \"status\""
     );
     assert!(params.is_empty());
 }
@@ -140,7 +143,7 @@ fn count_column() {
         .build();
     assert_eq!(
         sql,
-        "SELECT status, COUNT(id) FROM orders GROUP BY status"
+        "SELECT \"status\", COUNT(\"id\") FROM \"orders\" GROUP BY \"status\""
     );
     assert!(params.is_empty());
 }
@@ -155,9 +158,12 @@ fn group_by_with_where_and_having() {
         .build();
     assert_eq!(
         sql,
-        "SELECT customer_id, SUM(amount) FROM orders WHERE status = ? GROUP BY customer_id HAVING SUM(amount) > ?"
+        "SELECT \"customer_id\", SUM(\"amount\") FROM \"orders\" WHERE \"status\" = ? GROUP BY \"customer_id\" HAVING SUM(\"amount\") > ?"
     );
-    assert_eq!(params, vec![Value::String("completed".into()), Value::F64(100.0)]);
+    assert_eq!(
+        params,
+        vec![Value::String("completed".into()), Value::F64(100.0)]
+    );
 }
 
 #[test]
@@ -171,7 +177,7 @@ fn group_by_with_order_and_limit() {
         .build();
     assert_eq!(
         sql,
-        "SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id HAVING COUNT(*) >= ? ORDER BY customer_id DESC LIMIT 10"
+        "SELECT \"customer_id\", COUNT(*) FROM \"orders\" GROUP BY \"customer_id\" HAVING COUNT(*) >= ? ORDER BY \"customer_id\" DESC LIMIT 10"
     );
     assert_eq!(params, vec![Value::I64(2)]);
 }
@@ -186,7 +192,7 @@ fn multiple_having_conditions() {
         .build();
     assert_eq!(
         sql,
-        "SELECT status, COUNT(*), SUM(amount) FROM orders GROUP BY status HAVING COUNT(*) > ? AND SUM(amount) < ?"
+        "SELECT \"status\", COUNT(*), SUM(\"amount\") FROM \"orders\" GROUP BY \"status\" HAVING COUNT(*) > ? AND SUM(\"amount\") < ?"
     );
     assert_eq!(params, vec![Value::I64(1), Value::F64(1000.0)]);
 }

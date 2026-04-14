@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --all-features
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (unit)
+        # timestamps.rs is excluded — it references unstable features not yet stabilised
+        run: >
+          cargo test -p reify
+          --test array_types
+          --test audit_tests
+          --test batch_upsert
+          --test builder_type_safety
+          --test computed_columns
+          --test cursor_pagination
+          --test derive_enum
+          --test derive_table
+          --test distinct
+          --test func_tests
+          --test group_by
+          --test migration_tests
+          --test range_types
+          --test relations
+          --test sql_injection
+          --test subquery
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: reify
+          POSTGRES_PASSWORD: reify
+          POSTGRES_DB: reify_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U reify -d reify_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: reify
+          MYSQL_DATABASE: reify_test
+          MYSQL_USER: reify
+          MYSQL_PASSWORD: reify
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u reify -preify"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_URL: postgres://reify:reify@localhost:5432/reify_test
+      MYSQL_URL: mysql://reify:reify@localhost:3306/reify_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (integration)
+        run: cargo test -p reify --features integration-tests --test integration

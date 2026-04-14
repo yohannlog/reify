@@ -166,7 +166,10 @@ fn update_builder_skips_if_already_set() {
 fn ddl_db_source_postgres_default_now() {
     let defs = Event::column_defs();
     let sql = reify::create_table_sql::<Event>(&defs, reify::Dialect::Postgres);
-    assert!(sql.contains("DEFAULT NOW()"), "DDL should contain DEFAULT NOW(): {sql}");
+    assert!(
+        sql.contains("DEFAULT NOW()"),
+        "DDL should contain DEFAULT NOW(): {sql}"
+    );
 }
 
 #[test]

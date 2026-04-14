@@ -71,8 +71,6 @@ impl MysqlDb {
     }
 }
 
-
-
 // ── Value → mysql_async parameter conversion ────────────────────────
 
 fn values_to_mysql_params(params: &[Value]) -> mysql_async::Params {
@@ -132,9 +130,7 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
                 if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
                     return Value::Timestamp(dt);
                 }
-                if let Ok(dt) =
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
                     return Value::Timestamp(dt);
                 }
                 if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
@@ -213,7 +209,11 @@ impl Database for MysqlDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Executing");
-        let mut conn = self.pool.get_conn().await.map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| DbError::Connection(e.to_string()))?;
         conn.exec_drop(sql, mysql_params).await.map_err(mysql_err)?;
         Ok(conn.affected_rows())
     }
@@ -221,30 +221,40 @@ impl Database for MysqlDb {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying");
-        let mut conn = self.pool.get_conn().await.map_err(|e| DbError::Connection(e.to_string()))?;
-        let rows: Vec<mysql_async::Row> =
-            conn.exec(sql, mysql_params).await.map_err(mysql_err)?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let rows: Vec<mysql_async::Row> = conn.exec(sql, mysql_params).await.map_err(mysql_err)?;
         Ok(rows.iter().map(mysql_row_to_row).collect())
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying one");
-        let mut conn = self.pool.get_conn().await.map_err(|e| DbError::Connection(e.to_string()))?;
-        let row: Option<mysql_async::Row> =
-            conn.exec_first(sql, mysql_params).await.map_err(mysql_err)?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let row: Option<mysql_async::Row> = conn
+            .exec_first(sql, mysql_params)
+            .await
+            .map_err(mysql_err)?;
         match row {
             Some(r) => Ok(mysql_row_to_row(&r)),
             None => Err(DbError::Query("no rows returned".to_string())),
         }
     }
 
-    async fn transaction<'a>(
-        &'a self,
-        f: TransactionFn<'a>,
-    ) -> Result<(), DbError> {
+    async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         debug!(target: "reify::mysql", "BEGIN transaction");
-        let mut conn = self.pool.get_conn().await.map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| DbError::Connection(e.to_string()))?;
         conn.exec_drop("BEGIN", mysql_async::Params::Empty)
             .await
             .map_err(mysql_err)?;
@@ -254,8 +264,7 @@ impl Database for MysqlDb {
         });
         // SAFETY: `txn` lives until the end of this async block, which
         // is strictly longer than the `f(&*txn_ref).await` call.
-        let txn_ref: &'a MysqlTransaction =
-            unsafe { &*(&*txn as *const MysqlTransaction) };
+        let txn_ref: &'a MysqlTransaction = unsafe { &*(&*txn as *const MysqlTransaction) };
 
         match f(txn_ref).await {
             Ok(()) => {
@@ -300,8 +309,7 @@ impl Database for MysqlTransaction {
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying (txn)");
         let mut conn = self.conn.lock().await;
-        let rows: Vec<mysql_async::Row> =
-            conn.exec(sql, mysql_params).await.map_err(mysql_err)?;
+        let rows: Vec<mysql_async::Row> = conn.exec(sql, mysql_params).await.map_err(mysql_err)?;
         Ok(rows.iter().map(mysql_row_to_row).collect())
     }
 
@@ -309,18 +317,17 @@ impl Database for MysqlTransaction {
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying one (txn)");
         let mut conn = self.conn.lock().await;
-        let row: Option<mysql_async::Row> =
-            conn.exec_first(sql, mysql_params).await.map_err(mysql_err)?;
+        let row: Option<mysql_async::Row> = conn
+            .exec_first(sql, mysql_params)
+            .await
+            .map_err(mysql_err)?;
         match row {
             Some(r) => Ok(mysql_row_to_row(&r)),
             None => Err(DbError::Query("no rows returned".to_string())),
         }
     }
 
-    async fn transaction<'a>(
-        &'a self,
-        f: TransactionFn<'a>,
-    ) -> Result<(), DbError> {
+    async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         // Nested transaction via SAVEPOINT
         debug!(target: "reify::mysql", "SAVEPOINT nested_txn");
         {
@@ -339,7 +346,12 @@ impl Database for MysqlTransaction {
             }
             Err(e) => {
                 let mut conn = self.conn.lock().await;
-                let _ = conn.exec_drop("ROLLBACK TO SAVEPOINT nested_txn", mysql_async::Params::Empty).await;
+                let _ = conn
+                    .exec_drop(
+                        "ROLLBACK TO SAVEPOINT nested_txn",
+                        mysql_async::Params::Empty,
+                    )
+                    .await;
                 Err(e)
             }
         }

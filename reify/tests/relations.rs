@@ -80,13 +80,19 @@ fn belongs_to_relation_type() {
 #[test]
 fn join_condition_string() {
     let rel = User::posts();
-    assert_eq!(rel.join_condition(), "users.id = posts.user_id");
+    assert_eq!(
+        rel.join_condition(),
+        "\"users\".\"id\" = \"posts\".\"user_id\""
+    );
 }
 
 #[test]
 fn belongs_to_join_condition() {
     let rel = User::team();
-    assert_eq!(rel.join_condition(), "users.team_id = teams.id");
+    assert_eq!(
+        rel.join_condition(),
+        "\"users\".\"team_id\" = \"teams\".\"id\""
+    );
 }
 
 // ── Related trait manual impl ────────────────────────────────────────
@@ -112,7 +118,7 @@ fn inner_join_sql() {
     let (sql, params) = User::find().join(User::posts()).build();
     assert_eq!(
         sql,
-        "SELECT users.*, posts.* FROM users INNER JOIN posts ON users.id = posts.user_id"
+        "SELECT \"users\".*, \"posts\".* FROM \"users\" INNER JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\""
     );
     assert!(params.is_empty());
 }
@@ -122,7 +128,7 @@ fn left_join_sql() {
     let (sql, params) = User::find().left_join(User::profile()).build();
     assert_eq!(
         sql,
-        "SELECT users.*, profiles.* FROM users LEFT JOIN profiles ON users.id = profiles.user_id"
+        "SELECT \"users\".*, \"profiles\".* FROM \"users\" LEFT JOIN \"profiles\" ON \"users\".\"id\" = \"profiles\".\"user_id\""
     );
     assert!(params.is_empty());
 }
@@ -132,7 +138,7 @@ fn right_join_sql() {
     let (sql, params) = User::find().right_join(User::team()).build();
     assert_eq!(
         sql,
-        "SELECT users.*, teams.* FROM users RIGHT JOIN teams ON users.team_id = teams.id"
+        "SELECT \"users\".*, \"teams\".* FROM \"users\" RIGHT JOIN \"teams\" ON \"users\".\"team_id\" = \"teams\".\"id\""
     );
     assert!(params.is_empty());
 }
@@ -145,9 +151,9 @@ fn chained_joins_sql() {
         .build();
     assert_eq!(
         sql,
-        "SELECT users.*, posts.*, profiles.* FROM users \
-         INNER JOIN posts ON users.id = posts.user_id \
-         LEFT JOIN profiles ON users.id = profiles.user_id"
+        "SELECT \"users\".*, \"posts\".*, \"profiles\".* FROM \"users\" \
+         INNER JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\" \
+         LEFT JOIN \"profiles\" ON \"users\".\"id\" = \"profiles\".\"user_id\""
     );
 }
 
@@ -159,9 +165,9 @@ fn join_with_filter_sql() {
         .build();
     assert_eq!(
         sql,
-        "SELECT users.*, posts.* FROM users \
-         INNER JOIN posts ON users.id = posts.user_id \
-         WHERE name = ?"
+        "SELECT \"users\".*, \"posts\".* FROM \"users\" \
+         INNER JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\" \
+         WHERE \"name\" = ?"
     );
     assert_eq!(params.len(), 1);
 }
@@ -184,7 +190,7 @@ fn with_builder_parent_sql() {
         .filter(User::name.eq("alice"))
         .with(User::posts());
     let ((parent_sql, parent_params), _child_tpl) = wb.build_queries();
-    assert_eq!(parent_sql, "SELECT * FROM users WHERE name = ?");
+    assert_eq!(parent_sql, "SELECT * FROM \"users\" WHERE \"name\" = ?");
     assert_eq!(parent_params.len(), 1);
 }
 
@@ -193,7 +199,10 @@ fn with_builder_child_template() {
     let wb = User::find().with(User::posts());
     let (_, child_tpl) = wb.build_queries();
     // Child query selects from the target table filtering by the FK column.
-    assert_eq!(child_tpl, "SELECT * FROM posts WHERE user_id IN (?)");
+    assert_eq!(
+        child_tpl,
+        "SELECT * FROM \"posts\" WHERE \"user_id\" IN (?)"
+    );
 }
 
 #[test]
@@ -209,5 +218,5 @@ fn with_builder_belongs_to_child_template() {
     let wb = User::find().with(User::team());
     let (_, child_tpl) = wb.build_queries();
     // belongs_to: to_col on Team is "id"
-    assert_eq!(child_tpl, "SELECT * FROM teams WHERE id IN (?)");
+    assert_eq!(child_tpl, "SELECT * FROM \"teams\" WHERE \"id\" IN (?)");
 }

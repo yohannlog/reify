@@ -107,7 +107,7 @@ fn cursor_roundtrip_display() {
 fn cursor_builder_first_page_asc() {
     let builder = User::find().cursor(User::id).first(10);
     let (sql, params) = builder.build();
-    assert_eq!(sql, "SELECT * FROM users ORDER BY id ASC LIMIT 11");
+    assert_eq!(sql, "SELECT * FROM \"users\" ORDER BY \"id\" ASC LIMIT 11");
     assert!(params.is_empty());
 }
 
@@ -115,7 +115,7 @@ fn cursor_builder_first_page_asc() {
 fn cursor_builder_first_page_desc() {
     let builder = User::find().cursor_desc(User::id).first(10);
     let (sql, params) = builder.build();
-    assert_eq!(sql, "SELECT * FROM users ORDER BY id DESC LIMIT 11");
+    assert_eq!(sql, "SELECT * FROM \"users\" ORDER BY \"id\" DESC LIMIT 11");
     assert!(params.is_empty());
 }
 
@@ -130,7 +130,7 @@ fn cursor_builder_after_cursor_asc() {
     let (sql, params) = builder.build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE id > ? ORDER BY id ASC LIMIT 26"
+        "SELECT * FROM \"users\" WHERE \"id\" > ? ORDER BY \"id\" ASC LIMIT 26"
     );
     assert_eq!(params, vec![Value::I64(42)]);
 }
@@ -146,7 +146,7 @@ fn cursor_builder_after_cursor_desc() {
     // DESC + forward → LT
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE id < ? ORDER BY id DESC LIMIT 21"
+        "SELECT * FROM \"users\" WHERE \"id\" < ? ORDER BY \"id\" DESC LIMIT 21"
     );
     assert_eq!(params, vec![Value::I64(100)]);
 }
@@ -166,7 +166,7 @@ fn cursor_builder_before_cursor_asc() {
     // ASC + backward → LT, order flips to DESC
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE id < ? ORDER BY id DESC LIMIT 11"
+        "SELECT * FROM \"users\" WHERE \"id\" < ? ORDER BY \"id\" DESC LIMIT 11"
     );
     assert_eq!(params, vec![Value::I64(50)]);
 }
@@ -176,7 +176,7 @@ fn cursor_builder_last_without_cursor() {
     let builder = User::find().cursor(User::id).last(5);
     let (sql, params) = builder.build();
     // backward with no cursor → just reversed order
-    assert_eq!(sql, "SELECT * FROM users ORDER BY id DESC LIMIT 6");
+    assert_eq!(sql, "SELECT * FROM \"users\" ORDER BY \"id\" DESC LIMIT 6");
     assert!(params.is_empty());
 }
 
@@ -195,7 +195,7 @@ fn cursor_builder_with_filter() {
     let (sql, params) = builder.build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE email LIKE ? AND id > ? ORDER BY id ASC LIMIT 26"
+        "SELECT * FROM \"users\" WHERE \"email\" LIKE ? ESCAPE '\\' AND \"id\" > ? ORDER BY \"id\" ASC LIMIT 26"
     );
     assert_eq!(params, vec![Value::String("admin%".into()), Value::I64(10)]);
 }
@@ -212,7 +212,7 @@ fn cursor_builder_multi_column_first_page() {
     let (sql, params) = builder.build();
     assert_eq!(
         sql,
-        "SELECT * FROM posts ORDER BY user_id DESC, id DESC LIMIT 21"
+        "SELECT * FROM \"posts\" ORDER BY \"user_id\" DESC, \"id\" DESC LIMIT 21"
     );
     assert!(params.is_empty());
 }
@@ -228,7 +228,7 @@ fn cursor_builder_multi_column_after_cursor() {
     // DESC + forward → LT for row-value comparison
     assert_eq!(
         sql,
-        "SELECT * FROM posts WHERE (user_id, id) < (?, ?) ORDER BY user_id DESC, id DESC LIMIT 21"
+        "SELECT * FROM \"posts\" WHERE (user_id, id) < (?, ?) ORDER BY \"user_id\" DESC, \"id\" DESC LIMIT 21"
     );
     assert_eq!(params, vec![Value::I64(5), Value::I64(100)]);
 }
@@ -244,7 +244,7 @@ fn cursor_builder_multi_column_before_cursor() {
     // DESC + backward → GT, order flips to ASC
     assert_eq!(
         sql,
-        "SELECT * FROM posts WHERE (user_id, id) > (?, ?) ORDER BY user_id ASC, id ASC LIMIT 21"
+        "SELECT * FROM \"posts\" WHERE (user_id, id) > (?, ?) ORDER BY \"user_id\" ASC, \"id\" ASC LIMIT 21"
     );
     assert_eq!(params, vec![Value::I64(5), Value::I64(100)]);
 }
@@ -265,9 +265,12 @@ fn cursor_builder_with_count() {
     let (data_sql, count_sql, data_params, count_params) = builder.build_with_count();
     assert_eq!(
         data_sql,
-        "SELECT * FROM users WHERE score > ? AND id > ? ORDER BY id ASC LIMIT 11"
+        "SELECT * FROM \"users\" WHERE \"score\" > ? AND \"id\" > ? ORDER BY \"id\" ASC LIMIT 11"
     );
-    assert_eq!(count_sql, "SELECT COUNT(*) FROM users WHERE score > ?");
+    assert_eq!(
+        count_sql,
+        "SELECT COUNT(*) FROM \"users\" WHERE \"score\" > ?"
+    );
     assert_eq!(data_params, vec![Value::F64(50.0), Value::I64(42)]);
     assert_eq!(count_params, vec![Value::F64(50.0)]);
 }
@@ -396,7 +399,7 @@ fn full_pagination_flow() {
     // Page 1: no cursor
     let builder = User::find().cursor(User::id).first(2);
     let (sql, _) = builder.build();
-    assert_eq!(sql, "SELECT * FROM users ORDER BY id ASC LIMIT 3");
+    assert_eq!(sql, "SELECT * FROM \"users\" ORDER BY \"id\" ASC LIMIT 3");
 
     // Simulate: got 3 rows → has_next
     let rows = vec![
@@ -416,7 +419,7 @@ fn full_pagination_flow() {
     let (sql2, params2) = builder2.build();
     assert_eq!(
         sql2,
-        "SELECT * FROM users WHERE id > ? ORDER BY id ASC LIMIT 3"
+        "SELECT * FROM \"users\" WHERE \"id\" > ? ORDER BY \"id\" ASC LIMIT 3"
     );
     assert_eq!(params2, vec![Value::I64(2)]);
 

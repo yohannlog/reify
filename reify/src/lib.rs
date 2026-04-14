@@ -35,7 +35,10 @@ pub use reify_macros::View;
 
 // Database adapters behind feature flags
 #[cfg(feature = "postgres")]
-pub use reify_postgres::{self, deadpool_postgres, tokio_postgres, NoTls, PostgresDb};
+pub use reify_postgres::{self, NoTls, PostgresDb, deadpool_postgres, tokio_postgres};
 
 #[cfg(feature = "mysql")]
-pub use reify_mysql::{self, mysql_async, MysqlDb};
+pub use reify_mysql::{self, MysqlDb, mysql_async};
+
+#[cfg(feature = "sqlite")]
+pub use reify_sqlite::{self, SqliteDb};

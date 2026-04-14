@@ -133,9 +133,7 @@ fn main() {
     println!("  params: {params:?}\n");
 
     // isempty()
-    let (sql, params) = Event::find()
-        .filter(Event::rooms.is_empty_range())
-        .build();
+    let (sql, params) = Event::find().filter(Event::rooms.is_empty_range()).build();
     println!("is_empty_range:");
     println!("  {sql}");
     println!("  params: {params:?}\n");

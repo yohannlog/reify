@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 
 use crate::column::Column;
 use crate::condition::Condition;
+use crate::ident::qi;
 use crate::query::SelectBuilder;
 use crate::sql::{OrderFragment, SqlFragment};
 use crate::table::Table;
@@ -88,6 +89,7 @@ impl<M: Table> Paginated<M> {
         // Data query: set LIMIT/OFFSET on the AST
         let data_ast = match ast {
             SqlFragment::Select {
+                distinct,
                 columns,
                 from,
                 joins,
@@ -97,6 +99,7 @@ impl<M: Table> Paginated<M> {
                 order_by,
                 ..
             } => SqlFragment::Select {
+                distinct,
                 columns,
                 from,
                 joins,
@@ -182,6 +185,7 @@ impl<M: Table> CursorPaginated<M> {
         // Operate on the AST: strip limit/offset, add cursor condition + ordering
         let ast = match ast {
             SqlFragment::Select {
+                distinct,
                 columns,
                 from,
                 joins,
@@ -202,11 +206,12 @@ impl<M: Table> CursorPaginated<M> {
                 // Replace ORDER BY with cursor ordering
                 let descending = self.direction == CursorDirection::Backward;
                 let order_by = vec![OrderFragment {
-                    column: self.cursor_column.to_string(),
+                    column: qi(self.cursor_column),
                     descending,
                 }];
 
                 SqlFragment::Select {
+                    distinct,
                     columns,
                     from,
                     joins,
@@ -639,6 +644,7 @@ impl<M: Table> CursorBuilder<M> {
     fn apply_cursor(&self, ast: SqlFragment) -> SqlFragment {
         match ast {
             SqlFragment::Select {
+                distinct,
                 columns,
                 from,
                 joins,
@@ -668,13 +674,14 @@ impl<M: Table> CursorBuilder<M> {
                             c.descending
                         };
                         OrderFragment {
-                            column: c.name.to_string(),
+                            column: qi(c.name),
                             descending,
                         }
                     })
                     .collect();
 
                 SqlFragment::Select {
+                    distinct,
                     columns,
                     from,
                     joins,

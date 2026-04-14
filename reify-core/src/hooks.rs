@@ -25,10 +25,3 @@ pub trait ModelHooks {
     /// Called before a DELETE.
     fn before_delete(&self) {}
 }
-
-/// Marker: this type has no lifecycle hooks.
-///
-/// Automatically implemented for all types that do not implement `ModelHooks`.
-/// Used by the hook-aware db helpers to avoid requiring `ModelHooks` bounds
-/// on every model.
-pub struct NoHooks;

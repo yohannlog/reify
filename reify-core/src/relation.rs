@@ -67,14 +67,15 @@ impl<F: Table, T: Table> Relation<F, T> {
         }
     }
 
-    /// SQL JOIN condition fragment: `"from_table.from_col = to_table.to_col"`.
+    /// SQL JOIN condition fragment: `"from_table"."from_col" = "to_table"."to_col"`.
     pub fn join_condition(&self) -> String {
+        use crate::ident::qi;
         format!(
             "{}.{} = {}.{}",
-            F::table_name(),
-            self.from_col,
-            T::table_name(),
-            self.to_col,
+            qi(F::table_name()),
+            qi(self.from_col),
+            qi(T::table_name()),
+            qi(self.to_col),
         )
     }
 }

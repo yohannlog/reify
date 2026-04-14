@@ -43,7 +43,10 @@ fn carol() -> User {
 #[test]
 fn insert_many_single_row() {
     let (sql, params) = User::insert_many(&[alice()]).build();
-    assert_eq!(sql, "INSERT INTO users (id, email, name) VALUES (?, ?, ?)");
+    assert_eq!(
+        sql,
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?)"
+    );
     assert_eq!(params.len(), 3);
 }
 
@@ -52,7 +55,7 @@ fn insert_many_two_rows() {
     let (sql, params) = User::insert_many(&[alice(), bob()]).build();
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?), (?, ?, ?)"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?)"
     );
     assert_eq!(params.len(), 6);
 }
@@ -63,7 +66,7 @@ fn insert_many_three_rows_param_order() {
     let (sql, params) = User::insert_many(&[alice(), bob(), carol()]).build();
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?)"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?)"
     );
     assert_eq!(params.len(), 9);
     // Params are row-major: alice's values, then bob's, then carol's.
@@ -78,6 +81,24 @@ fn insert_many_empty_panics() {
     User::insert_many(&[]).build();
 }
 
+#[test]
+fn insert_many_try_new_returns_error_on_empty() {
+    let result = reify::InsertManyBuilder::<User>::try_new(&[]);
+    match result {
+        Err(err) => {
+            assert_eq!(err, reify::BuildError::EmptyInsert);
+            assert!(err.to_string().contains("at least one row"));
+        }
+        Ok(_) => panic!("expected EmptyInsert error"),
+    }
+}
+
+#[test]
+fn insert_many_try_new_ok_with_rows() {
+    let result = reify::InsertManyBuilder::<User>::try_new(&[alice()]);
+    assert!(result.is_ok());
+}
+
 // ── InsertBuilder — upsert (single row) ─────────────────────────────
 
 #[test]
@@ -87,7 +108,7 @@ fn insert_on_conflict_do_nothing_postgres() {
         .build_with_dialect(Dialect::Postgres);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?) ON CONFLICT DO NOTHING"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?) ON CONFLICT DO NOTHING"
     );
 }
 
@@ -98,7 +119,7 @@ fn insert_on_conflict_do_nothing_mysql() {
         .build_with_dialect(Dialect::Mysql);
     assert_eq!(
         sql,
-        "INSERT IGNORE INTO users (id, email, name) VALUES (?, ?, ?)"
+        "INSERT IGNORE INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?)"
     );
 }
 
@@ -109,8 +130,8 @@ fn insert_on_conflict_do_update_postgres() {
         .build_with_dialect(Dialect::Postgres);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?) \
-         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?) \
+         ON CONFLICT (\"email\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
     );
 }
 
@@ -121,8 +142,8 @@ fn insert_on_conflict_do_update_multiple_targets_postgres() {
         .build_with_dialect(Dialect::Postgres);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?) \
-         ON CONFLICT (id, email) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?) \
+         ON CONFLICT (\"id\", \"email\") DO UPDATE SET \"name\" = EXCLUDED.\"name\", \"email\" = EXCLUDED.\"email\""
     );
 }
 
@@ -133,8 +154,8 @@ fn insert_on_conflict_do_update_mysql() {
         .build_with_dialect(Dialect::Mysql);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?) \
-         ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?) \
+         ON DUPLICATE KEY UPDATE \"name\" = VALUES(\"name\")"
     );
 }
 
@@ -142,7 +163,10 @@ fn insert_on_conflict_do_update_mysql() {
 fn insert_no_conflict_clause_generic() {
     // Default build() emits no conflict clause regardless of dialect.
     let (sql, _) = User::insert(&alice()).build();
-    assert_eq!(sql, "INSERT INTO users (id, email, name) VALUES (?, ?, ?)");
+    assert_eq!(
+        sql,
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?)"
+    );
 }
 
 // ── InsertManyBuilder — upsert ───────────────────────────────────────
@@ -154,7 +178,7 @@ fn insert_many_on_conflict_do_nothing_postgres() {
         .build_with_dialect(Dialect::Postgres);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?), (?, ?, ?) ON CONFLICT DO NOTHING"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?) ON CONFLICT DO NOTHING"
     );
     assert_eq!(params.len(), 6);
 }
@@ -166,7 +190,7 @@ fn insert_many_on_conflict_do_nothing_mysql() {
         .build_with_dialect(Dialect::Mysql);
     assert_eq!(
         sql,
-        "INSERT IGNORE INTO users (id, email, name) VALUES (?, ?, ?), (?, ?, ?)"
+        "INSERT IGNORE INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?)"
     );
     assert_eq!(params.len(), 6);
 }
@@ -178,8 +202,8 @@ fn insert_many_on_conflict_do_update_postgres() {
         .build_with_dialect(Dialect::Postgres);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?), (?, ?, ?) \
-         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?) \
+         ON CONFLICT (\"email\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
     );
     assert_eq!(params.len(), 6);
 }
@@ -191,8 +215,8 @@ fn insert_many_on_conflict_do_update_mysql() {
         .build_with_dialect(Dialect::Mysql);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?), (?, ?, ?) \
-         ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email)"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?) \
+         ON DUPLICATE KEY UPDATE \"name\" = VALUES(\"name\"), \"email\" = VALUES(\"email\")"
     );
     assert_eq!(params.len(), 6);
 }
@@ -207,7 +231,7 @@ fn insert_many_returning_postgres() {
         .build_with_dialect(Dialect::Postgres);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?), (?, ?, ?) RETURNING id, email"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?) RETURNING \"id\", \"email\""
     );
     assert_eq!(params.len(), 6);
 }
@@ -221,7 +245,7 @@ fn insert_many_upsert_returning_postgres() {
         .build_with_dialect(Dialect::Postgres);
     assert_eq!(
         sql,
-        "INSERT INTO users (id, email, name) VALUES (?, ?, ?) \
-         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name RETURNING id"
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?) \
+         ON CONFLICT (\"email\") DO UPDATE SET \"name\" = EXCLUDED.\"name\" RETURNING \"id\""
     );
 }

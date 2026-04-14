@@ -1,15 +1,17 @@
 pub mod audit;
+pub mod built_query;
 pub mod column;
 pub mod condition;
 pub mod db;
 pub mod enumeration;
 pub mod func;
 pub mod hooks;
+pub mod ident;
+pub mod migration;
 pub mod paginate;
 pub mod query;
 pub mod range;
 pub mod relation;
-pub mod migration;
 pub mod rls;
 pub mod schema;
 pub mod sql;
@@ -20,22 +22,28 @@ pub mod view;
 pub use tracing;
 
 pub use column::Column;
-pub use condition::{Condition, LogicalOp};
+#[cfg(feature = "postgres")]
+pub use column::JsonExpr;
+#[cfg(feature = "postgres")]
+pub use condition::PgCondition;
+pub use condition::{AggregateCondition, Condition, LogicalOp};
+#[allow(deprecated)]
 pub use query::{
-    DeleteBuilder, Dialect, Expr, InsertBuilder, InsertManyBuilder, JoinClause, JoinKind,
-    JoinedSelectBuilder, OnConflict, SelectBuilder, UpdateBuilder, WithBuilder, count_all,
-    rewrite_placeholders_pg,
+    BuildError, DeleteBuilder, Dialect, Expr, InsertBuilder, InsertManyBuilder, JoinClause,
+    JoinKind, OnConflict, SelectBuilder, UpdateBuilder, WithBuilder, rewrite_placeholders_pg,
 };
+
+pub use func::count_all;
 
 pub use relation::{Related, Relation, RelationType};
 pub use sql::{JoinFragment, OrderFragment, SqlFragment, ToSql};
 pub use table::Table;
-pub use value::Value;
+pub use value::{FromValue, Value};
 
 pub use schema::{
-    table, ColumnBuilder, ColumnDef, ComputedColumn, HasTimestamp, IndexBuilder, IndexColumnDef,
-    IndexDef, IndexKind, NoTimestamp, Schema, SortDirection, SqlType, TableSchema, TimestampKind,
-    TimestampSource, TimestampState,
+    ColumnBuilder, ColumnDef, ComputedColumn, HasTimestamp, IndexBuilder, IndexColumnDef, IndexDef,
+    IndexKind, NoTimestamp, Schema, SortDirection, SqlType, TableSchema, TimestampKind,
+    TimestampSource, TimestampState, table,
 };
 
 pub use paginate::{
@@ -43,7 +51,13 @@ pub use paginate::{
     PageInfo, Paginated,
 };
 
-pub use db::{Database, DynDatabase, DbError, FromRow, Row, BoxFuture, TransactionFn, delete, fetch, fetch_all, insert, insert_many, update, sqlstate};
+pub use built_query::BuiltQuery;
+
+pub use db::{
+    BoxFuture, Database, DbError, DynDatabase, FromRow, Row, TransactionFn, delete, fetch,
+    fetch_all, fetch_one, fetch_optional, insert, insert_many, raw_execute, raw_fetch, raw_query,
+    sqlstate, update,
+};
 
 #[cfg(feature = "postgres")]
 pub use db::{delete_returning, insert_many_returning, insert_returning, update_returning};
@@ -60,8 +74,8 @@ pub use rls::{
 };
 
 pub use audit::{
-    Auditable, AuditContext, AuditOperation, audit_column_defs_for, values_to_json_string,
-    audited_update, audited_delete,
+    AuditContext, AuditOperation, Auditable, audit_column_defs_for, audited_delete, audited_update,
+    values_to_json_string,
 };
 
 pub use enumeration::{DbEnum, enum_from_value};

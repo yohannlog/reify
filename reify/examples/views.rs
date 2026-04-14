@@ -1,4 +1,4 @@
-use reify::{query::Order, Migration, MigrationContext, SqlType, Table, View, ViewSchemaDef};
+use reify::{Migration, MigrationContext, SqlType, Table, View, ViewSchemaDef, query::Order};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Source tables

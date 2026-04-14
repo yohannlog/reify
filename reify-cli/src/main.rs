@@ -10,8 +10,8 @@
 
 use clap::{Parser, Subcommand};
 use reify_core::migration::{
-    generate_migration_file, generate_view_migration_file, MigrationError, MigrationRunner,
-    MigrationStatus,
+    MigrationError, MigrationRunner, MigrationStatus, generate_migration_file,
+    generate_view_migration_file,
 };
 
 // ── CLI definition ───────────────────────────────────────────────────

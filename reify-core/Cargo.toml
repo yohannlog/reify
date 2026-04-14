@@ -16,3 +16,20 @@ serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "build_select"
+harness = false
+
+[[bench]]
+name = "build_insert_many"
+harness = false
+
+[[bench]]
+name = "rewrite_placeholders"
+harness = false
+
+[[bench]]
+name = "from_row"
+harness = false

@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse::Parse, parse_macro_input, Attribute, Data, DeriveInput, Fields, Lit, Path};
+use syn::{Attribute, Data, DeriveInput, Fields, Lit, Path, parse::Parse, parse_macro_input};
 
 /// Derive macro that implements `Table` and generates typed column constants + query builder helpers.
 ///
@@ -315,14 +315,14 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 return Err(syn::Error::new_spanned(
                     input,
                     "Table derive requires named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 input,
                 "Table derive only works on structs",
-            ))
+            ));
         }
     };
 
@@ -527,6 +527,28 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         quote! {}
     };
 
+    // Generate FromRow field extraction arms
+    let from_row_arms: Vec<proc_macro2::TokenStream> = col_idents
+        .iter()
+        .zip(col_types.iter())
+        .zip(col_names.iter())
+        .map(|((ident, ty), name)| {
+            quote! {
+                let #ident: #ty = match row.get(#name) {
+                    Some(v) => <#ty as reify_core::value::FromValue>::from_value(v.clone())
+                        .map_err(|e| reify_core::db::DbError::Conversion(
+                            format!("column '{}': {}", #name, e)
+                        ))?,
+                    None => return Err(reify_core::db::DbError::Conversion(
+                        format!("missing column: {}", #name)
+                    )),
+                };
+            }
+        })
+        .collect();
+
+    let from_row_field_names = col_idents.iter().collect::<Vec<_>>();
+
     let expanded = quote! {
         // ── Table trait impl ────────────────────────────────────────
         impl reify_core::Table for #struct_name {
@@ -553,6 +575,14 @@ fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
             fn update_timestamp_columns() -> Vec<&'static str> {
                 vec![#(#update_ts_vm_cols),*]
+            }
+        }
+
+        // ── FromRow impl (auto-generated) ───────────────────────────
+        impl reify_core::db::FromRow for #struct_name {
+            fn from_row(row: &reify_core::db::Row) -> Result<Self, reify_core::db::DbError> {
+                #(#from_row_arms)*
+                Ok(Self { #(#from_row_field_names),* })
             }
         }
 
@@ -689,7 +719,7 @@ fn impl_db_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             return Err(syn::Error::new_spanned(
                 input,
                 "DbEnum can only be derived on enums",
-            ))
+            ));
         }
     };
 
@@ -755,6 +785,24 @@ fn impl_db_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         impl reify_core::value::IntoValue for #enum_name {
             fn into_value(self) -> reify_core::Value {
                 reify_core::Value::String(reify_core::DbEnum::as_str(&self).to_owned())
+            }
+        }
+
+        impl reify_core::value::FromValue for #enum_name {
+            fn from_value(val: reify_core::Value) -> Result<Self, String> {
+                match &val {
+                    reify_core::Value::String(s) => {
+                        <#enum_name as reify_core::DbEnum>::from_str(s).ok_or_else(|| {
+                            format!(
+                                "unknown enum variant '{}', expected one of {:?}",
+                                s,
+                                <#enum_name as reify_core::DbEnum>::variants()
+                            )
+                        })
+                    }
+                    reify_core::Value::Null => Err("expected enum value, got NULL".to_string()),
+                    other => Err(format!("expected string for enum, got {:?}", other)),
+                }
             }
         }
     })
@@ -907,14 +955,14 @@ fn impl_partial_model(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
                 return Err(syn::Error::new_spanned(
                     input,
                     "PartialModel requires named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 input,
                 "PartialModel only works on structs",
-            ))
+            ));
         }
     };
 
@@ -1172,14 +1220,14 @@ fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 return Err(syn::Error::new_spanned(
                     input,
                     "View derive requires named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 input,
                 "View derive only works on structs",
-            ))
+            ));
         }
     };
 

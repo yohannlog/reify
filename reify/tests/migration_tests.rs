@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use reify::{
-    Database, DbError, Row, Value, TransactionFn,
+    Database, DbError, Row, TransactionFn, Value,
     migration::{
         Migration, MigrationContext, MigrationError, MigrationPlan, MigrationRunner,
         generate_migration_file,
@@ -44,7 +44,10 @@ impl MockDb {
 
 impl Database for MockDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-        self.executed.lock().unwrap().push((sql.to_string(), params.to_vec()));
+        self.executed
+            .lock()
+            .unwrap()
+            .push((sql.to_string(), params.to_vec()));
         Ok(1)
     }
 
@@ -60,10 +63,7 @@ impl Database for MockDb {
         Err(DbError::Query("no rows".into()))
     }
 
-    async fn transaction<'a>(
-        &'a self,
-        f: TransactionFn<'a>,
-    ) -> Result<(), DbError> {
+    async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         f(self).await
     }
 }
@@ -94,8 +94,12 @@ pub struct Post {
 
 struct AddUserCity;
 impl Migration for AddUserCity {
-    fn version(&self) -> &'static str { "20240320_000001_add_user_city" }
-    fn description(&self) -> &'static str { "Add city column to users" }
+    fn version(&self) -> &'static str {
+        "20240320_000001_add_user_city"
+    }
+    fn description(&self) -> &'static str {
+        "Add city column to users"
+    }
     fn up(&self, ctx: &mut MigrationContext) {
         ctx.add_column("users", "city", "TEXT NOT NULL DEFAULT ''");
     }
@@ -106,8 +110,12 @@ impl Migration for AddUserCity {
 
 struct AddPostSlug;
 impl Migration for AddPostSlug {
-    fn version(&self) -> &'static str { "20240321_000001_add_post_slug" }
-    fn description(&self) -> &'static str { "Add slug column to posts" }
+    fn version(&self) -> &'static str {
+        "20240321_000001_add_post_slug"
+    }
+    fn description(&self) -> &'static str {
+        "Add slug column to posts"
+    }
     fn up(&self, ctx: &mut MigrationContext) {
         ctx.add_column("posts", "slug", "TEXT NOT NULL DEFAULT ''");
         ctx.execute("UPDATE posts SET slug = title;");
@@ -119,9 +127,15 @@ impl Migration for AddPostSlug {
 
 struct IrreversibleDrop;
 impl Migration for IrreversibleDrop {
-    fn version(&self) -> &'static str { "20240322_000001_drop_old" }
-    fn description(&self) -> &'static str { "Drop legacy table" }
-    fn is_reversible(&self) -> bool { false }
+    fn version(&self) -> &'static str {
+        "20240322_000001_drop_old"
+    }
+    fn description(&self) -> &'static str {
+        "Drop legacy table"
+    }
+    fn is_reversible(&self) -> bool {
+        false
+    }
     fn up(&self, ctx: &mut MigrationContext) {
         ctx.execute("DROP TABLE IF EXISTS legacy;");
     }
@@ -164,7 +178,8 @@ async fn runner_emits_create_table_for_new_tables() {
 
     let sql = db.executed_sql();
     assert!(
-        sql.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS users")),
+        sql.iter()
+            .any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
         "CREATE TABLE not found: {sql:?}"
     );
 }
@@ -176,7 +191,10 @@ async fn runner_emits_add_column_for_new_fields() {
     // users table exists but missing "role"
     db.push_rows(vec![
         Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
-        Row::new(vec!["column_name".into()], vec![Value::String("email".into())]),
+        Row::new(
+            vec!["column_name".into()],
+            vec![Value::String("email".into())],
+        ),
     ]);
 
     MigrationRunner::new()
@@ -187,8 +205,8 @@ async fn runner_emits_add_column_for_new_fields() {
 
     let sql = db.executed_sql();
     assert!(
-        sql.iter().any(|s| s.contains("ADD COLUMN role")),
-        "ADD COLUMN role not found: {sql:?}"
+        sql.iter().any(|s| s.contains("ADD COLUMN \"role\"")),
+        "ADD COLUMN \"role\" not found: {sql:?}"
     );
 }
 
@@ -198,8 +216,14 @@ async fn runner_skips_table_when_all_columns_present() {
     db.push_rows(vec![]); // applied_versions
     db.push_rows(vec![
         Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
-        Row::new(vec!["column_name".into()], vec![Value::String("email".into())]),
-        Row::new(vec!["column_name".into()], vec![Value::String("role".into())]),
+        Row::new(
+            vec!["column_name".into()],
+            vec![Value::String("email".into())],
+        ),
+        Row::new(
+            vec!["column_name".into()],
+            vec![Value::String("role".into())],
+        ),
     ]);
 
     MigrationRunner::new()
@@ -211,7 +235,8 @@ async fn runner_skips_table_when_all_columns_present() {
     let sql = db.executed_sql();
     // Only the tracking table CREATE should be executed, no DDL for users
     assert!(
-        !sql.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS users")),
+        !sql.iter()
+            .any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
         "unexpected CREATE TABLE: {sql:?}"
     );
     assert!(
@@ -238,7 +263,8 @@ async fn dry_run_returns_plans_without_executing_ddl() {
     // No DDL executed (only tracking table CREATE + applied_versions query)
     let sql = db.executed_sql();
     assert!(
-        !sql.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS users")),
+        !sql.iter()
+            .any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
         "dry_run must not execute DDL: {sql:?}"
     );
 }
@@ -256,7 +282,7 @@ async fn dry_run_includes_manual_migration_statements() {
 
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].version, "20240320_000001_add_user_city");
-    assert!(plans[0].statements[0].contains("ADD COLUMN city"));
+    assert!(plans[0].statements[0].contains("ADD COLUMN \"city\""));
 }
 
 #[tokio::test]
@@ -281,7 +307,10 @@ async fn dry_run_skips_already_applied_migrations() {
         .await
         .unwrap();
 
-    assert!(plans.is_empty(), "expected no pending plans, got: {plans:?}");
+    assert!(
+        plans.is_empty(),
+        "expected no pending plans, got: {plans:?}"
+    );
 }
 
 #[tokio::test]
@@ -296,7 +325,7 @@ async fn manual_migration_up_executes_all_statements() {
         .unwrap();
 
     let sql = db.executed_sql();
-    assert!(sql.iter().any(|s| s.contains("ADD COLUMN slug")));
+    assert!(sql.iter().any(|s| s.contains("ADD COLUMN \"slug\"")));
     assert!(sql.iter().any(|s| s.contains("UPDATE posts SET slug")));
 }
 
@@ -317,11 +346,12 @@ async fn rollback_executes_down_and_removes_tracking_entry() {
 
     let sql = db.executed_sql();
     assert!(
-        sql.iter().any(|s| s.contains("DROP COLUMN city")),
-        "expected DROP COLUMN city: {sql:?}"
+        sql.iter().any(|s| s.contains("DROP COLUMN \"city\"")),
+        "expected DROP COLUMN \"city\": {sql:?}"
     );
     assert!(
-        sql.iter().any(|s| s.contains("DELETE FROM _reify_migrations")),
+        sql.iter()
+            .any(|s| s.contains("DELETE FROM _reify_migrations")),
         "expected DELETE FROM tracking: {sql:?}"
     );
 }
@@ -362,18 +392,21 @@ async fn status_lists_applied_and_pending() {
         .unwrap();
 
     assert_eq!(statuses.len(), 2);
-    let city = statuses.iter().find(|s| s.version.contains("add_user_city")).unwrap();
-    let slug = statuses.iter().find(|s| s.version.contains("add_post_slug")).unwrap();
+    let city = statuses
+        .iter()
+        .find(|s| s.version.contains("add_user_city"))
+        .unwrap();
+    let slug = statuses
+        .iter()
+        .find(|s| s.version.contains("add_post_slug"))
+        .unwrap();
     assert!(city.applied);
     assert!(!slug.applied);
 }
 
 #[test]
 fn generate_migration_file_produces_correct_struct_name() {
-    let content = generate_migration_file(
-        "add_user_city",
-        "20240320_000001_add_user_city",
-    );
+    let content = generate_migration_file("add_user_city", "20240320_000001_add_user_city");
     assert!(content.contains("struct AddUserCity"));
     assert!(content.contains("impl Migration for AddUserCity"));
     assert!(content.contains("20240320_000001_add_user_city"));
@@ -423,9 +456,9 @@ fn normalize_sql_type_parameterized() {
 
 #[test]
 fn create_table_uses_metadata_types_not_heuristics() {
+    use reify::Dialect;
     use reify::migration::create_table_sql;
     use reify::schema::{ColumnDef, SqlType};
-    use reify::Dialect;
 
     // Build column defs with explicit types matching User's columns
     let defs = vec![
@@ -476,16 +509,22 @@ fn create_table_uses_metadata_types_not_heuristics() {
     let sql = create_table_sql::<User>(&defs, Dialect::Postgres);
     assert!(sql.contains("BIGSERIAL"), "expected BIGSERIAL, got: {sql}");
     // email uses Uuid type → should render as UUID for Postgres, not TEXT
-    assert!(sql.contains("UUID"), "expected UUID (from metadata, not name heuristic), got: {sql}");
+    assert!(
+        sql.contains("UUID"),
+        "expected UUID (from metadata, not name heuristic), got: {sql}"
+    );
     assert!(sql.contains("TEXT"), "expected TEXT for role, got: {sql}");
-    assert!(sql.contains("PRIMARY KEY"), "expected PRIMARY KEY, got: {sql}");
+    assert!(
+        sql.contains("PRIMARY KEY"),
+        "expected PRIMARY KEY, got: {sql}"
+    );
     assert!(sql.contains("UNIQUE"), "expected UNIQUE, got: {sql}");
 }
 
 #[test]
 fn column_defs_from_derive_macro_have_correct_types() {
-    use reify::schema::SqlType;
     use reify::Table;
+    use reify::schema::SqlType;
 
     let defs = User::column_defs();
     assert_eq!(defs.len(), 3);
@@ -522,8 +561,13 @@ async fn auto_migration_uses_metadata_types_in_create_table() {
         .unwrap();
 
     let sql = db.executed_sql();
-    let create_users = sql.iter().find(|s| s.contains("CREATE TABLE IF NOT EXISTS users"));
-    assert!(create_users.is_some(), "expected CREATE TABLE users: {sql:?}");
+    let create_users = sql
+        .iter()
+        .find(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\""));
+    assert!(
+        create_users.is_some(),
+        "expected CREATE TABLE users: {sql:?}"
+    );
 
     let create_sql = create_users.unwrap();
     // Should use metadata types, not name-based heuristics
@@ -538,9 +582,9 @@ async fn auto_migration_uses_metadata_types_in_create_table() {
 
 #[test]
 fn create_table_with_column_check() {
+    use reify::Dialect;
     use reify::migration::create_table_sql;
     use reify::schema::{ColumnDef, SqlType};
-    use reify::Dialect;
 
     // Use column names matching User::column_names() = ["id", "email", "role"]
     let defs = vec![
@@ -609,9 +653,9 @@ fn create_table_with_column_check() {
 
 #[test]
 fn create_table_with_table_level_checks() {
+    use reify::Dialect;
     use reify::migration::create_table_sql_with_checks;
     use reify::schema::{ColumnDef, SqlType};
-    use reify::Dialect;
 
     // Use column names matching User::column_names() = ["id", "email", "role"]
     let defs = vec![
@@ -666,7 +710,10 @@ fn create_table_with_table_level_checks() {
         "expected table-level CHECK in: {sql}"
     );
     // Table-level CHECK should be a separate line, not on a column line
-    let check_line = sql.lines().find(|l| l.contains("length(email) > 5")).unwrap();
+    let check_line = sql
+        .lines()
+        .find(|l| l.contains("length(email) > 5"))
+        .unwrap();
     assert!(
         !check_line.contains("TEXT"),
         "table-level CHECK should be on its own line: {check_line}"
@@ -675,9 +722,9 @@ fn create_table_with_table_level_checks() {
 
 #[test]
 fn create_table_with_no_checks_matches_base() {
+    use reify::Dialect;
     use reify::migration::{create_table_sql, create_table_sql_with_checks};
     use reify::schema::{ColumnDef, SqlType};
-    use reify::Dialect;
 
     let defs = vec![ColumnDef {
         name: "id",

@@ -49,9 +49,7 @@ fn main() {
     println!("UPDATE:\n  {sql}\n  params: {params:?}\n");
 
     // ── DELETE (WHERE obligatoire) ──────────────────────────────
-    let (sql, params) = User::delete()
-        .filter(User::id.eq(42i64))
-        .build();
+    let (sql, params) = User::delete().filter(User::id.eq(42i64)).build();
     println!("DELETE:\n  {sql}\n  params: {params:?}\n");
 
     // ── Logical OR ──────────────────────────────────────────────

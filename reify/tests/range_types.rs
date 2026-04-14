@@ -1,7 +1,7 @@
-use reify::range::{Bound, Range};
 #[cfg(feature = "postgres")]
 use reify::Table;
 use reify::Value;
+use reify::range::{Bound, Range};
 
 // ── Range construction ─────────────────────────────────────────────
 
@@ -208,7 +208,7 @@ mod postgres_tests {
             .build();
         assert_eq!(
             sql,
-            "SELECT * FROM events WHERE duration && ? AND name LIKE ?"
+            "SELECT * FROM \"events\" WHERE \"duration\" && ? AND \"name\" LIKE ? ESCAPE '\\'"
         );
         assert_eq!(
             params,

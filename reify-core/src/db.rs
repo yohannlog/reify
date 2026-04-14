@@ -75,10 +75,16 @@ impl std::fmt::Display for DbError {
         match self {
             DbError::Connection(msg) => write!(f, "connection error: {msg}"),
             DbError::Query(msg) => write!(f, "query error: {msg}"),
-            DbError::Constraint { message, sqlstate: Some(code) } => {
+            DbError::Constraint {
+                message,
+                sqlstate: Some(code),
+            } => {
                 write!(f, "constraint violation [{code}]: {message}")
             }
-            DbError::Constraint { message, sqlstate: None } => {
+            DbError::Constraint {
+                message,
+                sqlstate: None,
+            } => {
                 write!(f, "constraint violation: {message}")
             }
             DbError::Conversion(msg) => write!(f, "conversion error: {msg}"),
@@ -118,7 +124,8 @@ pub mod sqlstate {
 ///
 /// Used by [`DynDatabase`] (the dyn-compatible companion trait) to erase
 /// the concrete future type behind a trait object.
-pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, DbError>> + Send + 'a>>;
+pub type BoxFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, DbError>> + Send + 'a>>;
 
 /// The closure accepted by [`Database::transaction`].
 ///
@@ -144,23 +151,35 @@ pub type TransactionFn<'a> = Box<dyn FnOnce(&'a dyn DynDatabase) -> BoxFuture<'a
 #[allow(async_fn_in_trait)]
 pub trait Database: Send + Sync {
     /// Execute a statement (INSERT, UPDATE, DELETE). Returns rows affected.
-    fn execute(&self, sql: &str, params: &[Value]) -> impl std::future::Future<Output = Result<u64, DbError>> + Send;
+    fn execute(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> impl std::future::Future<Output = Result<u64, DbError>> + Send;
 
     /// Execute a query (SELECT). Returns rows.
-    fn query(&self, sql: &str, params: &[Value]) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send;
+    fn query(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send;
 
     /// Execute a query and return a single row (e.g. COUNT).
-    fn query_one(&self, sql: &str, params: &[Value]) -> impl std::future::Future<Output = Result<Row, DbError>> + Send;
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> impl std::future::Future<Output = Result<Row, DbError>> + Send;
 
     /// Run a closure inside a transaction.
     ///
     /// The closure receives a `&dyn DynDatabase` that represents the
     /// **isolated transaction connection** — NOT the pool. All queries inside
     /// `f` MUST go through this reference to participate in the transaction.
-    async fn transaction<'a>(
+    fn transaction<'a>(
         &'a self,
         f: TransactionFn<'a>,
-    ) -> Result<(), DbError>;
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send;
 }
 
 // ── DynDatabase — dyn-compatible companion ──────────────────────────
@@ -171,48 +190,30 @@ pub trait Database: Send + Sync {
 /// A blanket impl automatically implements this for every `T: Database`.
 /// You should not implement this trait manually.
 pub trait DynDatabase: Send + Sync {
-    fn execute<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> BoxFuture<'a, u64>;
+    fn execute<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, u64>;
 
-    fn query<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> BoxFuture<'a, Vec<Row>>;
+    fn query<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Vec<Row>>;
 
-    fn query_one<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> BoxFuture<'a, Row>;
+    fn query_one<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Row>;
+
+    fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> BoxFuture<'a, ()>;
 }
 
 impl<T: Database> DynDatabase for T {
-    fn execute<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> BoxFuture<'a, u64> {
+    fn execute<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, u64> {
         Box::pin(Database::execute(self, sql, params))
     }
 
-    fn query<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> BoxFuture<'a, Vec<Row>> {
+    fn query<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Vec<Row>> {
         Box::pin(Database::query(self, sql, params))
     }
 
-    fn query_one<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> BoxFuture<'a, Row> {
+    fn query_one<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Row> {
         Box::pin(Database::query_one(self, sql, params))
+    }
+
+    fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> BoxFuture<'a, ()> {
+        Box::pin(Database::transaction(self, f))
     }
 }
 
@@ -226,11 +227,8 @@ impl Database for dyn DynDatabase + '_ {
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
         DynDatabase::query_one(self, sql, params).await
     }
-    async fn transaction<'a>(
-        &'a self,
-        _f: TransactionFn<'a>,
-    ) -> Result<(), DbError> {
-        Err(DbError::Other("transaction not supported on dyn DynDatabase".into()))
+    async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
+        DynDatabase::transaction(self, f).await
     }
 }
 
@@ -255,6 +253,36 @@ pub async fn fetch<M: Table + FromRow>(
 ) -> Result<Vec<M>, DbError> {
     let rows = fetch_all(db, builder).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
+}
+
+/// Execute a SELECT and return exactly one typed result.
+///
+/// Returns an error if the query returns 0 or 2+ rows.
+pub async fn fetch_one<M: Table + FromRow>(
+    db: &impl Database,
+    builder: &crate::query::SelectBuilder<M>,
+) -> Result<M, DbError> {
+    let rows = fetch(db, builder).await?;
+    match rows.len() {
+        1 => Ok(rows.into_iter().next().unwrap()),
+        0 => Err(DbError::Query("expected 1 row, got 0".into())),
+        n => Err(DbError::Query(format!("expected 1 row, got {n}"))),
+    }
+}
+
+/// Execute a SELECT and return 0 or 1 typed result.
+///
+/// Returns an error if the query returns 2+ rows.
+pub async fn fetch_optional<M: Table + FromRow>(
+    db: &impl Database,
+    builder: &crate::query::SelectBuilder<M>,
+) -> Result<Option<M>, DbError> {
+    let rows = fetch(db, builder).await?;
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(Some(rows.into_iter().next().unwrap())),
+        n => Err(DbError::Query(format!("expected 0 or 1 row, got {n}"))),
+    }
 }
 
 /// Execute an INSERT.
@@ -347,11 +375,7 @@ pub async fn delete_returning<M: Table + FromRow>(
 /// ```ignore
 /// let affected = raw_execute(db, "DELETE FROM sessions WHERE expires_at < ?", &[Value::Timestamptz(cutoff)]).await?;
 /// ```
-pub async fn raw_execute(
-    db: &impl Database,
-    sql: &str,
-    params: &[Value],
-) -> Result<u64, DbError> {
+pub async fn raw_execute(db: &impl Database, sql: &str, params: &[Value]) -> Result<u64, DbError> {
     db.execute(sql, params).await
 }
 
@@ -407,7 +431,10 @@ mod tests {
         }
 
         fn with_affected(n: u64) -> Self {
-            Self { rows: vec![], affected: n }
+            Self {
+                rows: vec![],
+                affected: n,
+            }
         }
     }
 
@@ -421,13 +448,13 @@ mod tests {
         }
 
         async fn query_one(&self, _sql: &str, _params: &[Value]) -> Result<Row, DbError> {
-            self.rows.first().cloned().ok_or_else(|| DbError::Query("no rows".into()))
+            self.rows
+                .first()
+                .cloned()
+                .ok_or_else(|| DbError::Query("no rows".into()))
         }
 
-        async fn transaction<'a>(
-            &'a self,
-            f: TransactionFn<'a>,
-        ) -> Result<(), DbError> {
+        async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
             f(self).await
         }
     }
@@ -481,9 +508,13 @@ mod tests {
             vec![Value::I64(42), Value::String("alice".into())],
         );
         let db = StubDb::with_rows(vec![row]);
-        let rows = raw_query(&db, "SELECT id, name FROM users WHERE id = ?", &[Value::I64(42)])
-            .await
-            .unwrap();
+        let rows = raw_query(
+            &db,
+            "SELECT id, name FROM users WHERE id = ?",
+            &[Value::I64(42)],
+        )
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("id"), Some(&Value::I64(42)));
         assert_eq!(rows[0].get("name"), Some(&Value::String("alice".into())));
@@ -511,11 +542,24 @@ mod tests {
             ),
         ];
         let db = StubDb::with_rows(rows);
-        let users: Vec<UserRow> =
-            raw_fetch::<UserRow>(&db, "SELECT id, name FROM users", &[]).await.unwrap();
+        let users: Vec<UserRow> = raw_fetch::<UserRow>(&db, "SELECT id, name FROM users", &[])
+            .await
+            .unwrap();
         assert_eq!(users.len(), 2);
-        assert_eq!(users[0], UserRow { id: 1, name: "bob".into() });
-        assert_eq!(users[1], UserRow { id: 2, name: "carol".into() });
+        assert_eq!(
+            users[0],
+            UserRow {
+                id: 1,
+                name: "bob".into()
+            }
+        );
+        assert_eq!(
+            users[1],
+            UserRow {
+                id: 2,
+                name: "carol".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -549,9 +593,18 @@ mod tests {
 
     #[test]
     fn dberror_display_variants() {
-        assert_eq!(DbError::Connection("refused".into()).to_string(), "connection error: refused");
-        assert_eq!(DbError::Query("syntax".into()).to_string(), "query error: syntax");
-        assert_eq!(DbError::Conversion("bad type".into()).to_string(), "conversion error: bad type");
+        assert_eq!(
+            DbError::Connection("refused".into()).to_string(),
+            "connection error: refused"
+        );
+        assert_eq!(
+            DbError::Query("syntax".into()).to_string(),
+            "query error: syntax"
+        );
+        assert_eq!(
+            DbError::Conversion("bad type".into()).to_string(),
+            "conversion error: bad type"
+        );
         assert_eq!(DbError::Other("oops".into()).to_string(), "error: oops");
     }
 }

@@ -1,4 +1,5 @@
 use crate::db::{Database, DbError, FromRow};
+use crate::ident::qi;
 use crate::query::{DeleteBuilder, UpdateBuilder};
 use crate::schema::{ColumnDef, SqlType, TimestampSource};
 use crate::table::Table;
@@ -228,7 +229,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayBool(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push_str(if *v { "true" } else { "false" });
                 }
                 out.push(']');
@@ -237,7 +240,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayI16(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push_str(&v.to_string());
                 }
                 out.push(']');
@@ -246,7 +251,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayI32(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push_str(&v.to_string());
                 }
                 out.push(']');
@@ -255,7 +262,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayI64(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push_str(&v.to_string());
                 }
                 out.push(']');
@@ -264,7 +273,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayF32(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push_str(&v.to_string());
                 }
                 out.push(']');
@@ -273,7 +284,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayF64(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push_str(&v.to_string());
                 }
                 out.push(']');
@@ -282,7 +295,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayString(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push('"');
                     out.push_str(&v.replace('\\', "\\\\").replace('"', "\\\""));
                     out.push('"');
@@ -293,7 +308,9 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::ArrayUuid(arr) => {
                 out.push('[');
                 for (j, v) in arr.iter().enumerate() {
-                    if j > 0 { out.push(','); }
+                    if j > 0 {
+                        out.push(',');
+                    }
                     out.push('"');
                     out.push_str(&v.to_string());
                     out.push('"');
@@ -325,7 +342,8 @@ pub async fn audited_update<M: Auditable>(
 
     // Build audit INSERT SQL
     let audit_sql = format!(
-        "INSERT INTO {audit_table} (operation, actor_id, row_data) VALUES (?, ?, ?)"
+        "INSERT INTO {} (\"operation\", \"actor_id\", \"row_data\") VALUES (?, ?, ?)",
+        qi(audit_table)
     );
     let actor_val = match actor_id {
         Some(id) => crate::value::Value::I64(id),
@@ -347,7 +365,8 @@ pub async fn audited_update<M: Auditable>(
             tx.execute(&audit_sql, &audit_params).await?;
             Ok(())
         })
-    })).await?;
+    }))
+    .await?;
 
     Ok(affected.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -383,7 +402,8 @@ pub async fn audited_delete<M: Auditable + FromRow>(
     let actor_id = ctx.actor_id;
 
     let audit_sql = format!(
-        "INSERT INTO {audit_table} (operation, actor_id, row_data) VALUES (?, ?, ?)"
+        "INSERT INTO {} (\"operation\", \"actor_id\", \"row_data\") VALUES (?, ?, ?)",
+        qi(audit_table)
     );
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -405,11 +425,13 @@ pub async fn audited_delete<M: Auditable + FromRow>(
                         actor_val,
                         crate::value::Value::String(row_data.clone()),
                     ],
-                ).await?;
+                )
+                .await?;
             }
             Ok(())
         })
-    })).await?;
+    }))
+    .await?;
 
     Ok(affected.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -425,7 +447,11 @@ mod tests {
     fn test_values_to_json_string_basic() {
         let json = values_to_json_string(
             &["id", "name", "active"],
-            &[Value::I64(42), Value::String("alice".into()), Value::Bool(true)],
+            &[
+                Value::I64(42),
+                Value::String("alice".into()),
+                Value::Bool(true),
+            ],
         );
         assert_eq!(json, r#"{"id":42,"name":"alice","active":true}"#);
     }
@@ -444,10 +470,7 @@ mod tests {
 
     #[test]
     fn test_values_to_json_string_escaping() {
-        let json = values_to_json_string(
-            &["msg"],
-            &[Value::String(r#"say "hi""#.into())],
-        );
+        let json = values_to_json_string(&["msg"], &[Value::String(r#"say "hi""#.into())]);
         assert_eq!(json, r#"{"msg":"say \"hi\""}"#);
     }
 

@@ -6,5 +6,5 @@ edition.workspace = true
 [dependencies]
 reify-core = { path = "../reify-core", version = "0.1.0" }
 rusqlite = { version = "0.31", features = ["bundled"] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"

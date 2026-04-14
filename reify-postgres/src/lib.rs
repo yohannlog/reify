@@ -178,21 +178,21 @@ fn range_to_pg<T: PgToSql + Sync>(
 
             range_to_sql(
                 |buf| match lower {
-                    Bound::Inclusive(v) => {
-                        Ok(RangeBound::Inclusive(convert_is_null(v.to_sql(&et_lower, buf)?)))
-                    }
-                    Bound::Exclusive(v) => {
-                        Ok(RangeBound::Exclusive(convert_is_null(v.to_sql(&et_lower, buf)?)))
-                    }
+                    Bound::Inclusive(v) => Ok(RangeBound::Inclusive(convert_is_null(
+                        v.to_sql(&et_lower, buf)?,
+                    ))),
+                    Bound::Exclusive(v) => Ok(RangeBound::Exclusive(convert_is_null(
+                        v.to_sql(&et_lower, buf)?,
+                    ))),
                     Bound::Unbounded => Ok(RangeBound::Unbounded),
                 },
                 |buf| match upper {
-                    Bound::Inclusive(v) => {
-                        Ok(RangeBound::Inclusive(convert_is_null(v.to_sql(&et_upper, buf)?)))
-                    }
-                    Bound::Exclusive(v) => {
-                        Ok(RangeBound::Exclusive(convert_is_null(v.to_sql(&et_upper, buf)?)))
-                    }
+                    Bound::Inclusive(v) => Ok(RangeBound::Inclusive(convert_is_null(
+                        v.to_sql(&et_upper, buf)?,
+                    ))),
+                    Bound::Exclusive(v) => Ok(RangeBound::Exclusive(convert_is_null(
+                        v.to_sql(&et_upper, buf)?,
+                    ))),
                     Bound::Unbounded => Ok(RangeBound::Unbounded),
                 },
                 out,
@@ -218,22 +218,22 @@ where
         postgres_protocol::types::Range::Empty => Range::Empty,
         postgres_protocol::types::Range::Nonempty(lower, upper) => {
             let lo = match lower {
-                PgBound::Inclusive(Some(bytes)) => {
-                    parse_element(bytes).map(Bound::Inclusive).unwrap_or(Bound::Unbounded)
-                }
-                PgBound::Exclusive(Some(bytes)) => {
-                    parse_element(bytes).map(Bound::Exclusive).unwrap_or(Bound::Unbounded)
-                }
+                PgBound::Inclusive(Some(bytes)) => parse_element(bytes)
+                    .map(Bound::Inclusive)
+                    .unwrap_or(Bound::Unbounded),
+                PgBound::Exclusive(Some(bytes)) => parse_element(bytes)
+                    .map(Bound::Exclusive)
+                    .unwrap_or(Bound::Unbounded),
                 PgBound::Inclusive(None) | PgBound::Exclusive(None) => Bound::Unbounded,
                 PgBound::Unbounded => Bound::Unbounded,
             };
             let hi = match upper {
-                PgBound::Inclusive(Some(bytes)) => {
-                    parse_element(bytes).map(Bound::Inclusive).unwrap_or(Bound::Unbounded)
-                }
-                PgBound::Exclusive(Some(bytes)) => {
-                    parse_element(bytes).map(Bound::Exclusive).unwrap_or(Bound::Unbounded)
-                }
+                PgBound::Inclusive(Some(bytes)) => parse_element(bytes)
+                    .map(Bound::Inclusive)
+                    .unwrap_or(Bound::Unbounded),
+                PgBound::Exclusive(Some(bytes)) => parse_element(bytes)
+                    .map(Bound::Exclusive)
+                    .unwrap_or(Bound::Unbounded),
                 PgBound::Inclusive(None) | PgBound::Exclusive(None) => Bound::Unbounded,
                 PgBound::Unbounded => Bound::Unbounded,
             };
@@ -341,48 +341,46 @@ fn pg_column_to_value(
             .flatten()
             .map(Value::Jsonb)
             .unwrap_or(Value::Null),
-        Type::INT4_RANGE => {
-            match row.try_get::<_, Option<&[u8]>>(idx) {
-                Ok(Some(raw)) => Value::Int4Range(range_from_pg(raw, |b| {
-                    use bytes::Buf;
-                    if b.len() == 4 { Some((&b[..]).get_i32()) } else { None }
-                })),
-                _ => Value::Null,
-            }
-        }
-        Type::INT8_RANGE => {
-            match row.try_get::<_, Option<&[u8]>>(idx) {
-                Ok(Some(raw)) => Value::Int8Range(range_from_pg(raw, |b| {
-                    use bytes::Buf;
-                    if b.len() == 8 { Some((&b[..]).get_i64()) } else { None }
-                })),
-                _ => Value::Null,
-            }
-        }
-        Type::TS_RANGE => {
-            match row.try_get::<_, Option<&[u8]>>(idx) {
-                Ok(Some(raw)) => Value::TsRange(range_from_pg(raw, |b| {
-                    postgres_types::FromSql::from_sql(&Type::TIMESTAMP, b).ok()
-                })),
-                _ => Value::Null,
-            }
-        }
-        Type::TSTZ_RANGE => {
-            match row.try_get::<_, Option<&[u8]>>(idx) {
-                Ok(Some(raw)) => Value::TstzRange(range_from_pg(raw, |b| {
-                    postgres_types::FromSql::from_sql(&Type::TIMESTAMPTZ, b).ok()
-                })),
-                _ => Value::Null,
-            }
-        }
-        Type::DATE_RANGE => {
-            match row.try_get::<_, Option<&[u8]>>(idx) {
-                Ok(Some(raw)) => Value::DateRange(range_from_pg(raw, |b| {
-                    postgres_types::FromSql::from_sql(&Type::DATE, b).ok()
-                })),
-                _ => Value::Null,
-            }
-        }
+        Type::INT4_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) => Value::Int4Range(range_from_pg(raw, |b| {
+                use bytes::Buf;
+                if b.len() == 4 {
+                    Some((&b[..]).get_i32())
+                } else {
+                    None
+                }
+            })),
+            _ => Value::Null,
+        },
+        Type::INT8_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) => Value::Int8Range(range_from_pg(raw, |b| {
+                use bytes::Buf;
+                if b.len() == 8 {
+                    Some((&b[..]).get_i64())
+                } else {
+                    None
+                }
+            })),
+            _ => Value::Null,
+        },
+        Type::TS_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) => Value::TsRange(range_from_pg(raw, |b| {
+                postgres_types::FromSql::from_sql(&Type::TIMESTAMP, b).ok()
+            })),
+            _ => Value::Null,
+        },
+        Type::TSTZ_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) => Value::TstzRange(range_from_pg(raw, |b| {
+                postgres_types::FromSql::from_sql(&Type::TIMESTAMPTZ, b).ok()
+            })),
+            _ => Value::Null,
+        },
+        Type::DATE_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) => Value::DateRange(range_from_pg(raw, |b| {
+                postgres_types::FromSql::from_sql(&Type::DATE, b).ok()
+            })),
+            _ => Value::Null,
+        },
         Type::BOOL_ARRAY => row
             .try_get::<_, Option<Vec<bool>>>(idx)
             .ok()
@@ -464,7 +462,9 @@ fn pg_err(e: tokio_postgres::Error) -> DbError {
 
 /// Acquire a pooled connection, mapping pool errors to `DbError`.
 async fn get_conn(pool: &Pool) -> Result<deadpool_postgres::Object, DbError> {
-    pool.get().await.map_err(|e| DbError::Connection(e.to_string()))
+    pool.get()
+        .await
+        .map_err(|e| DbError::Connection(e.to_string()))
 }
 
 /// Prepare params and execute a statement on a `tokio_postgres::Client`.
@@ -475,10 +475,15 @@ async fn pg_execute(
 ) -> Result<u64, DbError> {
     let pg_sql = rewrite_placeholders(sql);
     let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-    let param_refs: Vec<&(dyn PgToSql + Sync)> =
-        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
+        .iter()
+        .map(|p| p as &(dyn PgToSql + Sync))
+        .collect();
     debug!(target: "reify::postgres", sql = %pg_sql, "Executing");
-    client.execute(&*pg_sql, &param_refs[..]).await.map_err(pg_err)
+    client
+        .execute(&*pg_sql, &param_refs[..])
+        .await
+        .map_err(pg_err)
 }
 
 /// Prepare params and run a query on a `tokio_postgres::Client`.
@@ -489,10 +494,15 @@ async fn pg_query(
 ) -> Result<Vec<Row>, DbError> {
     let pg_sql = rewrite_placeholders(sql);
     let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-    let param_refs: Vec<&(dyn PgToSql + Sync)> =
-        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
+        .iter()
+        .map(|p| p as &(dyn PgToSql + Sync))
+        .collect();
     debug!(target: "reify::postgres", sql = %pg_sql, "Querying");
-    let rows = client.query(&*pg_sql, &param_refs[..]).await.map_err(pg_err)?;
+    let rows = client
+        .query(&*pg_sql, &param_refs[..])
+        .await
+        .map_err(pg_err)?;
     Ok(rows.iter().map(pg_row_to_row).collect())
 }
 
@@ -504,10 +514,15 @@ async fn pg_query_one(
 ) -> Result<Row, DbError> {
     let pg_sql = rewrite_placeholders(sql);
     let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
-    let param_refs: Vec<&(dyn PgToSql + Sync)> =
-        pg_params.iter().map(|p| p as &(dyn PgToSql + Sync)).collect();
+    let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
+        .iter()
+        .map(|p| p as &(dyn PgToSql + Sync))
+        .collect();
     debug!(target: "reify::postgres", sql = %pg_sql, "Querying one");
-    let row = client.query_one(&*pg_sql, &param_refs[..]).await.map_err(pg_err)?;
+    let row = client
+        .query_one(&*pg_sql, &param_refs[..])
+        .await
+        .map_err(pg_err)?;
     Ok(pg_row_to_row(&row))
 }
 
@@ -529,10 +544,7 @@ impl Database for PostgresDb {
         pg_query_one(&conn, sql, params).await
     }
 
-    async fn transaction<'a>(
-        &'a self,
-        f: TransactionFn<'a>,
-    ) -> Result<(), DbError> {
+    async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         debug!(target: "reify::postgres", "BEGIN transaction");
         let conn = get_conn(&self.pool).await?;
         conn.execute("BEGIN", &[]).await.map_err(pg_err)?;
@@ -546,8 +558,7 @@ impl Database for PostgresDb {
         // `&'a self`, but the compiler can't prove our local `txn`
         // lives that long. We guarantee it does because we don't drop
         // `txn` until after `f` completes.
-        let txn_ref: &'a PgTransaction =
-            unsafe { &*(&*txn as *const PgTransaction) };
+        let txn_ref: &'a PgTransaction = unsafe { &*(&*txn as *const PgTransaction) };
 
         match f(txn_ref).await {
             Ok(()) => {
@@ -588,20 +599,26 @@ impl Database for PgTransaction {
         pg_query_one(&self.conn, sql, params).await
     }
 
-    async fn transaction<'a>(
-        &'a self,
-        f: TransactionFn<'a>,
-    ) -> Result<(), DbError> {
+    async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         // Nested transaction via SAVEPOINT
         debug!(target: "reify::postgres", "SAVEPOINT nested_txn");
-        self.conn.execute("SAVEPOINT nested_txn", &[]).await.map_err(pg_err)?;
+        self.conn
+            .execute("SAVEPOINT nested_txn", &[])
+            .await
+            .map_err(pg_err)?;
         match f(self).await {
             Ok(()) => {
-                self.conn.execute("RELEASE SAVEPOINT nested_txn", &[]).await.map_err(pg_err)?;
+                self.conn
+                    .execute("RELEASE SAVEPOINT nested_txn", &[])
+                    .await
+                    .map_err(pg_err)?;
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute("ROLLBACK TO SAVEPOINT nested_txn", &[]).await;
+                let _ = self
+                    .conn
+                    .execute("ROLLBACK TO SAVEPOINT nested_txn", &[])
+                    .await;
                 Err(e)
             }
         }

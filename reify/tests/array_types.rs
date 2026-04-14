@@ -74,7 +74,7 @@ mod postgres_tests {
         let (sql, params) = Post::insert(&post).build();
         assert_eq!(
             sql,
-            "INSERT INTO posts (id, title, tags, scores) VALUES (?, ?, ?, ?)"
+            "INSERT INTO \"posts\" (\"id\", \"title\", \"tags\", \"scores\") VALUES (?, ?, ?, ?)"
         );
         assert_eq!(
             params,
@@ -92,11 +92,8 @@ mod postgres_tests {
         let (sql, params) = Post::find()
             .filter(Post::tags.contains(vec!["rust".to_string()]))
             .build();
-        assert_eq!(sql, "SELECT * FROM posts WHERE tags @> ?");
-        assert_eq!(
-            params,
-            vec![Value::ArrayString(vec!["rust".into()])]
-        );
+        assert_eq!(sql, "SELECT * FROM \"posts\" WHERE \"tags\" @> ?");
+        assert_eq!(params, vec![Value::ArrayString(vec!["rust".into()])]);
     }
 
     #[test]
@@ -108,7 +105,7 @@ mod postgres_tests {
                 "python".to_string(),
             ]))
             .build();
-        assert_eq!(sql, "SELECT * FROM posts WHERE tags <@ ?");
+        assert_eq!(sql, "SELECT * FROM \"posts\" WHERE \"tags\" <@ ?");
         assert_eq!(
             params,
             vec![Value::ArrayString(vec![
@@ -124,7 +121,7 @@ mod postgres_tests {
         let (sql, params) = Post::find()
             .filter(Post::tags.overlaps(vec!["rust".to_string(), "go".to_string()]))
             .build();
-        assert_eq!(sql, "SELECT * FROM posts WHERE tags && ?");
+        assert_eq!(sql, "SELECT * FROM \"posts\" WHERE \"tags\" && ?");
         assert_eq!(
             params,
             vec![Value::ArrayString(vec!["rust".into(), "go".into()])]
@@ -136,7 +133,7 @@ mod postgres_tests {
         let (sql, params) = Post::find()
             .filter(Post::scores.contains(vec![10i32]))
             .build();
-        assert_eq!(sql, "SELECT * FROM posts WHERE scores @> ?");
+        assert_eq!(sql, "SELECT * FROM \"posts\" WHERE \"scores\" @> ?");
         assert_eq!(params, vec![Value::ArrayI32(vec![10])]);
     }
 
@@ -146,13 +143,10 @@ mod postgres_tests {
             .set(Post::tags, vec!["updated".to_string()])
             .filter(Post::id.eq(1i64))
             .build();
-        assert_eq!(sql, "UPDATE posts SET tags = ? WHERE id = ?");
+        assert_eq!(sql, "UPDATE \"posts\" SET \"tags\" = ? WHERE \"id\" = ?");
         assert_eq!(
             params,
-            vec![
-                Value::ArrayString(vec!["updated".into()]),
-                Value::I64(1),
-            ]
+            vec![Value::ArrayString(vec!["updated".into()]), Value::I64(1),]
         );
     }
 
@@ -164,7 +158,7 @@ mod postgres_tests {
             .build();
         assert_eq!(
             sql,
-            "SELECT * FROM posts WHERE tags @> ? AND title LIKE ?"
+            "SELECT * FROM \"posts\" WHERE \"tags\" @> ? AND \"title\" LIKE ? ESCAPE '\\'"
         );
         assert_eq!(
             params,

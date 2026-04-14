@@ -96,7 +96,7 @@ fn column_constants_exist() {
 #[test]
 fn select_all() {
     let (sql, params) = User::find().build();
-    assert_eq!(sql, "SELECT * FROM users");
+    assert_eq!(sql, "SELECT * FROM \"users\"");
     assert!(params.is_empty());
 }
 
@@ -105,7 +105,7 @@ fn select_with_filter() {
     let (sql, params) = User::find()
         .filter(User::email.eq("alice@example.com"))
         .build();
-    assert_eq!(sql, "SELECT * FROM users WHERE email = ?");
+    assert_eq!(sql, "SELECT * FROM \"users\" WHERE \"email\" = ?");
     assert_eq!(params, vec![Value::String("alice@example.com".into())]);
 }
 
@@ -115,7 +115,10 @@ fn select_with_multiple_filters() {
         .filter(User::id.gt(10i64))
         .filter(User::role.is_not_null())
         .build();
-    assert_eq!(sql, "SELECT * FROM users WHERE id > ? AND role IS NOT NULL");
+    assert_eq!(
+        sql,
+        "SELECT * FROM \"users\" WHERE \"id\" > ? AND \"role\" IS NOT NULL"
+    );
     assert_eq!(params, vec![Value::I64(10)]);
 }
 
@@ -128,7 +131,7 @@ fn select_with_order_limit_offset() {
         .build();
     assert_eq!(
         sql,
-        "SELECT * FROM users ORDER BY id DESC LIMIT 10 OFFSET 20"
+        "SELECT * FROM \"users\" ORDER BY \"id\" DESC LIMIT 10 OFFSET 20"
     );
 }
 
@@ -152,7 +155,7 @@ fn select_build_emits_trace() {
     assert!(output.contains("Built SQL query"));
     assert!(output.contains("operation=\"select\""));
     assert!(output.contains("table=\"users\""));
-    assert!(output.contains("sql=SELECT * FROM users WHERE email = ?"));
+    assert!(output.contains("sql=SELECT * FROM \"users\" WHERE \"email\" = ?"));
 }
 
 #[test]
@@ -160,14 +163,17 @@ fn select_string_operators() {
     let (sql, params) = User::find()
         .filter(User::email.ends_with("@corp.io"))
         .build();
-    assert_eq!(sql, "SELECT * FROM users WHERE email LIKE ?");
+    assert_eq!(
+        sql,
+        "SELECT * FROM \"users\" WHERE \"email\" LIKE ? ESCAPE '\\'"
+    );
     assert_eq!(params, vec![Value::String("%@corp.io".into())]);
 }
 
 #[test]
 fn select_nullable_operators() {
     let (sql, params) = User::find().filter(User::role.is_null()).build();
-    assert_eq!(sql, "SELECT * FROM users WHERE role IS NULL");
+    assert_eq!(sql, "SELECT * FROM \"users\" WHERE \"role\" IS NULL");
     assert!(params.is_empty());
 }
 
@@ -181,7 +187,10 @@ fn insert_build() {
         role: Some("member".into()),
     };
     let (sql, params) = User::insert(&user).build();
-    assert_eq!(sql, "INSERT INTO users (id, email, role) VALUES (?, ?, ?)");
+    assert_eq!(
+        sql,
+        "INSERT INTO \"users\" (\"id\", \"email\", \"role\") VALUES (?, ?, ?)"
+    );
     assert_eq!(params.len(), 3);
 }
 
@@ -193,7 +202,7 @@ fn update_build() {
         .set(User::role, "admin")
         .filter(User::id.eq(42i64))
         .build();
-    assert_eq!(sql, "UPDATE users SET role = ? WHERE id = ?");
+    assert_eq!(sql, "UPDATE \"users\" SET \"role\" = ? WHERE \"id\" = ?");
     assert_eq!(params, vec![Value::String("admin".into()), Value::I64(42)]);
 }
 
@@ -208,7 +217,7 @@ fn update_without_where_panics() {
 #[test]
 fn delete_build() {
     let (sql, params) = User::delete().filter(User::id.eq(42i64)).build();
-    assert_eq!(sql, "DELETE FROM users WHERE id = ?");
+    assert_eq!(sql, "DELETE FROM \"users\" WHERE \"id\" = ?");
     assert_eq!(params, vec![Value::I64(42)]);
 }
 
@@ -218,13 +227,76 @@ fn delete_without_where_panics() {
     User::delete().build();
 }
 
+// ── try_build / unfiltered ──────────────────────────────────────────
+
+#[test]
+fn update_try_build_returns_error_without_filter() {
+    let result = User::update().set(User::role, "admin").try_build();
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(
+        err,
+        reify::BuildError::MissingFilter {
+            operation: "UPDATE"
+        }
+    );
+    assert!(err.to_string().contains("UPDATE without WHERE"));
+}
+
+#[test]
+fn update_try_build_ok_with_filter() {
+    let result = User::update()
+        .set(User::role, "admin")
+        .filter(User::id.eq(1i64))
+        .try_build();
+    assert!(result.is_ok());
+    let (sql, _) = result.unwrap();
+    assert!(sql.contains("WHERE"));
+}
+
+#[test]
+fn update_unfiltered_builds_without_where() {
+    let (sql, params) = User::update().set(User::role, "guest").unfiltered().build();
+    assert_eq!(sql, "UPDATE \"users\" SET \"role\" = ?");
+    assert_eq!(params, vec![Value::String("guest".into())]);
+}
+
+#[test]
+fn delete_try_build_returns_error_without_filter() {
+    let result = User::delete().try_build();
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(
+        err,
+        reify::BuildError::MissingFilter {
+            operation: "DELETE"
+        }
+    );
+}
+
+#[test]
+fn delete_try_build_ok_with_filter() {
+    let result = User::delete().filter(User::id.eq(1i64)).try_build();
+    assert!(result.is_ok());
+}
+
+#[test]
+fn delete_unfiltered_builds_without_where() {
+    let (sql, params) = User::delete().unfiltered().build();
+    assert_eq!(sql, "DELETE FROM \"users\"");
+    assert!(params.is_empty());
+}
+
 // ── Logical operators ───────────────────────────────────────────────
 
 #[test]
 fn or_condition() {
     let cond = User::email.eq("a@b.com").or(User::email.eq("c@d.com"));
     let (sql, params) = User::find().filter(cond).build();
-    assert_eq!(sql, "SELECT * FROM users WHERE (email = ? OR email = ?)");
+    assert_eq!(
+        sql,
+        "SELECT * FROM \"users\" WHERE (\"email\" = ? OR \"email\" = ?)"
+    );
     assert_eq!(params.len(), 2);
 }
 
@@ -299,11 +371,11 @@ fn paginate_page_1() {
     let (data_sql, count_sql, params) = paginated.build();
     assert_eq!(
         data_sql,
-        "SELECT * FROM users WHERE role IS NOT NULL LIMIT 25 OFFSET 0"
+        "SELECT * FROM \"users\" WHERE \"role\" IS NOT NULL LIMIT 25 OFFSET 0"
     );
     assert_eq!(
         count_sql,
-        "SELECT COUNT(*) FROM users WHERE role IS NOT NULL"
+        "SELECT COUNT(*) FROM \"users\" WHERE \"role\" IS NOT NULL"
     );
     assert!(params.is_empty());
 }
@@ -312,8 +384,8 @@ fn paginate_page_1() {
 fn paginate_page_3() {
     let paginated = User::find().paginate(3, 10);
     let (data_sql, count_sql, _) = paginated.build();
-    assert_eq!(data_sql, "SELECT * FROM users LIMIT 10 OFFSET 20");
-    assert_eq!(count_sql, "SELECT COUNT(*) FROM users");
+    assert_eq!(data_sql, "SELECT * FROM \"users\" LIMIT 10 OFFSET 20");
+    assert_eq!(count_sql, "SELECT COUNT(*) FROM \"users\"");
 }
 
 #[test]
@@ -361,7 +433,7 @@ fn cursor_after() {
     let (sql, params) = page.build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE role IS NOT NULL AND id > ? ORDER BY id ASC LIMIT 26"
+        "SELECT * FROM \"users\" WHERE \"role\" IS NOT NULL AND \"id\" > ? ORDER BY \"id\" ASC LIMIT 26"
     );
     assert_eq!(params, vec![Value::I64(150)]);
 }
@@ -372,7 +444,7 @@ fn cursor_before() {
     let (sql, params) = page.build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE id < ? ORDER BY id DESC LIMIT 26"
+        "SELECT * FROM \"users\" WHERE \"id\" < ? ORDER BY \"id\" DESC LIMIT 26"
     );
     assert_eq!(params, vec![Value::I64(100)]);
 }
@@ -384,7 +456,7 @@ fn cursor_first_page() {
     let (sql, _) = page.build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE id > ? ORDER BY id ASC LIMIT 11"
+        "SELECT * FROM \"users\" WHERE \"id\" > ? ORDER BY \"id\" ASC LIMIT 11"
     );
 }
 

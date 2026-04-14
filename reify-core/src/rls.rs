@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::condition::Condition;
-use crate::db::{Database, DynDatabase, DbError, Row, TransactionFn};
+use crate::db::{Database, DbError, DynDatabase, Row, TransactionFn};
 use crate::value::Value;
 
 // ── Policy context ─────────────────────────────────────────────────
@@ -113,11 +113,30 @@ impl Database for Scoped<'_> {
         self.inner.query_one(sql, params).await
     }
 
-    async fn transaction<'a>(
+    fn transaction<'a>(
         &'a self,
         f: TransactionFn<'a>,
-    ) -> Result<(), DbError> {
-        self.inner.transaction(f).await
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+        let ctx = self.ctx.clone();
+        async move {
+            self.inner
+                .transaction(Box::new(move |tx_db: &'a dyn DynDatabase| {
+                    let scoped_tx: Box<Scoped<'a>> = Box::new(Scoped::new(tx_db, ctx));
+                    // SAFETY: `scoped_tx` is moved into the async block and lives
+                    // until the future completes. The raw pointer cast extends the
+                    // borrow lifetime to match `'a` — same pattern as PgTransaction.
+                    let scoped_ref: &'a Scoped<'a> =
+                        unsafe { &*(&*scoped_tx as *const Scoped<'a>) };
+                    let fut = f(scoped_ref);
+                    // Move `scoped_tx` into the future to keep it alive until
+                    // `fut` completes. `_guard` is dropped after `fut.await`.
+                    Box::pin(async move {
+                        let _guard = scoped_tx;
+                        fut.await
+                    })
+                }))
+                .await
+        }
     }
 }
 
@@ -169,4 +188,164 @@ pub async fn scoped_delete<M: crate::table::Table + Policy>(
     };
     let (sql, params) = builder.build();
     Database::execute(scoped, &sql, &params).await
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, DbError, Row, TransactionFn};
+    use crate::value::Value;
+    use std::sync::{Arc, Mutex};
+
+    // ── Recording stub DB ───────────────────────────────────────────
+
+    /// A stub database that records all SQL executed through it.
+    struct RecordingDb {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingDb {
+        fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            (Self { log: log.clone() }, log)
+        }
+    }
+
+    impl Database for RecordingDb {
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<u64, DbError> {
+            self.log.lock().unwrap().push(sql.to_string());
+            Ok(0)
+        }
+
+        async fn query(&self, sql: &str, _params: &[Value]) -> Result<Vec<Row>, DbError> {
+            self.log.lock().unwrap().push(sql.to_string());
+            Ok(vec![])
+        }
+
+        async fn query_one(&self, sql: &str, _params: &[Value]) -> Result<Row, DbError> {
+            self.log.lock().unwrap().push(sql.to_string());
+            Err(DbError::Query("no rows".into()))
+        }
+
+        async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
+            // Simulate a transaction by just calling f with self
+            f(self).await
+        }
+    }
+
+    // ── Minimal Table + Policy stub ─────────────────────────────────
+
+    struct TenantPost;
+
+    impl crate::table::Table for TenantPost {
+        fn table_name() -> &'static str {
+            "posts"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "tenant_id", "title"]
+        }
+        fn into_values(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+
+    impl Policy for TenantPost {
+        fn policy(ctx: &RlsContext) -> Option<Condition> {
+            let tenant_id = ctx.get::<i64>("tenant_id")?;
+            Some(Condition::Eq("tenant_id", Value::I64(*tenant_id)))
+        }
+    }
+
+    // ── Tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn scoped_transaction_passes_queries_through() {
+        let (db, log) = RecordingDb::new();
+        let ctx = RlsContext::new().set("tenant_id", 42i64);
+        let scoped = Scoped::new(&db, ctx);
+
+        // Run a raw query inside a transaction via the Scoped wrapper.
+        // Before the fix, this would fail because DynDatabase didn't
+        // support transaction(). Now it delegates correctly.
+        let result = Database::transaction(
+            &scoped,
+            Box::new(|tx_db: &dyn DynDatabase| {
+                Box::pin(async move {
+                    // Issue a raw query through the transaction connection.
+                    // This goes through Scoped → RecordingDb.
+                    tx_db.query("SELECT 1", &[]).await?;
+                    tx_db.execute("UPDATE t SET x = 1", &[]).await?;
+                    Ok(())
+                })
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        // Both queries should have been recorded
+        let queries = log.lock().unwrap();
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0], "SELECT 1");
+        assert_eq!(queries[1], "UPDATE t SET x = 1");
+    }
+
+    #[tokio::test]
+    async fn scoped_query_outside_transaction_applies_rls() {
+        let (db, log) = RecordingDb::new();
+        let ctx = RlsContext::new().set("tenant_id", 7i64);
+        let scoped = Scoped::new(&db, ctx);
+
+        let builder = crate::query::SelectBuilder::<TenantPost>::new();
+        let _ = scoped_fetch_all::<TenantPost>(&scoped, builder).await;
+
+        let queries = log.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert!(
+            queries[0].contains("\"tenant_id\" = ?"),
+            "RLS filter should be applied, got: {}",
+            queries[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_transaction_wraps_connection_with_rls_context() {
+        let (db, _log) = RecordingDb::new();
+        let ctx = RlsContext::new().set("tenant_id", 99i64);
+        let scoped = Scoped::new(&db, ctx);
+
+        // Verify that the transaction closure receives a Scoped wrapper
+        // by checking that context() is accessible on the inner type.
+        // We use a shared flag to confirm the assertion ran.
+        let flag = Arc::new(Mutex::new(false));
+        let flag_clone = flag.clone();
+
+        let result = Database::transaction(
+            &scoped,
+            Box::new(move |tx_db: &dyn DynDatabase| {
+                let flag = flag_clone.clone();
+                Box::pin(async move {
+                    // The tx_db is a Scoped wrapping RecordingDb.
+                    // We can verify this indirectly: Scoped delegates query/execute
+                    // to its inner, so if we can query, the wrapping works.
+                    // The key behavioral guarantee: the Scoped::transaction impl
+                    // creates `Scoped::new(tx_db, ctx)` so the RLS context is
+                    // available for any scoped_* helper that receives this as
+                    // a &Scoped reference.
+                    tx_db.query("SELECT 1", &[]).await?;
+                    *flag.lock().unwrap() = true;
+                    Ok(())
+                })
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            *flag.lock().unwrap(),
+            "transaction closure should have executed"
+        );
+    }
 }

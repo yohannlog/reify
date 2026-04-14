@@ -102,7 +102,10 @@ fn table_with_enum_column_insert() {
         status: Status::Active,
     };
     let (sql, params) = Post::insert(&post).build();
-    assert_eq!(sql, "INSERT INTO posts (id, title, status) VALUES (?, ?, ?)");
+    assert_eq!(
+        sql,
+        "INSERT INTO \"posts\" (\"id\", \"title\", \"status\") VALUES (?, ?, ?)"
+    );
     assert_eq!(
         params,
         vec![
@@ -115,10 +118,8 @@ fn table_with_enum_column_insert() {
 
 #[test]
 fn table_with_enum_column_filter() {
-    let (sql, params) = Post::find()
-        .filter(Post::status.eq(Status::OnHold))
-        .build();
-    assert_eq!(sql, "SELECT * FROM posts WHERE status = ?");
+    let (sql, params) = Post::find().filter(Post::status.eq(Status::OnHold)).build();
+    assert_eq!(sql, "SELECT * FROM \"posts\" WHERE \"status\" = ?");
     assert_eq!(params, vec![Value::String("on_hold".into())]);
 }
 
@@ -127,7 +128,7 @@ fn table_with_enum_column_in_list() {
     let (sql, params) = Post::find()
         .filter(Post::status.in_list(vec![Status::Active, Status::Archived]))
         .build();
-    assert_eq!(sql, "SELECT * FROM posts WHERE status IN (?, ?)");
+    assert_eq!(sql, "SELECT * FROM \"posts\" WHERE \"status\" IN (?, ?)");
     assert_eq!(
         params,
         vec![
@@ -143,7 +144,7 @@ fn table_with_enum_column_update() {
         .set(Post::status, Status::Archived)
         .filter(Post::id.eq(1i64))
         .build();
-    assert_eq!(sql, "UPDATE posts SET status = ? WHERE id = ?");
+    assert_eq!(sql, "UPDATE \"posts\" SET \"status\" = ? WHERE \"id\" = ?");
     assert_eq!(
         params,
         vec![Value::String("archived".into()), Value::I64(1)]

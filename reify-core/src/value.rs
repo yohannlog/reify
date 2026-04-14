@@ -171,6 +171,259 @@ pub trait IntoValue {
     fn into_value(self) -> Value;
 }
 
+/// Trait for types that can be extracted from a `Value`.
+///
+/// Used by `#[derive(Table)]` to auto-generate `FromRow` implementations.
+/// Each supported Rust type implements this to convert from the dynamically-typed
+/// `Value` enum back into a concrete type.
+pub trait FromValue: Sized {
+    fn from_value(val: Value) -> Result<Self, String>;
+}
+
+impl FromValue for bool {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Bool(v) => Ok(v),
+            Value::I64(v) => Ok(v != 0),
+            Value::I32(v) => Ok(v != 0),
+            Value::I16(v) => Ok(v != 0),
+            _ => Err(format!("expected bool, got {:?}", val)),
+        }
+    }
+}
+
+impl FromValue for i16 {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::I16(v) => Ok(v),
+            Value::I32(v) => i16::try_from(v).map_err(|e| e.to_string()),
+            Value::I64(v) => i16::try_from(v).map_err(|e| e.to_string()),
+            _ => Err(format!("expected i16, got {:?}", val)),
+        }
+    }
+}
+
+impl FromValue for i32 {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::I32(v) => Ok(v),
+            Value::I16(v) => Ok(v as i32),
+            Value::I64(v) => i32::try_from(v).map_err(|e| e.to_string()),
+            _ => Err(format!("expected i32, got {:?}", val)),
+        }
+    }
+}
+
+impl FromValue for i64 {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::I64(v) => Ok(v),
+            Value::I32(v) => Ok(v as i64),
+            Value::I16(v) => Ok(v as i64),
+            _ => Err(format!("expected i64, got {:?}", val)),
+        }
+    }
+}
+
+impl FromValue for f32 {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::F32(v) => Ok(v),
+            Value::F64(v) => Ok(v as f32),
+            Value::I32(v) => Ok(v as f32),
+            Value::I64(v) => Ok(v as f32),
+            _ => Err(format!("expected f32, got {:?}", val)),
+        }
+    }
+}
+
+impl FromValue for f64 {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::F64(v) => Ok(v),
+            Value::F32(v) => Ok(v as f64),
+            Value::I32(v) => Ok(v as f64),
+            Value::I64(v) => Ok(v as f64),
+            _ => Err(format!("expected f64, got {:?}", val)),
+        }
+    }
+}
+
+impl FromValue for String {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::String(v) => Ok(v),
+            _ => Err(format!("expected String, got {:?}", val)),
+        }
+    }
+}
+
+impl FromValue for Vec<u8> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Bytes(v) => Ok(v),
+            _ => Err(format!("expected Bytes, got {:?}", val)),
+        }
+    }
+}
+
+impl<T: FromValue> FromValue for Option<T> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Null => Ok(None),
+            other => T::from_value(other).map(Some),
+        }
+    }
+}
+
+// ── PostgreSQL-specific FromValue impls ────────────────────────────
+
+#[cfg(feature = "postgres")]
+impl FromValue for uuid::Uuid {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Uuid(v) => Ok(v),
+            Value::String(s) => s.parse().map_err(|e: uuid::Error| e.to_string()),
+            _ => Err(format!("expected Uuid, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for chrono::DateTime<chrono::Utc> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Timestamptz(v) => Ok(v),
+            _ => Err(format!("expected Timestamptz, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for serde_json::Value {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Jsonb(v) => Ok(v),
+            Value::String(s) => serde_json::from_str(&s).map_err(|e| e.to_string()),
+            _ => Err(format!("expected Jsonb, got {:?}", val)),
+        }
+    }
+}
+
+// ── Shared temporal FromValue impls (PostgreSQL & MySQL) ───────────
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl FromValue for chrono::NaiveDateTime {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Timestamp(v) => Ok(v),
+            _ => Err(format!("expected Timestamp, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl FromValue for chrono::NaiveDate {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Date(v) => Ok(v),
+            _ => Err(format!("expected Date, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl FromValue for chrono::NaiveTime {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Time(v) => Ok(v),
+            _ => Err(format!("expected Time, got {:?}", val)),
+        }
+    }
+}
+
+// ── PostgreSQL array FromValue impls ──────────────────────────────
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<bool> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayBool(v) => Ok(v),
+            _ => Err(format!("expected ArrayBool, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<i16> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayI16(v) => Ok(v),
+            _ => Err(format!("expected ArrayI16, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<i32> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayI32(v) => Ok(v),
+            _ => Err(format!("expected ArrayI32, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<i64> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayI64(v) => Ok(v),
+            _ => Err(format!("expected ArrayI64, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<f32> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayF32(v) => Ok(v),
+            _ => Err(format!("expected ArrayF32, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<f64> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayF64(v) => Ok(v),
+            _ => Err(format!("expected ArrayF64, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<String> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayString(v) => Ok(v),
+            _ => Err(format!("expected ArrayString, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for Vec<uuid::Uuid> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::ArrayUuid(v) => Ok(v),
+            _ => Err(format!("expected ArrayUuid, got {:?}", val)),
+        }
+    }
+}
+
 impl IntoValue for i16 {
     fn into_value(self) -> Value {
         Value::I16(self)
@@ -335,5 +588,57 @@ impl IntoValue for chrono::NaiveDate {
 impl IntoValue for chrono::NaiveTime {
     fn into_value(self) -> Value {
         Value::Time(self)
+    }
+}
+
+// ── PostgreSQL range FromValue impls ──────────────────────────────
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::range::Range<i32> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Int4Range(v) => Ok(v),
+            _ => Err(format!("expected Int4Range, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::range::Range<i64> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Int8Range(v) => Ok(v),
+            _ => Err(format!("expected Int8Range, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::range::Range<chrono::NaiveDateTime> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::TsRange(v) => Ok(v),
+            _ => Err(format!("expected TsRange, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::range::Range<chrono::DateTime<chrono::Utc>> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::TstzRange(v) => Ok(v),
+            _ => Err(format!("expected TstzRange, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::range::Range<chrono::NaiveDate> {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::DateRange(v) => Ok(v),
+            _ => Err(format!("expected DateRange, got {:?}", val)),
+        }
     }
 }

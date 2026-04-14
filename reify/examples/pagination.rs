@@ -45,7 +45,10 @@ fn main() {
     println!("Page 5:");
     println!("  data: {data_sql}");
     let page = paginated.page_info(237);
-    println!("  has_next: {}, has_prev: {}\n", page.has_next, page.has_prev);
+    println!(
+        "  has_next: {}, has_prev: {}\n",
+        page.has_next, page.has_prev
+    );
 
     // ── Cursor-based pagination ─────────────────────────────────
     // Keyset pagination — much faster on large tables (no OFFSET scan).

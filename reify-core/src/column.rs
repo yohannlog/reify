@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 
 use crate::condition::Condition;
+#[cfg(feature = "postgres")]
+use crate::condition::PgCondition;
 use crate::query::{Expr, SelectBuilder};
 use crate::table::Table;
 use crate::value::IntoValue;
@@ -125,45 +127,72 @@ impl<M: 'static, T: Numeric + 'static> Column<M, T> {
 
 // ── String operators ────────────────────────────────────────────────
 
+/// Escape LIKE/ILIKE wildcard characters in user input.
+///
+/// Escapes `\`, `%`, and `_` so they are treated as literal characters
+/// in a LIKE pattern. The corresponding SQL uses `ESCAPE '\\'` to
+/// declare the escape character.
+fn escape_like(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 impl<M: 'static> Column<M, String> {
+    /// Raw LIKE pattern — wildcards in `pattern` are **not** escaped.
+    ///
+    /// Use this when you want to pass your own `%` / `_` wildcards.
+    /// The generated SQL includes `ESCAPE '\\'` so you can still use
+    /// `\\%` and `\\_` for literal matches.
     pub fn like(&self, pattern: &str) -> Condition {
         Condition::Like(self.name, pattern.to_owned())
     }
 
+    /// `col LIKE '%sub%'` — user input is escaped so `%` and `_` in
+    /// `sub` are treated as literals.
     pub fn contains(&self, sub: &str) -> Condition {
-        Condition::Like(self.name, format!("%{sub}%"))
+        let escaped = escape_like(sub);
+        Condition::Like(self.name, format!("%{escaped}%"))
     }
 
+    /// `col LIKE 'prefix%'` — user input is escaped.
     pub fn starts_with(&self, prefix: &str) -> Condition {
-        Condition::Like(self.name, format!("{prefix}%"))
+        let escaped = escape_like(prefix);
+        Condition::Like(self.name, format!("{escaped}%"))
     }
 
+    /// `col LIKE '%suffix'` — user input is escaped.
     pub fn ends_with(&self, suffix: &str) -> Condition {
-        Condition::Like(self.name, format!("%{suffix}"))
+        let escaped = escape_like(suffix);
+        Condition::Like(self.name, format!("%{escaped}"))
     }
 
-    /// Case-insensitive LIKE (PostgreSQL `ILIKE`).
+    /// Raw case-insensitive LIKE (PostgreSQL `ILIKE`) — wildcards are **not** escaped.
     #[cfg(feature = "postgres")]
     pub fn ilike(&self, pattern: &str) -> Condition {
-        Condition::ILike(self.name, pattern.to_owned())
+        Condition::Postgres(PgCondition::ILike(self.name, pattern.to_owned()))
     }
 
-    /// Case-insensitive contains (PostgreSQL `ILIKE '%sub%'`).
+    /// Case-insensitive contains (PostgreSQL `ILIKE '%sub%'`) — user input is escaped.
     #[cfg(feature = "postgres")]
     pub fn icontains(&self, sub: &str) -> Condition {
-        Condition::ILike(self.name, format!("%{sub}%"))
+        let escaped = escape_like(sub);
+        Condition::Postgres(PgCondition::ILike(self.name, format!("%{escaped}%")))
     }
 
-    /// Case-insensitive starts-with (PostgreSQL `ILIKE 'prefix%'`).
+    /// Case-insensitive starts-with (PostgreSQL `ILIKE 'prefix%'`) — user input is escaped.
     #[cfg(feature = "postgres")]
     pub fn istarts_with(&self, prefix: &str) -> Condition {
-        Condition::ILike(self.name, format!("{prefix}%"))
+        let escaped = escape_like(prefix);
+        Condition::Postgres(PgCondition::ILike(self.name, format!("{escaped}%")))
     }
 
-    /// Case-insensitive ends-with (PostgreSQL `ILIKE '%suffix'`).
+    /// Case-insensitive ends-with (PostgreSQL `ILIKE '%suffix'`) — user input is escaped.
     #[cfg(feature = "postgres")]
     pub fn iends_with(&self, suffix: &str) -> Condition {
-        Condition::ILike(self.name, format!("%{suffix}"))
+        let escaped = escape_like(suffix);
+        Condition::Postgres(PgCondition::ILike(self.name, format!("%{escaped}")))
     }
 }
 
@@ -211,7 +240,7 @@ where
     /// // → duration @> 5
     /// ```
     pub fn contains_element(&self, val: impl IntoValue) -> Condition {
-        Condition::RangeContains(self.name, val.into_value())
+        Condition::Postgres(PgCondition::RangeContains(self.name, val.into_value()))
     }
 
     /// Range contains another range: `@>` operator.
@@ -221,52 +250,141 @@ where
     /// // → duration @> '[5,10]'
     /// ```
     pub fn contains_range(&self, val: crate::range::Range<T>) -> Condition {
-        Condition::RangeContains(self.name, val.into_value())
+        Condition::Postgres(PgCondition::RangeContains(self.name, val.into_value()))
     }
 
     /// Range is contained by another range: `<@` operator.
     pub fn contained_by(&self, val: crate::range::Range<T>) -> Condition {
-        Condition::RangeContainedBy(self.name, val.into_value())
+        Condition::Postgres(PgCondition::RangeContainedBy(self.name, val.into_value()))
     }
 
     /// Ranges overlap: `&&` operator.
     pub fn overlaps(&self, val: crate::range::Range<T>) -> Condition {
-        Condition::RangeOverlaps(self.name, val.into_value())
+        Condition::Postgres(PgCondition::RangeOverlaps(self.name, val.into_value()))
     }
 
     /// Range is strictly left of: `<<` operator.
     pub fn left_of(&self, val: crate::range::Range<T>) -> Condition {
-        Condition::RangeLeftOf(self.name, val.into_value())
+        Condition::Postgres(PgCondition::RangeLeftOf(self.name, val.into_value()))
     }
 
     /// Range is strictly right of: `>>` operator.
     pub fn right_of(&self, val: crate::range::Range<T>) -> Condition {
-        Condition::RangeRightOf(self.name, val.into_value())
+        Condition::Postgres(PgCondition::RangeRightOf(self.name, val.into_value()))
     }
 
     /// Range is adjacent to: `-|-` operator.
     pub fn adjacent(&self, val: crate::range::Range<T>) -> Condition {
-        Condition::RangeAdjacent(self.name, val.into_value())
+        Condition::Postgres(PgCondition::RangeAdjacent(self.name, val.into_value()))
     }
 
     /// Range is empty: `isempty(column)`.
     pub fn is_empty_range(&self) -> Condition {
-        Condition::RangeIsEmpty(self.name)
+        Condition::Postgres(PgCondition::RangeIsEmpty(self.name))
     }
 }
 
 // ── JSONB operators (PostgreSQL) ───────────────────────────────────
 
+/// A JSONB field access expression: `column->>'key'`.
+///
+/// Returned by [`Column<M, serde_json::Value>::json_get()`]. This is an
+/// *expression* (it returns a value), not a condition. Use the methods
+/// on this struct to build actual WHERE conditions:
+///
+/// ```ignore
+/// User::metadata.json_get("role").eq("admin")
+/// // → metadata->>'role' = ?
+///
+/// User::metadata.json_get("bio").is_null()
+/// // → metadata->>'bio' IS NULL
+/// ```
+#[cfg(feature = "postgres")]
+pub struct JsonExpr {
+    column: &'static str,
+    key: String,
+}
+
+#[cfg(feature = "postgres")]
+impl JsonExpr {
+    /// `column->>'key' = value`
+    pub fn eq(&self, val: impl IntoValue) -> Condition {
+        Condition::Raw(
+            format!("{}->>'{}' = ?", crate::ident::qi(self.column), self.key),
+            vec![val.into_value()],
+        )
+    }
+
+    /// `column->>'key' != value`
+    pub fn neq(&self, val: impl IntoValue) -> Condition {
+        Condition::Raw(
+            format!("{}->>'{}' != ?", crate::ident::qi(self.column), self.key),
+            vec![val.into_value()],
+        )
+    }
+
+    /// `column->>'key' IS NULL`
+    pub fn is_null(&self) -> Condition {
+        Condition::Raw(
+            format!("{}->>'{}' IS NULL", crate::ident::qi(self.column), self.key),
+            vec![],
+        )
+    }
+
+    /// `column->>'key' IS NOT NULL`
+    pub fn is_not_null(&self) -> Condition {
+        Condition::Raw(
+            format!(
+                "{}->>'{}' IS NOT NULL",
+                crate::ident::qi(self.column),
+                self.key
+            ),
+            vec![],
+        )
+    }
+
+    /// `column->>'key' LIKE pattern` — raw pattern, wildcards not escaped.
+    pub fn like(&self, pattern: &str) -> Condition {
+        Condition::Raw(
+            format!(
+                "{}->>'{}' LIKE ? ESCAPE '\\'",
+                crate::ident::qi(self.column),
+                self.key
+            ),
+            vec![crate::value::Value::String(pattern.to_owned())],
+        )
+    }
+
+    /// `column->>'key' LIKE '%sub%'` — user input is escaped.
+    pub fn contains(&self, sub: &str) -> Condition {
+        let escaped = escape_like(sub);
+        Condition::Raw(
+            format!(
+                "{}->>'{}' LIKE ? ESCAPE '\\'",
+                crate::ident::qi(self.column),
+                self.key
+            ),
+            vec![crate::value::Value::String(format!("%{escaped}%"))],
+        )
+    }
+}
+
 #[cfg(feature = "postgres")]
 impl<M: 'static> Column<M, serde_json::Value> {
-    /// JSONB field access: `column->key`.
+    /// JSONB field access as text: `column->>'key'`.
+    ///
+    /// Returns a [`JsonExpr`] — use `.eq()`, `.neq()`, `.is_null()`, etc.
+    /// to build a WHERE condition.
     ///
     /// ```ignore
-    /// User::metadata.json_get("role")
-    /// // → metadata->'role'
+    /// User::metadata.json_get("role").eq("admin")
+    /// // → metadata->>'role' = ?
     /// ```
-    pub fn json_get(&self, key: &str) -> Condition {
-        Condition::JsonGet(self.name, key.to_owned())
+    pub fn json_get(&self, key: &str) -> JsonExpr {
+        JsonExpr {
+            column: self.name,
+            key: key.to_owned(),
+        }
     }
 
     /// JSONB contains: `column @> value`.
@@ -276,7 +394,7 @@ impl<M: 'static> Column<M, serde_json::Value> {
     /// // → metadata @> '{"active": true}'
     /// ```
     pub fn json_contains(&self, val: impl crate::value::IntoValue) -> Condition {
-        Condition::JsonContains(self.name, val.into_value())
+        Condition::Postgres(PgCondition::JsonContains(self.name, val.into_value()))
     }
 
     /// JSONB key exists: `column ? key`.
@@ -286,7 +404,7 @@ impl<M: 'static> Column<M, serde_json::Value> {
     /// // → metadata ? 'email'
     /// ```
     pub fn json_has_key(&self, key: &str) -> Condition {
-        Condition::JsonHasKey(self.name, key.to_owned())
+        Condition::Postgres(PgCondition::JsonHasKey(self.name, key.to_owned()))
     }
 }
 
@@ -304,7 +422,7 @@ where
     /// // → tags @> ARRAY['rust']
     /// ```
     pub fn contains(&self, val: Vec<T>) -> Condition {
-        Condition::ArrayContains(self.name, val.into_value())
+        Condition::Postgres(PgCondition::ArrayContains(self.name, val.into_value()))
     }
 
     /// Array is contained by: `<@` operator.
@@ -314,7 +432,7 @@ where
     /// // → tags <@ ARRAY['rust','python']
     /// ```
     pub fn contained_by(&self, val: Vec<T>) -> Condition {
-        Condition::ArrayContainedBy(self.name, val.into_value())
+        Condition::Postgres(PgCondition::ArrayContainedBy(self.name, val.into_value()))
     }
 
     /// Arrays overlap: `&&` operator.
@@ -324,7 +442,7 @@ where
     /// // → tags && ARRAY['rust','go']
     /// ```
     pub fn overlaps(&self, val: Vec<T>) -> Condition {
-        Condition::ArrayOverlaps(self.name, val.into_value())
+        Condition::Postgres(PgCondition::ArrayOverlaps(self.name, val.into_value()))
     }
 }
 

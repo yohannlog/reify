@@ -90,9 +90,12 @@ impl<M: Table> ViewSchema<M> {
     pub fn column<T, S: crate::schema::TimestampState>(
         mut self,
         col: Column<M, T>,
-        configure: impl FnOnce(crate::schema::ColumnBuilder<T, crate::schema::NoTimestamp>) -> crate::schema::ColumnBuilder<T, S>,
+        configure: impl FnOnce(
+            crate::schema::ColumnBuilder<T, crate::schema::NoTimestamp>,
+        ) -> crate::schema::ColumnBuilder<T, S>,
     ) -> Self {
-        let builder = crate::schema::ColumnBuilder::<T, crate::schema::NoTimestamp>::new_pub(col.name);
+        let builder =
+            crate::schema::ColumnBuilder::<T, crate::schema::NoTimestamp>::new_pub(col.name);
         self.columns.push(configure(builder).build());
         self
     }
@@ -149,12 +152,14 @@ pub trait ViewSchemaDef: View {
 
 /// Generate a `CREATE OR REPLACE VIEW` statement.
 pub fn create_view_sql(name: &str, query: &str) -> String {
-    format!("CREATE OR REPLACE VIEW {name} AS {query};")
+    let quoted = crate::ident::qi(name);
+    format!("CREATE OR REPLACE VIEW {quoted} AS {query};")
 }
 
 /// Generate a `DROP VIEW IF EXISTS` statement.
 pub fn drop_view_sql(name: &str) -> String {
-    format!("DROP VIEW IF EXISTS {name};")
+    let quoted = crate::ident::qi(name);
+    format!("DROP VIEW IF EXISTS {quoted};")
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -171,14 +176,14 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "CREATE OR REPLACE VIEW active_users AS SELECT id, email FROM users WHERE deleted_at IS NULL;"
+            "CREATE OR REPLACE VIEW \"active_users\" AS SELECT id, email FROM users WHERE deleted_at IS NULL;"
         );
     }
 
     #[test]
     fn drop_view_sql_generates_correct_ddl() {
         let sql = drop_view_sql("active_users");
-        assert_eq!(sql, "DROP VIEW IF EXISTS active_users;");
+        assert_eq!(sql, "DROP VIEW IF EXISTS \"active_users\";");
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use std::fmt::Write;
 
-use crate::condition::{Condition, LogicalOp};
+#[cfg(feature = "postgres")]
+use crate::condition::PgCondition;
+use crate::condition::{AggregateCondition, Condition, LogicalOp};
+use crate::ident::qi;
 use crate::query::JoinKind;
 use crate::value::Value;
 
@@ -64,6 +67,7 @@ pub struct JoinFragment {
 pub enum SqlFragment {
     /// A structured SELECT query.
     Select {
+        distinct: bool,
         columns: Vec<String>,
         from: String,
         joins: Vec<JoinFragment>,
@@ -86,6 +90,7 @@ impl SqlFragment {
     pub fn render(&self, params: &mut Vec<Value>) -> String {
         match self {
             SqlFragment::Select {
+                distinct,
                 columns,
                 from,
                 joins,
@@ -99,21 +104,25 @@ impl SqlFragment {
                 // Rough capacity: "SELECT * FROM table WHERE …" is typically 64-256 bytes.
                 let mut sql = String::with_capacity(128);
 
-                sql.push_str("SELECT ");
+                if *distinct {
+                    sql.push_str("SELECT DISTINCT ");
+                } else {
+                    sql.push_str("SELECT ");
+                }
                 if columns.is_empty() {
                     sql.push('*');
                 } else {
                     write_joined(&mut sql, columns, ", ", |buf, c| buf.push_str(c));
                 }
                 sql.push_str(" FROM ");
-                sql.push_str(from);
+                sql.push_str(&qi(from));
 
                 for join in joins {
                     let _ = write!(
                         sql,
                         " {} {} ON {}",
                         join.kind.sql_keyword(),
-                        join.table,
+                        qi(&join.table),
                         join.on_condition
                     );
                 }
@@ -174,6 +183,7 @@ impl SqlFragment {
                 having,
                 ..
             } => SqlFragment::Select {
+                distinct: false,
                 columns: vec!["COUNT(*)".to_string()],
                 from: from.clone(),
                 joins: joins.clone(),
@@ -201,6 +211,7 @@ impl SqlFragment {
     pub fn without_limit_offset(&self) -> SqlFragment {
         match self {
             SqlFragment::Select {
+                distinct,
                 columns,
                 from,
                 joins,
@@ -210,6 +221,7 @@ impl SqlFragment {
                 order_by,
                 ..
             } => SqlFragment::Select {
+                distinct: *distinct,
                 columns: columns.clone(),
                 from: from.clone(),
                 joins: joins.clone(),
@@ -228,6 +240,7 @@ impl SqlFragment {
     pub fn without_order_by(&self) -> SqlFragment {
         match self {
             SqlFragment::Select {
+                distinct,
                 columns,
                 from,
                 joins,
@@ -238,6 +251,7 @@ impl SqlFragment {
                 offset,
                 ..
             } => SqlFragment::Select {
+                distinct: *distinct,
                 columns: columns.clone(),
                 from: from.clone(),
                 joins: joins.clone(),
@@ -258,44 +272,39 @@ impl ToSql for Condition {
         match self {
             Condition::Eq(col, val) => {
                 params.push(val.clone());
-                let _ = write!(buf, "{col} = ?");
+                let _ = write!(buf, "{} = ?", qi(col));
             }
             Condition::Neq(col, val) => {
                 params.push(val.clone());
-                let _ = write!(buf, "{col} != ?");
+                let _ = write!(buf, "{} != ?", qi(col));
             }
             Condition::Gt(col, val) => {
                 params.push(val.clone());
-                let _ = write!(buf, "{col} > ?");
+                let _ = write!(buf, "{} > ?", qi(col));
             }
             Condition::Lt(col, val) => {
                 params.push(val.clone());
-                let _ = write!(buf, "{col} < ?");
+                let _ = write!(buf, "{} < ?", qi(col));
             }
             Condition::Gte(col, val) => {
                 params.push(val.clone());
-                let _ = write!(buf, "{col} >= ?");
+                let _ = write!(buf, "{} >= ?", qi(col));
             }
             Condition::Lte(col, val) => {
                 params.push(val.clone());
-                let _ = write!(buf, "{col} <= ?");
+                let _ = write!(buf, "{} <= ?", qi(col));
             }
             Condition::Between(col, a, b) => {
                 params.push(a.clone());
                 params.push(b.clone());
-                let _ = write!(buf, "{col} BETWEEN ? AND ?");
+                let _ = write!(buf, "{} BETWEEN ? AND ?", qi(col));
             }
             Condition::Like(col, pattern) => {
                 params.push(Value::String(pattern.clone()));
-                let _ = write!(buf, "{col} LIKE ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::ILike(col, pattern) => {
-                params.push(Value::String(pattern.clone()));
-                let _ = write!(buf, "{col} ILIKE ?");
+                let _ = write!(buf, "{} LIKE ? ESCAPE '\\'", qi(col));
             }
             Condition::In(col, vals) => {
-                let _ = write!(buf, "{col} IN (");
+                let _ = write!(buf, "{} IN (", qi(col));
                 for (i, v) in vals.iter().enumerate() {
                     if i > 0 {
                         buf.push_str(", ");
@@ -306,98 +315,17 @@ impl ToSql for Condition {
                 buf.push(')');
             }
             Condition::IsNull(col) => {
-                let _ = write!(buf, "{col} IS NULL");
+                let _ = write!(buf, "{} IS NULL", qi(col));
             }
             Condition::IsNotNull(col) => {
-                let _ = write!(buf, "{col} IS NOT NULL");
+                let _ = write!(buf, "{} IS NOT NULL", qi(col));
             }
             #[cfg(feature = "postgres")]
-            Condition::RangeContains(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} @> ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::RangeContainedBy(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} <@ ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::RangeOverlaps(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} && ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::RangeLeftOf(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} << ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::RangeRightOf(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} >> ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::RangeAdjacent(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} -|- ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::RangeIsEmpty(col) => {
-                let _ = write!(buf, "isempty({col})");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::JsonGet(col, key) => {
-                params.push(Value::String(key.clone()));
-                let _ = write!(buf, "{col}->?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::JsonContains(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} @> ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::JsonHasKey(col, key) => {
-                params.push(Value::String(key.clone()));
-                let _ = write!(buf, "jsonb_exists({col}, ?)");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::ArrayContains(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} @> ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::ArrayContainedBy(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} <@ ?");
-            }
-            #[cfg(feature = "postgres")]
-            Condition::ArrayOverlaps(col, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{col} && ?");
-            }
-            Condition::AggregateGt(expr, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{} > ?", expr.to_sql_fragment());
-            }
-            Condition::AggregateLt(expr, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{} < ?", expr.to_sql_fragment());
-            }
-            Condition::AggregateGte(expr, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{} >= ?", expr.to_sql_fragment());
-            }
-            Condition::AggregateLte(expr, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{} <= ?", expr.to_sql_fragment());
-            }
-            Condition::AggregateEq(expr, val) => {
-                params.push(val.clone());
-                let _ = write!(buf, "{} = ?", expr.to_sql_fragment());
-            }
+            Condition::Postgres(pg) => pg.write_sql(buf, params),
+            Condition::Aggregate(agg) => agg.write_sql(buf, params),
             Condition::InSubquery(col, sub_sql, sub_params) => {
                 params.extend(sub_params.iter().cloned());
-                let _ = write!(buf, "{col} IN ({sub_sql})");
+                let _ = write!(buf, "{} IN ({sub_sql})", qi(col));
             }
             Condition::Raw(sql, raw_params) => {
                 params.extend(raw_params.iter().cloned());
@@ -415,6 +343,92 @@ impl ToSql for Condition {
                     buf.push(')');
                 }
             },
+        }
+    }
+}
+
+impl ToSql for AggregateCondition {
+    fn write_sql(&self, buf: &mut String, params: &mut Vec<Value>) {
+        match self {
+            AggregateCondition::Gt(expr, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} > ?", expr.to_sql_fragment());
+            }
+            AggregateCondition::Lt(expr, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} < ?", expr.to_sql_fragment());
+            }
+            AggregateCondition::Gte(expr, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} >= ?", expr.to_sql_fragment());
+            }
+            AggregateCondition::Lte(expr, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} <= ?", expr.to_sql_fragment());
+            }
+            AggregateCondition::Eq(expr, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} = ?", expr.to_sql_fragment());
+            }
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl ToSql for PgCondition {
+    fn write_sql(&self, buf: &mut String, params: &mut Vec<Value>) {
+        match self {
+            PgCondition::ILike(col, pattern) => {
+                params.push(Value::String(pattern.clone()));
+                let _ = write!(buf, "{} ILIKE ? ESCAPE '\\'", qi(col));
+            }
+            PgCondition::RangeContains(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} @> ?", qi(col));
+            }
+            PgCondition::RangeContainedBy(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} <@ ?", qi(col));
+            }
+            PgCondition::RangeOverlaps(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} && ?", qi(col));
+            }
+            PgCondition::RangeLeftOf(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} << ?", qi(col));
+            }
+            PgCondition::RangeRightOf(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} >> ?", qi(col));
+            }
+            PgCondition::RangeAdjacent(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} -|- ?", qi(col));
+            }
+            PgCondition::RangeIsEmpty(col) => {
+                let _ = write!(buf, "isempty({})", qi(col));
+            }
+            PgCondition::JsonContains(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} @> ?", qi(col));
+            }
+            PgCondition::JsonHasKey(col, key) => {
+                params.push(Value::String(key.clone()));
+                let _ = write!(buf, "jsonb_exists({}, ?)", qi(col));
+            }
+            PgCondition::ArrayContains(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} @> ?", qi(col));
+            }
+            PgCondition::ArrayContainedBy(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} <@ ?", qi(col));
+            }
+            PgCondition::ArrayOverlaps(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} && ?", qi(col));
+            }
         }
     }
 }

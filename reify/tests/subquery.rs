@@ -21,12 +21,10 @@ pub struct Order {
 #[test]
 fn in_subquery_basic() {
     let sub = Order::find().select(&["user_id"]);
-    let (sql, params) = User::find()
-        .filter(User::id.in_subquery(sub))
-        .build();
+    let (sql, params) = User::find().filter(User::id.in_subquery(sub)).build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)"
+        "SELECT * FROM \"users\" WHERE \"id\" IN (SELECT \"user_id\" FROM \"orders\")"
     );
     assert!(params.is_empty());
 }
@@ -36,12 +34,10 @@ fn in_subquery_with_filter() {
     let sub = Order::find()
         .select(&["user_id"])
         .filter(Order::amount.gt(100.0f64));
-    let (sql, params) = User::find()
-        .filter(User::id.in_subquery(sub))
-        .build();
+    let (sql, params) = User::find().filter(User::id.in_subquery(sub)).build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > ?)"
+        "SELECT * FROM \"users\" WHERE \"id\" IN (SELECT \"user_id\" FROM \"orders\" WHERE \"amount\" > ?)"
     );
     assert_eq!(params, vec![Value::F64(100.0)]);
 }
@@ -55,7 +51,7 @@ fn in_subquery_combined_with_other_filter() {
         .build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE role = ? AND id IN (SELECT user_id FROM orders)"
+        "SELECT * FROM \"users\" WHERE \"role\" = ? AND \"id\" IN (SELECT \"user_id\" FROM \"orders\")"
     );
     assert_eq!(params, vec![Value::String("admin".into())]);
 }
@@ -71,7 +67,7 @@ fn in_subquery_with_subquery_params_and_outer_params() {
         .build();
     assert_eq!(
         sql,
-        "SELECT * FROM users WHERE role = ? AND id IN (SELECT user_id FROM orders WHERE amount > ?)"
+        "SELECT * FROM \"users\" WHERE \"role\" = ? AND \"id\" IN (SELECT \"user_id\" FROM \"orders\" WHERE \"amount\" > ?)"
     );
     assert_eq!(
         params,
