@@ -55,12 +55,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (unit)
         # timestamps.rs is excluded — it references unstable features not yet stabilised
+        # builder_type_safety is excluded — trybuild tests run in a dedicated job
         run: >
           cargo test -p reify
           --test array_types
           --test audit_tests
           --test batch_upsert
-          --test builder_type_safety
           --test computed_columns
           --test cursor_pagination
           --test derive_enum
@@ -73,6 +73,17 @@ jobs:
           --test relations
           --test sql_injection
           --test subquery
+
+  compile-fail-tests:
+    name: Compile-fail Tests (trybuild)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (compile-fail)
+        run: cargo test -p reify --test builder_type_safety
+        timeout-minutes: 15
 
   coverage:
     name: Coverage (tarpaulin)
@@ -90,12 +101,27 @@ jobs:
           cargo tarpaulin
           --all-features
           --workspace
+          --exclude reify-macros
           --timeout 120
           --out xml
           --output-dir coverage/
-          --exclude-files "reify-macros/*"
           --exclude-files "reify/tests/compile_fail/*"
           --exclude-files "reify/tests/builder_type_safety.rs"
+          --test array_types
+          --test audit_tests
+          --test batch_upsert
+          --test computed_columns
+          --test cursor_pagination
+          --test derive_enum
+          --test derive_table
+          --test distinct
+          --test func_tests
+          --test group_by
+          --test migration_tests
+          --test range_types
+          --test relations
+          --test sql_injection
+          --test subquery
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
