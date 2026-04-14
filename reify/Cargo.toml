@@ -2,6 +2,15 @@
 name = "reify"
 version.workspace = true
 edition.workspace = true
+authors = ["Yohann Catherine"]
+description = "Type-safe Rust ORM: Define your database in Rust. Zero magic strings."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yohann-catherine/reify"
+documentation = "https://docs.rs/reify"
+readme = "README.md"
+keywords = ["orm", "database", "sql", "type-safe", "macro"]
+categories = ["database", "asynchronous", "web-programming"]
+rust-version = "1.85"
 
 [features]
 default = []

@@ -329,7 +329,7 @@ impl Database for MysqlDb {
             .map_err(mysql_err)?;
         match row {
             Some(r) => Ok(mysql_row_to_row(&r)),
-            None => Err(DbError::Query("no rows returned".to_string())),
+            None => Err(DbError::RecordNotFound),
         }
     }
 
@@ -405,7 +405,7 @@ impl Database for MysqlTransaction {
             .map_err(mysql_err)?;
         match row {
             Some(r) => Ok(mysql_row_to_row(&r)),
-            None => Err(DbError::Query("no rows returned".to_string())),
+            None => Err(DbError::RecordNotFound),
         }
     }
 

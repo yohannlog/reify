@@ -182,7 +182,7 @@ impl Database for SqliteDb {
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
         let mut rows = Database::query(self, sql, params).await?;
         if rows.is_empty() {
-            Err(DbError::Query("no rows".into()))
+            Err(DbError::RecordNotFound)
         } else {
             Ok(rows.remove(0))
         }
@@ -243,7 +243,7 @@ impl Database for SqliteTransaction {
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
         let mut rows = Database::query(self, sql, params).await?;
         if rows.is_empty() {
-            Err(DbError::Query("no rows".into()))
+            Err(DbError::RecordNotFound)
         } else {
             Ok(rows.remove(0))
         }

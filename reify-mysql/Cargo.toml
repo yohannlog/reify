@@ -2,6 +2,14 @@
 name = "reify-mysql"
 version.workspace = true
 edition.workspace = true
+authors = ["Yohann Catherine"]
+description = "MySQL/MariaDB adapter for Reify ORM (mysql_async)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yohann-catherine/reify"
+documentation = "https://docs.rs/reify-mysql"
+keywords = ["orm", "mysql", "mariadb", "database", "async"]
+categories = ["database", "asynchronous"]
+rust-version = "1.85"
 
 [features]
 postgres = ["reify-core/postgres"]

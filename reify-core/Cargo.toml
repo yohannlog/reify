@@ -2,6 +2,14 @@
 name = "reify-core"
 version.workspace = true
 edition.workspace = true
+authors = ["Yohann Catherine"]
+description = "Core traits and query builder for Reify ORM"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yohann-catherine/reify"
+documentation = "https://docs.rs/reify-core"
+keywords = ["orm", "database", "sql", "query-builder"]
+categories = ["database", "asynchronous"]
+rust-version = "1.85"
 
 [features]
 default = []

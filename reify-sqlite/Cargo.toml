@@ -2,6 +2,14 @@
 name = "reify-sqlite"
 version.workspace = true
 edition.workspace = true
+authors = ["Yohann Catherine"]
+description = "SQLite adapter for Reify ORM (rusqlite)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yohann-catherine/reify"
+documentation = "https://docs.rs/reify-sqlite"
+keywords = ["orm", "sqlite", "database", "async"]
+categories = ["database"]
+rust-version = "1.85"
 
 [features]
 postgres = ["reify-core/postgres"]

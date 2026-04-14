@@ -2,6 +2,14 @@
 name = "reify-cli"
 version.workspace = true
 edition.workspace = true
+authors = ["Yohann Catherine"]
+description = "CLI tooling for Reify ORM"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yohann-catherine/reify"
+documentation = "https://docs.rs/reify-cli"
+keywords = ["orm", "cli", "database"]
+categories = ["database", "command-line-utilities", "development-tools"]
+rust-version = "1.85"
 
 [[bin]]
 name = "reify"
