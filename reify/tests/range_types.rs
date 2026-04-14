@@ -193,7 +193,10 @@ mod postgres_tests {
             .set(Event::duration, Range::closed(0, 60))
             .filter(Event::id.eq(1i64))
             .build();
-        assert_eq!(sql, "UPDATE \"events\" SET \"duration\" = ? WHERE \"id\" = ?");
+        assert_eq!(
+            sql,
+            "UPDATE \"events\" SET \"duration\" = ? WHERE \"id\" = ?"
+        );
         assert_eq!(
             params,
             vec![Value::Int4Range(Range::closed(0, 60)), Value::I64(1)]
