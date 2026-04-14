@@ -203,10 +203,46 @@ fn mysql_err(e: mysql_async::Error) -> DbError {
     DbError::Query(e.to_string())
 }
 
+// ── SQL identifier rewriting ─────────────────────────────────────────
+
+/// Rewrite double-quoted identifiers (`"name"`) to MySQL backtick style (`` `name` ``).
+///
+/// The query builder always emits `"ident"` (ANSI SQL / Generic dialect).
+/// MySQL requires backtick quoting by default, so we rewrite at execution time.
+fn rewrite_quotes_mysql(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            result.push('`');
+            loop {
+                match chars.next() {
+                    None => break,
+                    Some('"') => {
+                        // A doubled quote `""` is an escaped quote inside the identifier.
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            result.push('"');
+                        } else {
+                            result.push('`');
+                            break;
+                        }
+                    }
+                    Some(inner) => result.push(inner),
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 // ── Database trait implementation ───────────────────────────────────
 
 impl Database for MysqlDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        let sql = rewrite_quotes_mysql(sql);
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Executing");
         let mut conn = self
@@ -219,6 +255,7 @@ impl Database for MysqlDb {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        let sql = rewrite_quotes_mysql(sql);
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying");
         let mut conn = self
@@ -231,6 +268,7 @@ impl Database for MysqlDb {
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        let sql = rewrite_quotes_mysql(sql);
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying one");
         let mut conn = self
@@ -298,6 +336,7 @@ struct MysqlTransaction {
 
 impl Database for MysqlTransaction {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        let sql = rewrite_quotes_mysql(sql);
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Executing (txn)");
         let mut conn = self.conn.lock().await;
@@ -306,6 +345,7 @@ impl Database for MysqlTransaction {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        let sql = rewrite_quotes_mysql(sql);
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying (txn)");
         let mut conn = self.conn.lock().await;
@@ -314,6 +354,7 @@ impl Database for MysqlTransaction {
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        let sql = rewrite_quotes_mysql(sql);
         let mysql_params = values_to_mysql_params(params);
         debug!(target: "reify::mysql", sql, "Querying one (txn)");
         let mut conn = self.conn.lock().await;

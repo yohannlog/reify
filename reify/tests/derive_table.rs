@@ -137,25 +137,31 @@ fn select_with_order_limit_offset() {
 
 #[test]
 fn select_build_emits_trace() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(reify::tracing::Level::DEBUG)
-        .with_writer(writer.clone())
-        .without_time()
-        .with_target(false)
-        .finish();
+    // Spawn a dedicated thread so the thread-local subscriber is not
+    // shadowed by subscribers installed by other tests running in parallel.
+    std::thread::spawn(|| {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(reify::tracing::Level::DEBUG)
+            .with_writer(writer.clone())
+            .without_time()
+            .with_target(false)
+            .finish();
 
-    reify::tracing::subscriber::with_default(subscriber, || {
-        let _ = User::find()
-            .filter(User::email.eq("alice@example.com"))
-            .build();
-    });
+        reify::tracing::subscriber::with_default(subscriber, || {
+            let _ = User::find()
+                .filter(User::email.eq("alice@example.com"))
+                .build();
+        });
 
-    let output = String::from_utf8(writer.buffer.lock().unwrap().clone()).unwrap();
-    assert!(output.contains("Built SQL query"));
-    assert!(output.contains("operation=\"select\""));
-    assert!(output.contains("table=\"users\""));
-    assert!(output.contains("sql=SELECT * FROM \"users\" WHERE \"email\" = ?"));
+        let output = String::from_utf8(writer.buffer.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("Built SQL query"));
+        assert!(output.contains("operation=\"select\""));
+        assert!(output.contains("table=\"users\""));
+        assert!(output.contains("sql=SELECT * FROM \"users\" WHERE \"email\" = ?"));
+    })
+    .join()
+    .expect("tracing test thread panicked");
 }
 
 #[test]
