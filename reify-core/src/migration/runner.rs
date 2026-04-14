@@ -12,13 +12,13 @@ use crate::table::Table;
 use crate::value::Value;
 use std::collections::HashSet;
 
-const TRACKING_TABLE: &str = "_reify_migrations";
+const TRACKING_TABLE: &str = "\"_reify_migrations\"";
 
 const CREATE_TRACKING_TABLE: &str = "
-CREATE TABLE IF NOT EXISTS _reify_migrations (
-    version     TEXT        NOT NULL PRIMARY KEY,
-    description TEXT        NOT NULL,
-    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS \"_reify_migrations\" (
+    \"version\"     TEXT        NOT NULL PRIMARY KEY,
+    \"description\" TEXT        NOT NULL,
+    \"applied_at\"  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );";
 
 /// An entry registered via `MigrationRunner::add_table::<T>()`.
@@ -199,7 +199,7 @@ impl MigrationRunner {
         db: &impl Database,
     ) -> Result<std::collections::HashSet<String>, MigrationError> {
         let rows = db
-            .query(&format!("SELECT version FROM {TRACKING_TABLE}"), &[])
+            .query(&format!("SELECT \"version\" FROM {TRACKING_TABLE}"), &[])
             .await?;
         let versions = rows
             .into_iter()
@@ -224,7 +224,7 @@ impl MigrationRunner {
         description: &str,
     ) -> Result<(), MigrationError> {
         db.execute(
-            &format!("INSERT INTO {TRACKING_TABLE} (version, description) VALUES (?, ?);"),
+            &format!("INSERT INTO {TRACKING_TABLE} (\"version\", \"description\") VALUES (?, ?);"),
             &[
                 Value::String(version.into()),
                 Value::String(description.into()),
@@ -237,7 +237,7 @@ impl MigrationRunner {
     /// Remove a migration record (rollback).
     async fn mark_reverted(&self, db: &impl Database, version: &str) -> Result<(), MigrationError> {
         db.execute(
-            &format!("DELETE FROM {TRACKING_TABLE} WHERE version = ?;"),
+            &format!("DELETE FROM {TRACKING_TABLE} WHERE \"version\" = ?;"),
             &[Value::String(version.into())],
         )
         .await?;
@@ -715,9 +715,9 @@ impl MigrationRunner {
         let rows = db
             .query(
                 &format!(
-                    "SELECT version FROM {TRACKING_TABLE} \
-                     WHERE version NOT LIKE 'auto__%' \
-                     ORDER BY applied_at DESC LIMIT 1;"
+                    "SELECT \"version\" FROM {TRACKING_TABLE} \
+                     WHERE \"version\" NOT LIKE 'auto__%' \
+                     ORDER BY \"applied_at\" DESC LIMIT 1;"
                 ),
                 &[],
             )
@@ -776,9 +776,9 @@ impl MigrationRunner {
         let rows = db
             .query(
                 &format!(
-                    "SELECT version FROM {TRACKING_TABLE} \
-                     WHERE version NOT LIKE 'auto__%' \
-                     ORDER BY applied_at DESC;"
+                    "SELECT \"version\" FROM {TRACKING_TABLE} \
+                     WHERE \"version\" NOT LIKE 'auto__%' \
+                     ORDER BY \"applied_at\" DESC;"
                 ),
                 &[],
             )

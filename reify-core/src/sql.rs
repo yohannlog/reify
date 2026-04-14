@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 
 #[cfg(feature = "postgres")]
@@ -64,25 +65,25 @@ pub struct JoinFragment {
 /// Produced by `SelectBuilder::build_ast()` and consumed by pagination
 /// helpers so they can manipulate query structure without parsing text.
 #[derive(Debug, Clone)]
-pub enum SqlFragment {
+pub enum SqlFragment<'a> {
     /// A structured SELECT query.
     Select {
         distinct: bool,
         columns: Vec<String>,
         from: String,
-        joins: Vec<JoinFragment>,
-        conditions: Vec<Condition>,
+        joins: Cow<'a, [JoinFragment]>,
+        conditions: Cow<'a, [Condition]>,
         group_by: Vec<String>,
-        having: Vec<Condition>,
-        order_by: Vec<OrderFragment>,
+        having: Cow<'a, [Condition]>,
+        order_by: Cow<'a, [OrderFragment]>,
         limit: Option<u64>,
         offset: Option<u64>,
     },
     /// Raw SQL string with bound parameters (escape hatch).
-    Raw(String, Vec<Value>),
+    Raw(Cow<'a, str>, Cow<'a, [Value]>),
 }
 
-impl SqlFragment {
+impl<'a> SqlFragment<'a> {
     /// Render this fragment into a SQL string, appending bound params.
     ///
     /// Uses a single pre-allocated buffer — no intermediate `Vec<String>`
@@ -117,7 +118,7 @@ impl SqlFragment {
                 sql.push_str(" FROM ");
                 sql.push_str(&qi(from));
 
-                for join in joins {
+                for join in joins.iter() {
                     let _ = write!(
                         sql,
                         " {} {} ON {}",
@@ -164,7 +165,7 @@ impl SqlFragment {
             }
             SqlFragment::Raw(sql, raw_params) => {
                 params.extend(raw_params.iter().cloned());
-                sql.clone()
+                sql.clone().into_owned()
             }
         }
     }
@@ -173,7 +174,7 @@ impl SqlFragment {
     ///
     /// For `Select` variants: replaces columns with `COUNT(*)` and strips
     /// ORDER BY, LIMIT, OFFSET. For `Raw`: falls back to text manipulation.
-    pub fn to_count_query(&self) -> SqlFragment {
+    pub fn to_count_query(&self) -> SqlFragment<'a> {
         match self {
             SqlFragment::Select {
                 from,
@@ -190,7 +191,7 @@ impl SqlFragment {
                 conditions: conditions.clone(),
                 group_by: group_by.clone(),
                 having: having.clone(),
-                order_by: vec![],
+                order_by: Cow::Owned(vec![]),
                 limit: None,
                 offset: None,
             },
@@ -199,7 +200,7 @@ impl SqlFragment {
                 let upper = sql.to_uppercase();
                 if let Some(from_idx) = upper.find(" FROM ") {
                     let rest = &sql[from_idx..];
-                    SqlFragment::Raw(format!("SELECT COUNT(*){rest}"), p.clone())
+                    SqlFragment::Raw(Cow::Owned(format!("SELECT COUNT(*){rest}")), p.clone())
                 } else {
                     SqlFragment::Raw(sql.clone(), p.clone())
                 }
@@ -208,7 +209,7 @@ impl SqlFragment {
     }
 
     /// Strip LIMIT and OFFSET from this fragment.
-    pub fn without_limit_offset(&self) -> SqlFragment {
+    pub fn without_limit_offset(&self) -> SqlFragment<'a> {
         match self {
             SqlFragment::Select {
                 distinct,
@@ -237,7 +238,7 @@ impl SqlFragment {
     }
 
     /// Strip ORDER BY from this fragment.
-    pub fn without_order_by(&self) -> SqlFragment {
+    pub fn without_order_by(&self) -> SqlFragment<'a> {
         match self {
             SqlFragment::Select {
                 distinct,
@@ -258,7 +259,7 @@ impl SqlFragment {
                 conditions: conditions.clone(),
                 group_by: group_by.clone(),
                 having: having.clone(),
-                order_by: vec![],
+                order_by: Cow::Owned(vec![]),
                 limit: *limit,
                 offset: *offset,
             },

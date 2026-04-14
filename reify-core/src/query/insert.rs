@@ -288,6 +288,103 @@ impl<M: Table> InsertManyBuilder<M> {
     }
 }
 
+// ── Chunked build methods ────────────────────────────────────────────
+
+impl<M: Table> InsertManyBuilder<M> {
+    /// Maximum rows per chunk for a given dialect, based on its parameter limit.
+    ///
+    /// Returns `usize::MAX` when the data fits in a single statement.
+    fn rows_per_chunk(&self, dialect: Dialect) -> usize {
+        let num_cols = M::writable_column_names().len();
+        if num_cols == 0 {
+            return usize::MAX;
+        }
+        dialect.max_params() / num_cols
+    }
+
+    /// Build one `(sql, params)` tuple for a contiguous slice of rows.
+    #[allow(unused_mut)]
+    fn build_chunk(&self, rows: &[Vec<Value>], dialect: Dialect) -> (String, Vec<Value>) {
+        let col_names = M::writable_column_names();
+        let num_cols = col_names.len();
+        let num_rows = rows.len();
+
+        let params: Vec<Value> = rows.iter().flat_map(|r| r.iter().cloned()).collect();
+
+        let insert_kw = match (&self.on_conflict, dialect) {
+            (Some(OnConflict::DoNothing), Dialect::Mysql) => "INSERT IGNORE",
+            _ => "INSERT",
+        };
+
+        let mut sql = String::with_capacity(64 + num_cols * 3 + num_rows * (num_cols * 3 + 4));
+        let _ = write!(sql, "{insert_kw} INTO {} (", qi(M::table_name()));
+        write_joined(&mut sql, &col_names, ", ", |buf, c| buf.push_str(&qi(c)));
+        sql.push_str(") VALUES ");
+
+        for row_idx in 0..num_rows {
+            if row_idx > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('(');
+            for col_idx in 0..num_cols {
+                if col_idx > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+            }
+            sql.push(')');
+        }
+
+        write_on_conflict(&mut sql, &self.on_conflict, dialect);
+
+        #[cfg(feature = "postgres")]
+        write_returning(&mut sql, &self.returning);
+
+        trace_query("insert_many_chunk", M::table_name(), &sql, &params);
+        (sql, params)
+    }
+
+    /// Split the rows into chunks that respect the dialect's parameter limit
+    /// and build one `(sql, params)` pair per chunk.
+    ///
+    /// If all rows fit in a single statement, returns a `Vec` with one element
+    /// (identical to calling [`build_with_dialect`](Self::build_with_dialect)).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let chunks = User::insert_many(&huge_vec).build_chunked(Dialect::Postgres);
+    /// for (sql, params) in &chunks {
+    ///     db.execute(sql, params).await?;
+    /// }
+    /// ```
+    pub fn build_chunked(&self, dialect: Dialect) -> Vec<(String, Vec<Value>)> {
+        let chunk_size = self.rows_per_chunk(dialect);
+        if chunk_size >= self.rows.len() {
+            return vec![self.build_with_dialect(dialect)];
+        }
+        self.rows
+            .chunks(chunk_size)
+            .map(|chunk| self.build_chunk(chunk, dialect))
+            .collect()
+    }
+
+    /// Build chunked queries with PostgreSQL `$N` placeholders.
+    ///
+    /// Each chunk respects the 65 535 parameter limit. Returns one
+    /// [`BuiltQuery`](crate::built_query::BuiltQuery) per chunk.
+    #[cfg(feature = "postgres")]
+    pub fn build_chunked_pg(&self) -> Vec<crate::built_query::BuiltQuery> {
+        self.build_chunked(Dialect::Postgres)
+            .into_iter()
+            .map(|(sql, params)| {
+                let pg_sql = rewrite_placeholders_pg(&sql);
+                crate::built_query::BuiltQuery::new(pg_sql, params)
+            })
+            .collect()
+    }
+}
+
 // ── InsertManyBuilder direct execution methods ───────────────────────
 
 impl<M: Table> InsertManyBuilder<M> {
@@ -307,5 +404,171 @@ impl<M: Table> InsertManyBuilder<M> {
         M: crate::db::FromRow,
     {
         crate::db::insert_many_returning(db, self).await
+    }
+
+    /// Execute a batch INSERT, automatically chunking to stay within the
+    /// database's bind-parameter limit.
+    ///
+    /// All chunks run inside a single transaction for atomicity. Returns
+    /// the total number of affected rows across all chunks.
+    ///
+    /// ```ignore
+    /// // Inserts 100k rows in ~8 chunks of ~8k rows each (5 cols × 8k ≈ 40k params)
+    /// let affected = User::insert_many(&huge_vec)
+    ///     .execute_chunked(&db)
+    ///     .await?;
+    /// ```
+    pub async fn execute_chunked(
+        &self,
+        db: &impl crate::db::Database,
+    ) -> Result<u64, crate::db::DbError> {
+        #[cfg(feature = "postgres")]
+        let chunks = self.build_chunked_pg();
+        #[cfg(not(feature = "postgres"))]
+        let chunks = self.build_chunked(Dialect::Generic);
+
+        // Single chunk — no transaction wrapper needed.
+        if chunks.len() == 1 {
+            #[cfg(feature = "postgres")]
+            return db.execute(&chunks[0].sql, &chunks[0].params).await;
+            #[cfg(not(feature = "postgres"))]
+            return db.execute(&chunks[0].0, &chunks[0].1).await;
+        }
+
+        // Multiple chunks — wrap in a transaction for atomicity.
+        use crate::db::{Database, DynDatabase};
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let total_clone = total.clone();
+
+        // We need to move chunks into the closure. Clone the data.
+        #[cfg(feature = "postgres")]
+        let owned_chunks: Vec<(String, Vec<Value>)> = chunks
+            .into_iter()
+            .map(|q| (q.sql, q.params))
+            .collect();
+        #[cfg(not(feature = "postgres"))]
+        let owned_chunks = chunks;
+
+        Database::transaction(
+            db,
+            Box::new(move |tx: &dyn DynDatabase| {
+                Box::pin(async move {
+                    for (sql, params) in &owned_chunks {
+                        let n = tx.execute(sql, params).await?;
+                        total_clone.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(())
+                })
+            }),
+        )
+        .await?;
+
+        Ok(total.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{ColumnDef, IndexDef};
+
+    struct Row3 {
+        a: i32,
+        b: i32,
+        c: i32,
+    }
+
+    impl Table for Row3 {
+        fn table_name() -> &'static str {
+            "rows"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["a", "b", "c"]
+        }
+        fn into_values(&self) -> Vec<Value> {
+            vec![Value::I32(self.a), Value::I32(self.b), Value::I32(self.c)]
+        }
+        fn column_defs() -> Vec<ColumnDef> {
+            Vec::new()
+        }
+        fn indexes() -> Vec<IndexDef> {
+            Vec::new()
+        }
+    }
+
+    fn make_rows(n: usize) -> Vec<Row3> {
+        (0..n)
+            .map(|i| Row3 {
+                a: i as i32,
+                b: i as i32 * 10,
+                c: i as i32 * 100,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_chunk_when_under_limit() {
+        let rows = make_rows(10);
+        let builder = InsertManyBuilder::new(&rows);
+        // 10 rows × 3 cols = 30 params — well under any limit
+        let chunks = builder.build_chunked(Dialect::Generic);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1.len(), 30);
+    }
+
+    #[test]
+    fn splits_into_correct_chunks() {
+        // 3 cols, Generic limit = 32_766 → max 10_922 rows per chunk
+        let rows = make_rows(25_000);
+        let builder = InsertManyBuilder::new(&rows);
+        let chunks = builder.build_chunked(Dialect::Generic);
+
+        // 25_000 / 10_922 = 3 chunks (10_922 + 10_922 + 3_156)
+        assert_eq!(chunks.len(), 3);
+
+        let total_params: usize = chunks.iter().map(|(_, p)| p.len()).sum();
+        assert_eq!(total_params, 25_000 * 3);
+
+        // Each chunk must not exceed the limit
+        for (_, params) in &chunks {
+            assert!(params.len() <= Dialect::Generic.max_params());
+        }
+    }
+
+    #[test]
+    fn chunk_sql_is_valid() {
+        let rows = make_rows(5);
+        let builder = InsertManyBuilder::new(&rows);
+        let chunks = builder.build_chunked(Dialect::Generic);
+        assert_eq!(chunks.len(), 1);
+        let (sql, _) = &chunks[0];
+        assert!(sql.starts_with("INSERT INTO \"rows\""));
+        // 5 rows → 5 value groups
+        assert_eq!(sql.matches("(?, ?, ?)").count(), 5);
+    }
+
+    #[test]
+    fn on_conflict_preserved_in_chunks() {
+        let rows = make_rows(5);
+        let builder = InsertManyBuilder::new(&rows).on_conflict_do_nothing();
+        let chunks = builder.build_chunked(Dialect::Postgres);
+        for (sql, _) in &chunks {
+            assert!(
+                sql.contains("ON CONFLICT DO NOTHING"),
+                "missing ON CONFLICT in: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_per_chunk_calculation() {
+        let rows = make_rows(1);
+        let builder = InsertManyBuilder::new(&rows);
+        // 3 cols → 65_535 / 3 = 21_845 rows per chunk for Postgres
+        assert_eq!(builder.rows_per_chunk(Dialect::Postgres), 21_845);
+        // 3 cols → 32_766 / 3 = 10_922 rows per chunk for Generic
+        assert_eq!(builder.rows_per_chunk(Dialect::Generic), 10_922);
     }
 }

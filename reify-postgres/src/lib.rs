@@ -532,6 +532,34 @@ impl Database for PostgresDb {
         pg_query(&conn, sql, params).await
     }
 
+    async fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
+        let conn = get_conn(&self.pool).await?;
+        let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
+        let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| p as &(dyn PgToSql + Sync))
+            .collect();
+            
+        debug!(target: "reify::postgres", sql = %sql, "Querying (stream)");
+        let row_stream = Box::pin(conn.query_raw(&sql, param_refs).await.map_err(pg_err)?);
+
+        let stream = futures_util::stream::unfold(
+            (row_stream, conn),
+            |(mut row_stream, conn)| async move {
+                use futures_util::StreamExt;
+                match row_stream.next().await {
+                    Some(res) => Some((
+                        res.map(|r| pg_row_to_row(&r)).map_err(pg_err),
+                        (row_stream, conn)
+                    )),
+                    None => None,
+                }
+            }
+        );
+
+        Ok(Box::pin(stream))
+    }
+
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
         let conn = get_conn(&self.pool).await?;
         pg_query_one(&conn, sql, params).await
@@ -542,18 +570,8 @@ impl Database for PostgresDb {
         let conn = get_conn(&self.pool).await?;
         conn.execute("BEGIN", &[]).await.map_err(pg_err)?;
 
-        // Heap-allocate the transaction wrapper so it can be borrowed
-        // for the `'a` lifetime required by the closure.
-        let txn: Box<PgTransaction> = Box::new(PgTransaction { conn });
-        // SAFETY: `txn` lives until the end of this async block, which
-        // is strictly longer than the `f(&*txn_ref).await` call. The
-        // `'a` lifetime in the closure signature is the lifetime of
-        // `&'a self`, but the compiler can't prove our local `txn`
-        // lives that long. We guarantee it does because we don't drop
-        // `txn` until after `f` completes.
-        let txn_ref: &'a PgTransaction = unsafe { &*(&*txn as *const PgTransaction) };
-
-        match f(txn_ref).await {
+        let txn = PgTransaction { conn };
+        match f(&txn).await {
             Ok(()) => {
                 debug!(target: "reify::postgres", "COMMIT transaction");
                 txn.conn.execute("COMMIT", &[]).await.map_err(pg_err)?;

@@ -194,15 +194,11 @@ impl Database for SqliteDb {
         .await
         .map_err(|e| DbError::Other(e.to_string()))??;
 
-        let txn: Box<SqliteTransaction> = Box::new(SqliteTransaction {
+        let txn = SqliteTransaction {
             conn: Arc::clone(&self.conn),
-        });
-        // SAFETY: `txn` lives until the end of this async fn, which is
-        // strictly longer than the `f(&*txn_ref).await` call. Same
-        // lifetime-extension pattern as PgTransaction/MysqlTransaction.
-        let txn_ref: &'a SqliteTransaction = unsafe { &*(&*txn as *const SqliteTransaction) };
+        };
 
-        match f(txn_ref).await {
+        match f(&txn).await {
             Ok(()) => {
                 let conn = Arc::clone(&txn.conn);
                 tokio::task::spawn_blocking(move || {

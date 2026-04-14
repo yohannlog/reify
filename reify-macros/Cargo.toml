@@ -6,6 +6,11 @@ edition.workspace = true
 [lib]
 proc-macro = true
 
+[features]
+default = []
+dto = []
+dto-validation = ["dto"]
+
 [dependencies]
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

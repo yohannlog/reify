@@ -78,6 +78,22 @@ pub enum Dialect {
     Mysql,
 }
 
+impl Dialect {
+    /// Maximum number of bind parameters allowed in a single statement.
+    ///
+    /// - **PostgreSQL**: 65 535 (`$1` … `$65535`)
+    /// - **MySQL**: 65 535 (practical limit)
+    /// - **Generic / SQLite**: 32 766 (conservative; SQLite default is 999
+    ///   but can be compiled up to 32 766)
+    pub const fn max_params(self) -> usize {
+        match self {
+            Dialect::Postgres => 65_535,
+            Dialect::Mysql => 65_535,
+            Dialect::Generic => 32_766,
+        }
+    }
+}
+
 // ── OnConflict ──────────────────────────────────────────────────────
 
 /// Conflict-resolution strategy for INSERT statements.

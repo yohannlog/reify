@@ -55,6 +55,10 @@ pub enum DbError {
     Connection(String),
     /// Query execution failed.
     Query(String),
+    /// Expected exactly one row, but found none.
+    RecordNotFound,
+    /// Expected at most one row, but found multiple.
+    TooManyRows,
     /// Constraint violation (unique, foreign key, not-null, check, …).
     ///
     /// `message` is a human-readable description; `sqlstate` carries the
@@ -75,6 +79,8 @@ impl std::fmt::Display for DbError {
         match self {
             DbError::Connection(msg) => write!(f, "connection error: {msg}"),
             DbError::Query(msg) => write!(f, "query error: {msg}"),
+            DbError::RecordNotFound => write!(f, "expected 1 row, found 0"),
+            DbError::TooManyRows => write!(f, "expected at most 1 row, found multiple"),
             DbError::Constraint {
                 message,
                 sqlstate: Some(code),
@@ -127,12 +133,16 @@ pub mod sqlstate {
 pub type BoxFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, DbError>> + Send + 'a>>;
 
+/// A boxed, `Send`-safe stream returning `Result<T, DbError>`.
+pub type BoxStream<'a, T> =
+    std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<T, DbError>> + Send + 'a>>;
+
 /// The closure accepted by [`Database::transaction`].
 ///
 /// Receives a `&dyn DynDatabase` representing the isolated transaction
 /// connection and returns a [`BoxFuture`] that resolves when the
 /// transaction body completes.
-pub type TransactionFn<'a> = Box<dyn FnOnce(&'a dyn DynDatabase) -> BoxFuture<'a, ()> + Send + 'a>;
+pub type TransactionFn<'a> = Box<dyn for<'c> FnOnce(&'c dyn DynDatabase) -> BoxFuture<'c, ()> + Send + 'a>;
 
 // ── Database trait ──────────────────────────────────────────────────
 
@@ -164,6 +174,23 @@ pub trait Database: Send + Sync {
         params: &[Value],
     ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send;
 
+    /// Execute a query (SELECT) and return an asynchronous stream of rows.
+    ///
+    /// The default implementation executes `query` and streams the resulting `Vec<Row>`.
+    /// Database adapters can override this to stream rows directly from the driver
+    /// to avoid loading the entire result set into memory.
+    fn query_stream<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+    ) -> impl std::future::Future<Output = Result<BoxStream<'a, Row>, DbError>> + Send {
+        use futures_util::StreamExt;
+        async move {
+            let rows = self.query(&sql, &params).await?;
+            Ok(Box::pin(futures_util::stream::iter(rows.into_iter().map(Ok))) as BoxStream<'a, Row>)
+        }
+    }
+
     /// Execute a query and return a single row (e.g. COUNT).
     fn query_one(
         &self,
@@ -194,6 +221,8 @@ pub trait DynDatabase: Send + Sync {
 
     fn query<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Vec<Row>>;
 
+    fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> BoxFuture<'a, BoxStream<'a, Row>>;
+
     fn query_one<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Row>;
 
     fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> BoxFuture<'a, ()>;
@@ -206,6 +235,10 @@ impl<T: Database> DynDatabase for T {
 
     fn query<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Vec<Row>> {
         Box::pin(Database::query(self, sql, params))
+    }
+
+    fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> BoxFuture<'a, BoxStream<'a, Row>> {
+        Box::pin(Database::query_stream(self, sql, params))
     }
 
     fn query_one<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Row> {
@@ -223,6 +256,9 @@ impl Database for dyn DynDatabase + '_ {
     }
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
         DynDatabase::query(self, sql, params).await
+    }
+    async fn query_stream<'a>(&'a self, sql: String, params: Vec<Value>) -> Result<BoxStream<'a, Row>, DbError> {
+        DynDatabase::query_stream(self, sql, params).await
     }
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
         DynDatabase::query_one(self, sql, params).await
@@ -254,6 +290,23 @@ pub async fn fetch_all<M: Table>(
     }
 }
 
+/// Execute a SELECT and return an asynchronous stream of raw rows.
+pub async fn fetch_all_stream<'a, M: Table>(
+    db: &'a impl Database,
+    builder: &crate::query::SelectBuilder<M>,
+) -> Result<BoxStream<'a, Row>, DbError> {
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return db.query_stream(q.sql, q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.query_stream(sql, params).await
+    }
+}
+
 /// Execute a SELECT and return typed results.
 pub async fn fetch<M: Table + FromRow>(
     db: &impl Database,
@@ -261,6 +314,16 @@ pub async fn fetch<M: Table + FromRow>(
 ) -> Result<Vec<M>, DbError> {
     let rows = fetch_all(db, builder).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
+}
+
+/// Execute a SELECT and return an asynchronous stream of typed results.
+pub async fn fetch_stream<'a, M: Table + FromRow>(
+    db: &'a impl Database,
+    builder: &crate::query::SelectBuilder<M>,
+) -> Result<BoxStream<'a, M>, DbError> {
+    use futures_util::StreamExt;
+    let stream = fetch_all_stream(db, builder).await?;
+    Ok(Box::pin(stream.map(|res| res.and_then(|r| M::from_row(&r)))))
 }
 
 /// Execute a SELECT and return exactly one typed result.
@@ -273,8 +336,8 @@ pub async fn fetch_one<M: Table + FromRow>(
     let rows = fetch(db, builder).await?;
     match rows.len() {
         1 => Ok(rows.into_iter().next().unwrap()),
-        0 => Err(DbError::Query("expected 1 row, got 0".into())),
-        n => Err(DbError::Query(format!("expected 1 row, got {n}"))),
+        0 => Err(DbError::RecordNotFound),
+        _ => Err(DbError::TooManyRows),
     }
 }
 
@@ -289,7 +352,7 @@ pub async fn fetch_optional<M: Table + FromRow>(
     match rows.len() {
         0 => Ok(None),
         1 => Ok(Some(rows.into_iter().next().unwrap())),
-        n => Err(DbError::Query(format!("expected 0 or 1 row, got {n}"))),
+        _ => Err(DbError::TooManyRows),
     }
 }
 
@@ -494,8 +557,8 @@ mod tests {
                 .ok_or_else(|| DbError::Query("no rows".into()))
         }
 
-        async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
-            f(self).await
+        fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+            async move { f(self).await }
         }
     }
 

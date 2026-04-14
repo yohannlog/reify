@@ -297,14 +297,11 @@ impl Database for MysqlDb {
             .await
             .map_err(mysql_err)?;
 
-        let txn: Box<MysqlTransaction> = Box::new(MysqlTransaction {
+        let txn = MysqlTransaction {
             conn: tokio::sync::Mutex::new(conn),
-        });
-        // SAFETY: `txn` lives until the end of this async block, which
-        // is strictly longer than the `f(&*txn_ref).await` call.
-        let txn_ref: &'a MysqlTransaction = unsafe { &*(&*txn as *const MysqlTransaction) };
+        };
 
-        match f(txn_ref).await {
+        match f(&txn).await {
             Ok(()) => {
                 debug!(target: "reify::mysql", "COMMIT transaction");
                 let mut conn = txn.conn.lock().await;

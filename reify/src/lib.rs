@@ -33,12 +33,16 @@ pub use reify_macros::Relations;
 pub use reify_macros::Table;
 pub use reify_macros::View;
 
+// Re-export validator when dto-validation is enabled
+#[cfg(feature = "dto-validation")]
+pub use validator;
+
 // Database adapters behind feature flags
 #[cfg(feature = "postgres")]
-pub use reify_postgres::{self, NoTls, PostgresDb, deadpool_postgres, tokio_postgres};
+pub use reify_postgres::{self, deadpool_postgres, tokio_postgres, NoTls, PostgresDb};
 
 #[cfg(feature = "mysql")]
-pub use reify_mysql::{self, MysqlDb, mysql_async};
+pub use reify_mysql::{self, mysql_async, MysqlDb};
 
 #[cfg(feature = "sqlite")]
 pub use reify_sqlite::{self, SqliteDb};

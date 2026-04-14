@@ -74,7 +74,7 @@ pub trait Policy: crate::table::Table {
 /// RLS helpers (`scoped_fetch_all`, `scoped_update`, `scoped_delete`)
 /// remain usable inside the transaction body.
 pub type ScopedTransactionFn<'a> =
-    Box<dyn FnOnce(&'a Scoped<'a>) -> BoxFuture<'a, ()> + Send + 'a>;
+    Box<dyn for<'c> FnOnce(Scoped<'c>) -> BoxFuture<'c, ()> + Send + 'a>;
 
 // ── Scoped database wrapper ────────────────────────────────────────
 
@@ -122,18 +122,9 @@ impl<'a> Scoped<'a> {
         let ctx = self.ctx.clone();
         async move {
             self.inner
-                .transaction(Box::new(move |tx_db: &'s dyn DynDatabase| {
-                    let scoped_tx: Box<Scoped<'s>> = Box::new(Scoped::new(tx_db, ctx));
-                    // SAFETY: `scoped_tx` is moved into the async block and lives
-                    // until the future completes. The raw pointer cast extends the
-                    // borrow lifetime to match `'s`.
-                    let scoped_ref: &'s Scoped<'s> =
-                        unsafe { &*(&*scoped_tx as *const Scoped<'s>) };
-                    let fut = f(scoped_ref);
-                    Box::pin(async move {
-                        let _guard = scoped_tx;
-                        fut.await
-                    })
+                .transaction(Box::new(move |tx_db| {
+                    let scoped_tx = Scoped::new(tx_db, ctx);
+                    f(scoped_tx)
                 }))
                 .await
         }
@@ -142,6 +133,13 @@ impl<'a> Scoped<'a> {
 
 /// Delegate raw `Database` calls — policies are enforced at the builder level,
 /// not at the SQL string level, so the raw trait just passes through.
+///
+/// **`transaction()`** is intentionally blocked: calling `Database::transaction`
+/// on a `Scoped` would hand the closure a raw `&dyn DynDatabase` without RLS
+/// context, silently bypassing row-level security.  Use
+/// [`Scoped::scoped_transaction`] instead — it passes `&Scoped` to the closure
+/// so that `scoped_fetch_all`, `scoped_update`, and `scoped_delete` remain
+/// available and RLS policies stay enforced.
 impl Database for Scoped<'_> {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
         self.inner.execute(sql, params).await
@@ -155,30 +153,19 @@ impl Database for Scoped<'_> {
         self.inner.query_one(sql, params).await
     }
 
-    fn transaction<'a>(
-        &'a self,
-        f: TransactionFn<'a>,
-    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
-        let ctx = self.ctx.clone();
-        async move {
-            self.inner
-                .transaction(Box::new(move |tx_db: &'a dyn DynDatabase| {
-                    let scoped_tx: Box<Scoped<'a>> = Box::new(Scoped::new(tx_db, ctx));
-                    // SAFETY: `scoped_tx` is moved into the async block and lives
-                    // until the future completes. The raw pointer cast extends the
-                    // borrow lifetime to match `'a` — same pattern as PgTransaction.
-                    let scoped_ref: &'a Scoped<'a> =
-                        unsafe { &*(&*scoped_tx as *const Scoped<'a>) };
-                    let fut = f(scoped_ref);
-                    // Move `scoped_tx` into the future to keep it alive until
-                    // `fut` completes. `_guard` is dropped after `fut.await`.
-                    Box::pin(async move {
-                        let _guard = scoped_tx;
-                        fut.await
-                    })
-                }))
-                .await
-        }
+    /// **Blocked** — always returns an error.
+    ///
+    /// Calling `Database::transaction` on a `Scoped` wrapper would give the
+    /// closure a raw `&dyn DynDatabase` that cannot enforce RLS policies.
+    /// Use [`Scoped::scoped_transaction`] instead.
+    async fn transaction<'a>(&'a self, _f: TransactionFn<'a>) -> Result<(), DbError> {
+        Err(DbError::Other(
+            "Database::transaction() called on a Scoped wrapper. \
+             This would bypass RLS policies because the closure receives a raw \
+             &dyn DynDatabase without the RLS context. \
+             Use Scoped::scoped_transaction() instead."
+                .into(),
+        ))
     }
 }
 
@@ -308,22 +295,17 @@ mod tests {
         let ctx = RlsContext::new().set("tenant_id", 42i64);
         let scoped = Scoped::new(&db, ctx);
 
-        // Run a raw query inside a transaction via the Scoped wrapper.
-        // Before the fix, this would fail because DynDatabase didn't
-        // support transaction(). Now it delegates correctly.
-        let result = Database::transaction(
-            &scoped,
-            Box::new(|tx_db: &dyn DynDatabase| {
+        // Use scoped_transaction — the closure receives &Scoped so raw
+        // queries still go through the inner connection.
+        let result = scoped
+            .scoped_transaction(Box::new(|s: Scoped<'_>| {
                 Box::pin(async move {
-                    // Issue a raw query through the transaction connection.
-                    // This goes through Scoped → RecordingDb.
-                    tx_db.query("SELECT 1", &[]).await?;
-                    tx_db.execute("UPDATE t SET x = 1", &[]).await?;
+                    Database::query(&s, "SELECT 1", &[]).await?;
+                    Database::execute(&s, "UPDATE t SET x = 1", &[]).await?;
                     Ok(())
                 })
-            }),
-        )
-        .await;
+            }))
+            .await;
 
         assert!(result.is_ok());
 
@@ -362,10 +344,10 @@ mod tests {
         // call scoped_fetch_all — the RLS filter must be injected even
         // inside the transaction body.
         let result = scoped
-            .scoped_transaction(Box::new(|s: &Scoped<'_>| {
+            .scoped_transaction(Box::new(|s: Scoped<'_>| {
                 Box::pin(async move {
                     let builder = crate::query::SelectBuilder::<TenantPost>::new();
-                    scoped_fetch_all::<TenantPost>(s, builder).await?;
+                    scoped_fetch_all::<TenantPost>(&s, builder).await?;
                     Ok(())
                 })
             }))
@@ -383,41 +365,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_transaction_wraps_connection_with_rls_context() {
+    async fn database_transaction_on_scoped_is_blocked() {
         let (db, _log) = RecordingDb::new();
         let ctx = RlsContext::new().set("tenant_id", 99i64);
         let scoped = Scoped::new(&db, ctx);
 
-        // Verify that the transaction closure receives a Scoped wrapper
-        // by checking that context() is accessible on the inner type.
-        // We use a shared flag to confirm the assertion ran.
+        // Calling Database::transaction on a Scoped must return an error
+        // to prevent RLS bypass — the closure would receive a raw
+        // &dyn DynDatabase without the RLS context.
+        let result = Database::transaction(
+            &scoped,
+            Box::new(|_tx_db: &dyn DynDatabase| Box::pin(async { Ok(()) })),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("scoped_transaction"),
+            "error should mention scoped_transaction, got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_transaction_preserves_rls_context() {
+        let (db, log) = RecordingDb::new();
+        let ctx = RlsContext::new().set("tenant_id", 99i64);
+        let scoped = Scoped::new(&db, ctx);
+
+        // scoped_transaction passes &Scoped to the closure, so the RLS
+        // context is available and scoped_* helpers work correctly.
         let flag = Arc::new(Mutex::new(false));
         let flag_clone = flag.clone();
 
-        let result = Database::transaction(
-            &scoped,
-            Box::new(move |tx_db: &dyn DynDatabase| {
+        let result = scoped
+            .scoped_transaction(Box::new(move |s: Scoped<'_>| {
                 let flag = flag_clone.clone();
                 Box::pin(async move {
-                    // The tx_db is a Scoped wrapping RecordingDb.
-                    // We can verify this indirectly: Scoped delegates query/execute
-                    // to its inner, so if we can query, the wrapping works.
-                    // The key behavioral guarantee: the Scoped::transaction impl
-                    // creates `Scoped::new(tx_db, ctx)` so the RLS context is
-                    // available for any scoped_* helper that receives this as
-                    // a &Scoped reference.
-                    tx_db.query("SELECT 1", &[]).await?;
+                    // Verify the RLS context is propagated into the transaction.
+                    let tid = s.context().get::<i64>("tenant_id");
+                    assert_eq!(tid, Some(&99i64));
+
+                    Database::query(&s, "SELECT 1", &[]).await?;
                     *flag.lock().unwrap() = true;
                     Ok(())
                 })
-            }),
-        )
-        .await;
+            }))
+            .await;
 
         assert!(result.is_ok());
         assert!(
             *flag.lock().unwrap(),
             "transaction closure should have executed"
         );
+        assert_eq!(log.lock().unwrap().len(), 1);
     }
 }

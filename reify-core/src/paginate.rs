@@ -200,7 +200,7 @@ impl<M: Table> CursorPaginated<M> {
                         CursorDirection::Forward => Condition::Gt(self.cursor_column, val.clone()),
                         CursorDirection::Backward => Condition::Lt(self.cursor_column, val.clone()),
                     };
-                    conditions.push(cursor_cond);
+                    conditions.to_mut().push(cursor_cond);
                 }
 
                 // Replace ORDER BY with cursor ordering
@@ -218,7 +218,7 @@ impl<M: Table> CursorPaginated<M> {
                     conditions,
                     group_by,
                     having,
-                    order_by,
+                    order_by: std::borrow::Cow::Owned(order_by),
                     limit: Some(self.limit + 1), // fetch one extra to detect has_next
                     offset: None,
                 }
@@ -641,7 +641,7 @@ impl<M: Table> CursorBuilder<M> {
         (data_sql, count_sql, data_params, count_params)
     }
 
-    fn apply_cursor(&self, ast: SqlFragment) -> SqlFragment {
+    fn apply_cursor<'a>(&self, ast: SqlFragment<'a>) -> SqlFragment<'a> {
         match ast {
             SqlFragment::Select {
                 distinct,
@@ -658,7 +658,7 @@ impl<M: Table> CursorBuilder<M> {
                     if let Some(decoded) = Cursor::decode(cursor_str) {
                         let cond = build_cursor_condition(&self.columns, &decoded, self.backward);
                         if let Some(c) = cond {
-                            conditions.push(c);
+                            conditions.to_mut().push(c);
                         }
                     }
                 }
@@ -688,7 +688,7 @@ impl<M: Table> CursorBuilder<M> {
                     conditions,
                     group_by,
                     having,
-                    order_by,
+                    order_by: std::borrow::Cow::Owned(order_by),
                     limit: Some(self.limit + 1),
                     offset: None,
                 }

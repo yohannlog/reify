@@ -150,7 +150,7 @@ impl<M: Table> SelectBuilder<M> {
     ///
     /// Use this when you need to manipulate the query structure (e.g. pagination)
     /// without parsing rendered SQL text.
-    pub fn build_ast(&self) -> crate::sql::SqlFragment {
+    pub fn build_ast<'a>(&'a self) -> crate::sql::SqlFragment<'a> {
         let has_joins = !self.joins.is_empty();
 
         let columns = if let Some(ref exprs) = self.exprs {
@@ -184,7 +184,7 @@ impl<M: Table> SelectBuilder<M> {
                 table: j.table.to_string(),
                 on_condition: j.on.clone(),
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         let order_by = self
             .orders
@@ -199,17 +199,17 @@ impl<M: Table> SelectBuilder<M> {
                     descending: true,
                 },
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         crate::sql::SqlFragment::Select {
             distinct: self.distinct,
             columns,
             from: M::table_name().to_string(),
-            joins,
-            conditions: self.conditions.clone(),
+            joins: std::borrow::Cow::Owned(joins),
+            conditions: std::borrow::Cow::Borrowed(self.conditions.as_slice()),
             group_by: self.group_by.iter().map(|s| qi(s)).collect(),
-            having: self.having.clone(),
-            order_by,
+            having: std::borrow::Cow::Borrowed(self.having.as_slice()),
+            order_by: std::borrow::Cow::Owned(order_by),
             limit: self.limit,
             offset: self.offset,
         }
@@ -252,6 +252,14 @@ impl<M: Table + crate::db::FromRow> SelectBuilder<M> {
     /// ```
     pub async fn fetch(&self, db: &impl crate::db::Database) -> Result<Vec<M>, crate::db::DbError> {
         crate::db::fetch(db, self).await
+    }
+
+    /// Execute this SELECT and return an asynchronous stream of typed results.
+    pub async fn fetch_stream<'a>(
+        &self,
+        db: &'a impl crate::db::Database,
+    ) -> Result<crate::db::BoxStream<'a, M>, crate::db::DbError> {
+        crate::db::fetch_stream(db, self).await
     }
 
     /// Execute this SELECT and return exactly one typed result.

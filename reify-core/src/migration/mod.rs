@@ -71,18 +71,8 @@ mod tests {
             Err(DbError::Query("no rows".into()))
         }
 
-        async fn transaction<'a>(
-            &'a self,
-            f: Box<
-                dyn FnOnce(
-                        &'a dyn DynDatabase,
-                    ) -> std::pin::Pin<
-                        Box<dyn std::future::Future<Output = Result<(), DbError>> + Send + 'a>,
-                    > + Send
-                    + 'a,
-            >,
-        ) -> Result<(), DbError> {
-            f(self).await
+        fn transaction<'a>(&'a self, f: crate::db::TransactionFn<'a>) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+            async move { f(self).await }
         }
     }
 
@@ -291,7 +281,7 @@ mod tests {
         // Second: CREATE TABLE users
         assert!(sql[1].contains("CREATE TABLE IF NOT EXISTS \"users\""));
         // Third: INSERT into tracking table
-        assert!(sql[2].contains("INSERT INTO _reify_migrations"));
+        assert!(sql[2].contains("INSERT INTO \"_reify_migrations\""));
     }
 
     #[tokio::test]
@@ -324,7 +314,7 @@ mod tests {
         let has_drop = sql.iter().any(|s| s.contains("DROP COLUMN \"city\""));
         let has_delete = sql
             .iter()
-            .any(|s| s.contains("DELETE FROM _reify_migrations"));
+            .any(|s| s.contains("DELETE FROM \"_reify_migrations\""));
         assert!(has_drop, "expected DROP COLUMN \"city\" in: {sql:?}");
         assert!(has_delete, "expected DELETE FROM tracking in: {sql:?}");
     }
