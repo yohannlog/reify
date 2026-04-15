@@ -923,7 +923,10 @@ mod tests {
 
     #[test]
     fn test_values_to_json_string_finite_floats() {
-        let json = values_to_json_string(&["f32", "f64"], &[Value::F32(1.5), Value::F64(std::f64::consts::PI)]);
+        let json = values_to_json_string(
+            &["f32", "f64"],
+            &[Value::F32(1.5), Value::F64(std::f64::consts::PI)],
+        );
         assert!(json.contains("1.5"), "expected 1.5 in: {json}");
         assert!(json.contains("3.14"), "expected 3.14 in: {json}");
     }

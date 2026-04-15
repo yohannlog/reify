@@ -860,8 +860,7 @@ fn build_cursor_condition(
         let use_gt = first_desc == backward;
         let op = if use_gt { ">" } else { "<" };
 
-        // Quote each column name to handle reserved words and mixed-case identifiers.
-        let col_list: Vec<String> = columns.iter().map(|c| qi(c.name)).collect();
+        let col_list: Vec<String> = columns.iter().map(|c| c.name.to_string()).collect();
         let placeholders: Vec<&str> = vec!["?"; columns.len()];
 
         let raw_sql = format!(
