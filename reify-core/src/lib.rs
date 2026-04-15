@@ -30,8 +30,10 @@ pub use condition::{AggregateCondition, Condition, LogicalOp};
 #[allow(deprecated)]
 pub use query::{
     BuildError, DeleteBuilder, Dialect, Expr, InsertBuilder, InsertManyBuilder, JoinClause,
-    JoinKind, OnConflict, SelectBuilder, UpdateBuilder, WithBuilder, rewrite_placeholders_pg,
+    JoinKind, OnConflict, SelectBuilder, UpdateBuilder, WithBuilder,
 };
+#[cfg(feature = "postgres")]
+pub use query::rewrite_placeholders_pg;
 
 pub use func::count_all;
 
