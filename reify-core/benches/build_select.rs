@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use reify_core::condition::Condition;
 use reify_core::query::SelectBuilder;
-use reify_core::schema::{ColumnDef, IndexDef};
+
 use reify_core::table::Table;
 use reify_core::value::Value;
 
@@ -24,14 +24,6 @@ impl Table for BenchTable {
             Value::I32(42),
             Value::Bool(true),
         ]
-    }
-
-    fn column_defs() -> Vec<ColumnDef> {
-        Vec::new()
-    }
-
-    fn indexes() -> Vec<IndexDef> {
-        Vec::new()
     }
 }
 

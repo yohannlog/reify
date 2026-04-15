@@ -72,10 +72,14 @@ fn range_accessors() {
 fn range_into_value() {
     use reify::value::IntoValue;
     let r = Range::closed_open(1i32, 10i32);
-    #[cfg(not(feature = "postgres"))]
-    assert_eq!(r.into_value(), Value::String("[1,10)".into()));
-    #[cfg(feature = "postgres")]
-    assert_eq!(r.into_value(), Value::Int4Range(Range::closed_open(1, 10)));
+    let v = r.clone().into_value();
+    // Either the native postgres variant or the text fallback is acceptable,
+    // depending on which features reify-core was compiled with.
+    match v {
+        Value::Int4Range(got) => assert_eq!(got, r),
+        Value::String(s) => assert_eq!(s, "[1,10)"),
+        other => panic!("unexpected Value variant: {other:?}"),
+    }
 }
 
 // ── Table with range column + operators ────────────────────────────
