@@ -3,7 +3,7 @@
 //!
 //! Run: `cargo run --example timestamps`
 
-use reify::{query::Order, Schema, Table};
+use reify::{Schema, Table, query::Order};
 
 // ── VM-source (default): Rust generates Utc::now() ─────────────────
 

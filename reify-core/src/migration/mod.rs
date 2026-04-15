@@ -82,25 +82,28 @@ mod tests {
 
     struct Users;
     impl Table for Users {
-        fn table_name() -> &'static str { "users" }
-        fn column_names() -> &'static [&'static str] { &["id", "email", "role"] }
-        fn into_values(&self) -> Vec<Value> { vec![] }
+        fn table_name() -> &'static str {
+            "users"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "email", "role"]
+        }
+        fn into_values(&self) -> Vec<Value> {
+            vec![]
+        }
     }
     impl crate::schema::Schema for Users {
         fn schema() -> crate::schema::TableSchema<Self> {
             crate::schema::table::<Self>("users")
-                .column(
-                    crate::column::Column::<Users, i64>::new("id"),
-                    |c| c.sql_type(crate::schema::SqlType::BigInt).primary_key(),
-                )
-                .column(
-                    crate::column::Column::<Users, String>::new("email"),
-                    |c| c.sql_type(crate::schema::SqlType::Text),
-                )
-                .column(
-                    crate::column::Column::<Users, String>::new("role"),
-                    |c| c.sql_type(crate::schema::SqlType::Text),
-                )
+                .column(crate::column::Column::<Users, i64>::new("id"), |c| {
+                    c.sql_type(crate::schema::SqlType::BigInt).primary_key()
+                })
+                .column(crate::column::Column::<Users, String>::new("email"), |c| {
+                    c.sql_type(crate::schema::SqlType::Text)
+                })
+                .column(crate::column::Column::<Users, String>::new("role"), |c| {
+                    c.sql_type(crate::schema::SqlType::Text)
+                })
         }
     }
 

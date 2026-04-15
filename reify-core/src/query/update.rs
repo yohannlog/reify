@@ -75,6 +75,13 @@ impl<M: Table> UpdateBuilder<M> {
         self
     }
 
+    /// Return the SET column-value pairs for this builder.
+    ///
+    /// Used by `audited_update` to build the audit row from the new values.
+    pub fn set_entries(&self) -> &[(&'static str, Value)] {
+        &self.sets
+    }
+
     /// Convert this `UpdateBuilder` into a `SelectBuilder` with the same WHERE conditions.
     ///
     /// Used by `audited_update` to capture the before-image of rows before modification.

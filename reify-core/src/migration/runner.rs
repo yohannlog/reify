@@ -101,8 +101,7 @@ impl MigrationRunner {
         self = self.add_table::<T>();
         let audit_defs = T::audit_column_defs();
         let audit_name = T::audit_table_name();
-        let create_sql =
-            create_table_sql(audit_name, &audit_defs, crate::query::Dialect::Generic);
+        let create_sql = create_table_sql(audit_name, &audit_defs, crate::query::Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: audit_name,
             column_names: &[],

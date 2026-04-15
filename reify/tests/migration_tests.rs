@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use reify::schema::ColumnBuilder;
 use reify::{
     Database, DbError, Row, Schema, SqlType, TransactionFn, Value,
     migration::{
@@ -11,7 +12,6 @@ use reify::{
         generate_migration_file,
     },
 };
-use reify::schema::ColumnBuilder;
 
 // ── MockDb ───────────────────────────────────────────────────────────
 
@@ -487,7 +487,10 @@ fn create_table_uses_builder_types() {
         "expected UUID (explicit type, not name heuristic), got: {sql}"
     );
     assert!(sql.contains("TEXT"), "expected TEXT for role, got: {sql}");
-    assert!(sql.contains("PRIMARY KEY"), "expected PRIMARY KEY, got: {sql}");
+    assert!(
+        sql.contains("PRIMARY KEY"),
+        "expected PRIMARY KEY, got: {sql}"
+    );
     assert!(sql.contains("UNIQUE"), "expected UNIQUE, got: {sql}");
 }
 
@@ -608,7 +611,10 @@ fn create_table_with_table_level_checks() {
         sql.contains("CHECK (length(email) > 5)"),
         "expected table-level CHECK in: {sql}"
     );
-    let check_line = sql.lines().find(|l| l.contains("length(email) > 5")).unwrap();
+    let check_line = sql
+        .lines()
+        .find(|l| l.contains("length(email) > 5"))
+        .unwrap();
     assert!(
         !check_line.contains("TEXT"),
         "table-level CHECK should be on its own line: {check_line}"

@@ -273,7 +273,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                     #audit_table_name
                 }
                 fn audit_column_defs() -> Vec<reify_core::schema::ColumnDef> {
-                    reify_core::audit::audit_column_defs_for(#audit_table_name)
+                    reify_core::audit::audit_column_defs_base()
                 }
             }
         }

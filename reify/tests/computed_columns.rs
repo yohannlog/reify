@@ -267,7 +267,7 @@ pub struct Item {
 
 #[test]
 fn schema_builder_computed_stored() {
-    use reify::{table, SqlType, TableSchema};
+    use reify::{SqlType, TableSchema, table};
 
     let schema: TableSchema<Item> = table::<Item>("items")
         .column(Item::id, |c| c.primary_key())
@@ -285,7 +285,7 @@ fn schema_builder_computed_stored() {
 
 #[test]
 fn schema_builder_computed_virtual() {
-    use reify::{table, TableSchema};
+    use reify::{TableSchema, table};
 
     let schema: TableSchema<Item> = table::<Item>("items")
         .column(Item::id, |c| c.primary_key())

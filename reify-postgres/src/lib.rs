@@ -442,8 +442,7 @@ fn pg_column_to_value(
                 "Unknown PostgreSQL column type — falling back to String representation. \
                  Consider opening an issue or using a raw SQL query if precision is required."
             );
-            row
-                .try_get::<_, Option<String>>(idx)
+            row.try_get::<_, Option<String>>(idx)
                 .ok()
                 .flatten()
                 .map(Value::String)

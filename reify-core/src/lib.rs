@@ -27,13 +27,13 @@ pub use column::JsonExpr;
 #[cfg(feature = "postgres")]
 pub use condition::PgCondition;
 pub use condition::{AggregateCondition, Condition, LogicalOp};
+#[cfg(feature = "postgres")]
+pub use query::rewrite_placeholders_pg;
 #[allow(deprecated)]
 pub use query::{
     BuildError, DeleteBuilder, Dialect, Expr, InsertBuilder, InsertManyBuilder, JoinClause,
     JoinKind, OnConflict, SelectBuilder, UpdateBuilder, WithBuilder,
 };
-#[cfg(feature = "postgres")]
-pub use query::rewrite_placeholders_pg;
 
 pub use func::count_all;
 
