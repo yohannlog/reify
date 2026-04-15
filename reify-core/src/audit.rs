@@ -246,6 +246,36 @@ impl From<&str> for ActorId {
     }
 }
 
+// ── SecretError ──────────────────────────────────────────────────────
+
+/// Error returned by [`AuditContext::with_integrity`] when the HMAC secret
+/// does not meet the minimum security requirements.
+///
+/// NIST SP 800-107 recommends that HMAC keys be at least as long as the hash
+/// output (32 bytes for SHA-256). Shorter keys are technically valid per
+/// RFC 2104 but provide reduced security margins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretError {
+    /// The secret is empty. An empty key produces a deterministic HMAC that
+    /// provides no integrity guarantee whatsoever.
+    Empty,
+}
+
+impl std::fmt::Display for SecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretError::Empty => f.write_str(
+                "HMAC secret must not be empty; use at least 32 bytes (NIST SP 800-107)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SecretError {}
+
+/// Minimum recommended HMAC-SHA256 key length (NIST SP 800-107).
+pub const HMAC_MIN_KEY_BYTES: usize = 32;
+
 // ── AuditContext ─────────────────────────────────────────────────────
 
 /// Context passed to audited operations (who triggered the change).
@@ -280,12 +310,40 @@ impl AuditContext {
     }
 
     /// Create a context with HMAC-SHA256 integrity protection.
-    pub fn with_integrity(actor: impl Into<ActorId>, secret: impl Into<Vec<u8>>) -> Self {
-        Self {
-            actor: actor.into(),
-            hmac_secret: Some(ZeroOnDrop(secret.into())),
-            dialect: crate::query::Dialect::Generic,
+    ///
+    /// Returns [`SecretError::Empty`] when `secret` is empty — an empty key
+    /// provides no integrity guarantee.
+    ///
+    /// A `tracing::warn!` is emitted when the secret is shorter than
+    /// [`HMAC_MIN_KEY_BYTES`] (32 bytes, per NIST SP 800-107) but still
+    /// accepted, so callers can detect misconfiguration in logs without
+    /// breaking existing deployments that use shorter keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError::Empty`] if `secret` is zero bytes.
+    pub fn with_integrity(
+        actor: impl Into<ActorId>,
+        secret: impl Into<Vec<u8>>,
+    ) -> Result<Self, SecretError> {
+        let secret = secret.into();
+        if secret.is_empty() {
+            return Err(SecretError::Empty);
         }
+        if secret.len() < HMAC_MIN_KEY_BYTES {
+            tracing::warn!(
+                secret_len = secret.len(),
+                min_recommended = HMAC_MIN_KEY_BYTES,
+                "HMAC secret is shorter than the NIST-recommended {} bytes; \
+                 consider using a longer key",
+                HMAC_MIN_KEY_BYTES,
+            );
+        }
+        Ok(Self {
+            actor: actor.into(),
+            hmac_secret: Some(ZeroOnDrop(secret)),
+            dialect: crate::query::Dialect::Generic,
+        })
     }
 
     /// Override the SQL dialect (default: `Generic` / `?` placeholders).
@@ -492,7 +550,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
 /// ```
 /// use reify_core::audit::{AuditContext, ActorId, verify_audit_row};
 ///
-/// let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+/// let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
 /// let hash = ctx.compute_hash("delete", "2024-01-15T10:30:00Z", r#"{"id":1}"#).unwrap();
 /// assert_eq!(
 ///     verify_audit_row(b"secret", "delete", "7", "2024-01-15T10:30:00Z", r#"{"id":1}"#, Some(&hash), false),
@@ -1234,7 +1292,7 @@ mod tests {
         assert!(!ctx.has_integrity());
         assert_eq!(ctx.actor(), &ActorId::Int(1));
 
-        let ctx2 = AuditContext::with_integrity(ActorId::None, b"s");
+        let ctx2 = AuditContext::with_integrity(ActorId::None, b"s").unwrap();
         assert!(ctx2.has_integrity());
     }
 
@@ -1245,7 +1303,57 @@ mod tests {
         assert_eq!(ctx.dialect, Dialect::Postgres);
     }
 
-    /// Known-answer test: SHA-256("") = e3b0c44298fc1c149afb...
+    // ── SecretError / with_integrity validation ───────────────────────────
+
+    #[test]
+    fn test_with_integrity_empty_secret_is_error() {
+        let result = AuditContext::with_integrity(ActorId::Int(1), b"".to_vec());
+        assert_eq!(result.err(), Some(SecretError::Empty));
+    }
+
+    #[test]
+    fn test_with_integrity_empty_secret_display() {
+        let msg = SecretError::Empty.to_string();
+        assert!(
+            msg.contains("empty"),
+            "display should mention 'empty': {msg}"
+        );
+        assert!(msg.contains("32"), "display should mention 32 bytes: {msg}");
+    }
+
+    #[test]
+    fn test_with_integrity_short_secret_is_ok() {
+        // Secrets shorter than HMAC_MIN_KEY_BYTES are accepted (only a warning
+        // is emitted via tracing). The returned context must be functional.
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"short").unwrap();
+        assert!(ctx.has_integrity());
+        // Must still produce a valid 64-char hex hash.
+        let h = ctx.compute_hash("insert", "", "{}").unwrap();
+        assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn test_with_integrity_exact_min_length_is_ok() {
+        let secret = vec![0xabu8; HMAC_MIN_KEY_BYTES]; // exactly 32 bytes
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), secret).unwrap();
+        assert!(ctx.has_integrity());
+    }
+
+    #[test]
+    fn test_with_integrity_long_secret_is_ok() {
+        let secret = vec![0x42u8; 64]; // 64 bytes — above threshold
+        let ctx = AuditContext::with_integrity(ActorId::None, secret).unwrap();
+        assert!(ctx.has_integrity());
+    }
+
+    #[test]
+    fn test_secret_error_is_std_error() {
+        // Ensure SecretError implements std::error::Error (compile-time check).
+        fn assert_error<E: std::error::Error>(_: &E) {}
+        assert_error(&SecretError::Empty);
+    }
+
+    /// Known-answer test: SHA-256(\"\") = e3b0c44298fc1c149afb...
     #[test]
     fn test_sha256_empty() {
         let digest = sha256(b"");
@@ -1306,7 +1414,7 @@ mod tests {
 
     #[test]
     fn test_compute_hash_deterministic() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(42), b"my-secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(42), b"my-secret").unwrap();
         let h1 = ctx
             .compute_hash("delete", "2024-01-01T00:00:00Z", r#"{"id":1}"#)
             .unwrap();
@@ -1319,7 +1427,7 @@ mod tests {
 
     #[test]
     fn test_compute_hash_differs_on_operation() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"secret").unwrap();
         let h_update = ctx.compute_hash("update", "", "{}").unwrap();
         let h_delete = ctx.compute_hash("delete", "", "{}").unwrap();
         assert_ne!(h_update, h_delete);
@@ -1327,8 +1435,8 @@ mod tests {
 
     #[test]
     fn test_compute_hash_differs_on_actor() {
-        let ctx1 = AuditContext::with_integrity(ActorId::Int(1), b"secret");
-        let ctx2 = AuditContext::with_integrity(ActorId::Int(2), b"secret");
+        let ctx1 = AuditContext::with_integrity(ActorId::Int(1), b"secret").unwrap();
+        let ctx2 = AuditContext::with_integrity(ActorId::Int(2), b"secret").unwrap();
         assert_ne!(
             ctx1.compute_hash("update", "", "{}").unwrap(),
             ctx2.compute_hash("update", "", "{}").unwrap()
@@ -1337,7 +1445,7 @@ mod tests {
 
     #[test]
     fn test_compute_hash_differs_on_changed_at() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"secret").unwrap();
         let h1 = ctx
             .compute_hash("delete", "2024-01-01T00:00:00Z", "{}")
             .unwrap();
@@ -1349,18 +1457,19 @@ mod tests {
 
     #[test]
     fn test_compute_hash_null_actor() {
-        let ctx = AuditContext::with_integrity(ActorId::None, b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::None, b"secret").unwrap();
         let h = ctx.compute_hash("update", "", "{}");
         assert!(h.is_some());
     }
 
     #[test]
     fn test_compute_hash_string_actor() {
-        let ctx = AuditContext::with_integrity(ActorId::String("uuid-abc".into()), b"secret");
+        let ctx =
+            AuditContext::with_integrity(ActorId::String("uuid-abc".into()), b"secret").unwrap();
         let h = ctx.compute_hash("update", "", "{}");
         assert!(h.is_some());
         // Must differ from Int actor with same string representation
-        let ctx2 = AuditContext::with_integrity(ActorId::Int(0), b"secret");
+        let ctx2 = AuditContext::with_integrity(ActorId::Int(0), b"secret").unwrap();
         assert_ne!(h.unwrap(), ctx2.compute_hash("update", "", "{}").unwrap());
     }
 
@@ -1370,7 +1479,7 @@ mod tests {
 
     #[test]
     fn test_verify_audit_row_valid() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
         let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
             verify_audit_row(
@@ -1388,7 +1497,7 @@ mod tests {
 
     #[test]
     fn test_verify_audit_row_tampered_data() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
         let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
             verify_audit_row(
@@ -1406,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_verify_audit_row_tampered_operation() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
         let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
             verify_audit_row(
@@ -1424,7 +1533,7 @@ mod tests {
 
     #[test]
     fn test_verify_audit_row_tampered_actor() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
         let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
             verify_audit_row(
@@ -1442,7 +1551,7 @@ mod tests {
 
     #[test]
     fn test_verify_audit_row_tampered_changed_at() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
         let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
             verify_audit_row(
@@ -1468,7 +1577,7 @@ mod tests {
 
     #[test]
     fn test_verify_audit_row_wrong_secret() {
-        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"correct-secret");
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"correct-secret").unwrap();
         let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
             verify_audit_row(
@@ -1524,6 +1633,145 @@ mod tests {
             verify_audit_row(b"secret", "delete", "7", TS, r#"{"id":1}"#, None, false),
             None
         );
+    }
+
+    // ── hex_encode ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hex_encode_empty() {
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn test_hex_encode_single_byte_boundaries() {
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0x0f]), "0f");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+    }
+
+    #[test]
+    fn test_hex_encode_known_bytes() {
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    #[test]
+    fn test_hex_encode_all_zeros() {
+        assert_eq!(hex_encode(&[0u8; 32]), "0".repeat(64));
+    }
+
+    #[test]
+    fn test_hex_encode_all_ones() {
+        assert_eq!(hex_encode(&[0xffu8; 32]), "f".repeat(64));
+    }
+
+    #[test]
+    fn test_hex_encode_large_input() {
+        // 1 MiB of cycling bytes — verifies no allocation panic and correct length.
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024 * 1024).collect();
+        let hex = hex_encode(&data);
+        assert_eq!(hex.len(), data.len() * 2);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(&hex[..2], "00");
+        assert_eq!(&hex[hex.len() - 2..], "ff");
+    }
+
+    #[test]
+    fn test_hex_encode_output_is_lowercase() {
+        // Uppercase input bytes must produce lowercase hex digits.
+        assert_eq!(hex_encode(&[0xAB, 0xCD, 0xEF]), "abcdef");
+    }
+
+    // ── AuditOperation ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_audit_operation_as_str_all_variants() {
+        assert_eq!(AuditOperation::Insert.as_str(), "insert");
+        assert_eq!(AuditOperation::Update.as_str(), "update");
+        assert_eq!(AuditOperation::Delete.as_str(), "delete");
+    }
+
+    #[test]
+    fn test_audit_operation_as_str_matches_check_constraint() {
+        // Every variant must appear in the CHECK constraint of the `operation` column.
+        let defs = audit_column_defs_for("t");
+        let check = defs[1].check.as_deref().unwrap_or("");
+        for op in [
+            AuditOperation::Insert,
+            AuditOperation::Update,
+            AuditOperation::Delete,
+        ] {
+            assert!(
+                check.contains(op.as_str()),
+                "CHECK constraint missing '{}': {check}",
+                op.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_audit_operation_eq_and_clone() {
+        assert_eq!(AuditOperation::Insert, AuditOperation::Insert);
+        assert_ne!(AuditOperation::Insert, AuditOperation::Delete);
+        let op = AuditOperation::Update;
+        assert_eq!(op, op.clone());
+    }
+
+    #[test]
+    fn test_audit_operation_debug() {
+        assert_eq!(format!("{:?}", AuditOperation::Insert), "Insert");
+        assert_eq!(format!("{:?}", AuditOperation::Update), "Update");
+        assert_eq!(format!("{:?}", AuditOperation::Delete), "Delete");
+    }
+
+    // ── constant_time_eq (extended) ───────────────────────────────────────
+
+    #[test]
+    fn test_constant_time_eq_empty_slices() {
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_constant_time_eq_single_byte_equal() {
+        assert!(constant_time_eq(b"x", b"x"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_single_byte_different() {
+        assert!(!constant_time_eq(b"a", b"b"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_differs_only_in_last_byte() {
+        let a = b"hello world!";
+        let mut b = *a;
+        b[b.len() - 1] ^= 0x01;
+        assert!(!constant_time_eq(a, &b));
+    }
+
+    #[test]
+    fn test_constant_time_eq_differs_only_in_first_byte() {
+        let a = b"hello world!";
+        let mut b = *a;
+        b[0] ^= 0x01;
+        assert!(!constant_time_eq(a, &b));
+    }
+
+    #[test]
+    fn test_constant_time_eq_all_zeros_vs_one_bit() {
+        let a = [0u8; 32];
+        let mut b = [0u8; 32];
+        b[15] = 1;
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_constant_time_eq_hmac_hex_length() {
+        // Real comparison path: 64-char hex strings produced by hex_encode(hmac_sha256(...)).
+        let mac_a = hex_encode(&[0xabu8; 32]);
+        let mac_b = hex_encode(&[0xabu8; 32]);
+        let mac_c = hex_encode(&[0xcdu8; 32]);
+        assert!(constant_time_eq(mac_a.as_bytes(), mac_b.as_bytes()));
+        assert!(!constant_time_eq(mac_a.as_bytes(), mac_c.as_bytes()));
     }
 
     // ── JSON escaping ─────────────────────────────────────────────────

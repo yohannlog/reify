@@ -174,20 +174,56 @@ pub(crate) fn write_returning(sql: &mut String, returning: &Option<Vec<&'static 
 /// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params.
 ///
 /// Call this on the SQL string returned by `build()` when targeting PostgreSQL.
-/// This is a pure string transformation with a single allocation.
+///
+/// ## Implementation
+///
+/// Operates on raw bytes: `?` is ASCII (0x3F) so it can never appear as a
+/// continuation byte of a multi-byte UTF-8 sequence. We scan bytes directly,
+/// copy non-`?` runs in bulk with `extend_from_slice`, and only format the
+/// `$N` token when we hit a placeholder. The output capacity is pre-computed
+/// from the placeholder count to avoid reallocations.
 #[cfg(feature = "postgres")]
 pub fn rewrite_placeholders_pg(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len() + 16);
+    let bytes = sql.as_bytes();
+
+    // Count placeholders to pre-size the output buffer.
+    // Each `?` (1 byte) is replaced by `$N` (2–11 bytes); reserve for `$N` up
+    // to u32::MAX but in practice SQL never has more than a few hundred params.
+    let n_placeholders = bytecount_question_marks(bytes);
+    // Worst case: every `?` becomes `$4294967295` (11 chars). In practice
+    // params are small numbers, so this slightly over-allocates but avoids
+    // any reallocation.
+    let extra = n_placeholders.saturating_mul(10); // `$N` adds at most 10 extra bytes
+    let mut result = String::with_capacity(sql.len() + extra);
+
     let mut idx = 1u32;
-    for ch in sql.chars() {
-        if ch == '?' {
+    let mut start = 0usize;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'?' {
+            // SAFETY: `start..i` is a valid UTF-8 sub-slice because:
+            // 1. `sql` is valid UTF-8.
+            // 2. `?` (0x3F) is ASCII and cannot be a UTF-8 continuation byte,
+            //    so splitting at any `?` position always lands on a char boundary.
+            result.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
             let _ = write!(result, "${idx}");
             idx += 1;
-        } else {
-            result.push(ch);
+            start = i + 1; // skip the `?` byte
         }
     }
+    // Append the tail after the last placeholder (or the whole string if none).
+    result.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..]) });
     result
+}
+
+/// Count the number of `?` bytes in a byte slice.
+///
+/// Kept as a separate function so it can be inlined and auto-vectorised by
+/// the compiler independently of the main rewrite loop.
+#[cfg(feature = "postgres")]
+#[inline]
+fn bytecount_question_marks(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == b'?').count()
 }
 
 // ── Aggregate expressions ───────────────────────────────────────────
