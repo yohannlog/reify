@@ -141,7 +141,7 @@ impl MigrationRunner {
     /// Register a `Table` type that has `#[table(audit)]` for automatic diff-based migration.
     ///
     /// Registers both the main table (via `add_table::<T>()`) and a synthetic audit companion
-    /// table (`<table>_audit`) with the 5 fixed audit columns.
+    /// table (`<table>_audit`) with the 6 fixed audit columns.
     pub fn add_audited_table<T: Table + crate::audit::Auditable>(mut self) -> Self {
         self = self.add_table::<T>();
         let audit_defs = T::audit_column_defs();
@@ -159,8 +159,9 @@ impl MigrationRunner {
 
     /// Register a `Table` type with explicit `Schema` metadata, plus its audit companion table.
     ///
-    /// Same as `add_audited_table` but delegates the main table registration to
-    /// `add_table_with_schema(schema)` for users who define their schema via the builder API.
+    /// Same as [`add_audited_table`](Self::add_audited_table) but delegates the main table
+    /// registration to `add_table_with_schema(schema)` for users who define their schema via
+    /// the builder API.
     pub fn add_audited_table_with_schema<T>(mut self, schema: crate::schema::TableSchema<T>) -> Self
     where
         T: Table + crate::audit::Auditable,

@@ -774,7 +774,11 @@ mod tests {
     fn row_get_by_name_returns_correct_value() {
         let row = Row::new(
             vec!["id".into(), "name".into(), "active".into()],
-            vec![Value::I64(7), Value::String("alice".into()), Value::Bool(true)],
+            vec![
+                Value::I64(7),
+                Value::String("alice".into()),
+                Value::Bool(true),
+            ],
         );
         assert_eq!(row.get("id"), Some(&Value::I64(7)));
         assert_eq!(row.get("name"), Some(&Value::String("alice".into())));

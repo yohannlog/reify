@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use reify::{
-    AuditContext, Auditable, Database, DbError, MigrationRunner, Row, SqlType, TransactionFn,
-    Value, audit::values_to_json_string,
+    ActorId, AuditContext, Auditable, Database, DbError, MigrationRunner, Row, SqlType,
+    TransactionFn, Value, audit::values_to_json_string,
 };
 
 // ── MockDb ───────────────────────────────────────────────────────────
@@ -130,9 +130,12 @@ fn audit_column_defs_types() {
     let defs = AuditUser::audit_column_defs();
     assert_eq!(defs[0].sql_type, SqlType::BigSerial);
     assert!(defs[0].primary_key);
+    // operation: TEXT NOT NULL with CHECK constraint
     assert_eq!(defs[1].sql_type, SqlType::Text);
     assert!(!defs[1].nullable);
-    assert_eq!(defs[2].sql_type, SqlType::BigInt);
+    assert!(defs[1].check.as_deref().unwrap_or("").contains("insert"));
+    // actor_id: TEXT NULL (supports i64, UUID, string)
+    assert_eq!(defs[2].sql_type, SqlType::Text);
     assert!(defs[2].nullable);
     assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
     assert_eq!(defs[3].default, Some("NOW()".to_string()));
@@ -235,21 +238,92 @@ fn json_string_escaping() {
     assert_eq!(json, r#"{"msg":"say \"hi\""}"#);
 }
 
+// ── audited_insert ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn audited_insert_executes_insert_and_audit_row() {
+    let db = MockDb::new();
+    let ctx = AuditContext::new(ActorId::Int(99));
+
+    let user = AuditUser {
+        id: 0,
+        email: "new@example.com".into(),
+        role: None,
+    };
+    let builder = AuditUser::insert(&user);
+
+    reify::audited_insert(&db, builder, &ctx).await.unwrap();
+
+    let sqls = db.executed_sql();
+    assert_eq!(
+        sqls.len(),
+        2,
+        "expected INSERT + audit INSERT, got: {sqls:?}"
+    );
+    assert!(
+        sqls[0].starts_with("INSERT INTO \"users\""),
+        "first SQL should be INSERT: {}",
+        sqls[0]
+    );
+    assert!(
+        sqls[1].contains("INSERT INTO \"users_audit\""),
+        "second SQL should be audit INSERT: {}",
+        sqls[1]
+    );
+    // operation param should be "insert"
+    let params = db.executed_params();
+    assert_eq!(params[1][0], Value::String("insert".into()));
+}
+
+#[tokio::test]
+async fn audited_insert_stores_actor_id() {
+    let db = MockDb::new();
+    let ctx = AuditContext::new(ActorId::Int(7));
+    let user = AuditUser {
+        id: 0,
+        email: "a@b.com".into(),
+        role: None,
+    };
+    reify::audited_insert(&db, AuditUser::insert(&user), &ctx)
+        .await
+        .unwrap();
+    let params = db.executed_params();
+    assert_eq!(params[1][1], Value::I64(7), "actor_id should be 7");
+}
+
+#[tokio::test]
+async fn audited_insert_null_actor() {
+    let db = MockDb::new();
+    let ctx = AuditContext::new(ActorId::None);
+    let user = AuditUser {
+        id: 0,
+        email: "a@b.com".into(),
+        role: None,
+    };
+    reify::audited_insert(&db, AuditUser::insert(&user), &ctx)
+        .await
+        .unwrap();
+    let params = db.executed_params();
+    assert_eq!(params[1][1], Value::Null, "actor_id should be NULL");
+}
+
 // ── audited_update ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn audited_update_executes_update_and_audit_insert() {
     let db = MockDb::new();
 
-    // Pre-load the SELECT FOR UPDATE result (before-image of the row being updated).
-    let old_row = Row::new(
-        vec!["id".into(), "email".into(), "role".into()],
-        vec![Value::I64(1), Value::String("old@example.com".into()), Value::Null],
-    );
-    db.push_rows(vec![old_row]);
+    // Pre-load SELECT FOR UPDATE (before-image) + SELECT (after-image).
+    let make_row = |email: &str| {
+        Row::new(
+            vec!["id".into(), "email".into(), "role".into()],
+            vec![Value::I64(1), Value::String(email.into()), Value::Null],
+        )
+    };
+    db.push_rows(vec![make_row("old@example.com")]); // SELECT FOR UPDATE
+    db.push_rows(vec![make_row("new@example.com")]); // SELECT after-image
 
-    let ctx = AuditContext { actor_id: Some(42), hmac_secret: None };
-
+    let ctx = AuditContext::new(ActorId::Int(42));
     let builder = AuditUser::update()
         .set(AuditUser::email, "new@example.com")
         .filter(AuditUser::id.eq(1i64));
@@ -257,7 +331,11 @@ async fn audited_update_executes_update_and_audit_insert() {
     reify::audited_update(&db, builder, &ctx).await.unwrap();
 
     let sqls = db.executed_sql();
-    assert_eq!(sqls.len(), 2, "expected UPDATE + INSERT, got: {sqls:?}");
+    assert_eq!(
+        sqls.len(),
+        2,
+        "expected UPDATE + audit INSERT, got: {sqls:?}"
+    );
     assert!(
         sqls[0].starts_with("UPDATE \"users\" SET"),
         "first SQL should be UPDATE: {}",
@@ -271,18 +349,62 @@ async fn audited_update_executes_update_and_audit_insert() {
 }
 
 #[tokio::test]
+async fn audited_update_row_data_contains_before_and_after() {
+    let db = MockDb::new();
+
+    let make_row = |email: &str| {
+        Row::new(
+            vec!["id".into(), "email".into(), "role".into()],
+            vec![Value::I64(1), Value::String(email.into()), Value::Null],
+        )
+    };
+    db.push_rows(vec![make_row("old@example.com")]);
+    db.push_rows(vec![make_row("new@example.com")]);
+
+    let ctx = AuditContext::new(ActorId::Int(1));
+    let builder = AuditUser::update()
+        .set(AuditUser::email, "new@example.com")
+        .filter(AuditUser::id.eq(1i64));
+
+    reify::audited_update(&db, builder, &ctx).await.unwrap();
+
+    let params = db.executed_params();
+    let row_data = match &params[1][2] {
+        Value::String(s) => s.clone(),
+        other => panic!("expected String row_data, got {other:?}"),
+    };
+    assert!(
+        row_data.contains("\"before\""),
+        "row_data must contain 'before': {row_data}"
+    );
+    assert!(
+        row_data.contains("\"after\""),
+        "row_data must contain 'after': {row_data}"
+    );
+    assert!(
+        row_data.contains("old@example.com"),
+        "before must contain old email: {row_data}"
+    );
+    assert!(
+        row_data.contains("new@example.com"),
+        "after must contain new email: {row_data}"
+    );
+}
+
+#[tokio::test]
 async fn audited_update_null_actor() {
     let db = MockDb::new();
 
-    // Pre-load the SELECT FOR UPDATE result so the audit INSERT fires.
-    let old_row = Row::new(
-        vec!["id".into(), "email".into(), "role".into()],
-        vec![Value::I64(1), Value::String("old@example.com".into()), Value::Null],
-    );
-    db.push_rows(vec![old_row]);
+    let make_row = |email: &str| {
+        Row::new(
+            vec!["id".into(), "email".into(), "role".into()],
+            vec![Value::I64(1), Value::String(email.into()), Value::Null],
+        )
+    };
+    db.push_rows(vec![make_row("old@example.com")]);
+    db.push_rows(vec![make_row("new@example.com")]);
 
-    let ctx = AuditContext { actor_id: None, hmac_secret: None };
-
+    let ctx = AuditContext::new(ActorId::None);
     let builder = AuditUser::update()
         .set(AuditUser::email, "x@example.com")
         .filter(AuditUser::id.eq(1i64));
@@ -311,7 +433,7 @@ async fn audited_delete_captures_rows_and_inserts_audit() {
     );
     db.push_rows(vec![old_row]);
 
-    let ctx = AuditContext { actor_id: Some(7), hmac_secret: None };
+    let ctx = AuditContext::new(ActorId::Int(7));
     let builder = AuditUser::delete().filter(AuditUser::id.eq(1i64));
 
     reify::audited_delete::<AuditUser>(&db, builder, &ctx)
@@ -350,7 +472,7 @@ async fn audited_delete_no_rows_no_audit_insert() {
     // SELECT returns empty — nothing to delete
     db.push_rows(vec![]);
 
-    let ctx = AuditContext { actor_id: Some(1), hmac_secret: None };
+    let ctx = AuditContext::new(ActorId::Int(1));
     let builder = AuditUser::delete().filter(AuditUser::id.eq(999i64));
 
     reify::audited_delete::<AuditUser>(&db, builder, &ctx)

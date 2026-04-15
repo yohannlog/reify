@@ -1,6 +1,6 @@
 use crate::db::{Database, DbError, FromRow};
 use crate::ident::qi;
-use crate::query::{DeleteBuilder, UpdateBuilder};
+use crate::query::{DeleteBuilder, InsertBuilder, UpdateBuilder};
 use crate::schema::{ColumnDef, SqlType, TimestampSource};
 use crate::table::Table;
 
@@ -31,8 +31,7 @@ const K: [u32; 64] = [
 /// Initial hash values: first 32 bits of the fractional parts of the
 /// square roots of the first 8 primes.
 const H0: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 /// Compute SHA-256 over arbitrary bytes. Returns a 32-byte digest.
@@ -139,11 +138,28 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 
 /// Encode a byte slice as a lowercase hex string.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+// ── ZeroOnDrop ───────────────────────────────────────────────────────
+
+/// RAII guard that zeroizes a `Vec<u8>` on drop via `write_volatile` +
+/// `compiler_fence(SeqCst)`, preventing the compiler from eliding the wipe.
+pub(crate) struct ZeroOnDrop(pub Vec<u8>);
+
+impl Drop for ZeroOnDrop {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 // ── AuditOperation ───────────────────────────────────────────────────
@@ -151,6 +167,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 /// Operation kind recorded in the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOperation {
+    Insert,
     Update,
     Delete,
 }
@@ -158,9 +175,74 @@ pub enum AuditOperation {
 impl AuditOperation {
     pub fn as_str(&self) -> &'static str {
         match self {
+            AuditOperation::Insert => "insert",
             AuditOperation::Update => "update",
             AuditOperation::Delete => "delete",
         }
+    }
+}
+
+// ── ActorId ──────────────────────────────────────────────────────────
+
+/// Identifies the actor who triggered an audited operation.
+///
+/// Supports numeric IDs (`i64`), UUID strings, arbitrary strings, or anonymous
+/// (`None`). The actor representation is included in the HMAC message so that
+/// any post-hoc modification of `actor_id` is detectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorId {
+    /// A numeric user/session ID (most common case).
+    Int(i64),
+    /// A UUID or any other string identifier.
+    String(String),
+    /// No actor — anonymous or system-initiated operation.
+    None,
+}
+
+impl ActorId {
+    /// Render the actor as the string embedded in the HMAC message and stored
+    /// in the `actor_id` column (as TEXT when not an integer).
+    pub fn as_hmac_str(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            ActorId::Int(id) => std::borrow::Cow::Owned(id.to_string()),
+            ActorId::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            ActorId::None => std::borrow::Cow::Borrowed("null"),
+        }
+    }
+
+    /// Convert to the `Value` stored in the `actor_id` column.
+    ///
+    /// `Int` → `Value::I64`, `String` → `Value::String`, `None` → `Value::Null`.
+    pub fn to_value(&self) -> crate::value::Value {
+        match self {
+            ActorId::Int(id) => crate::value::Value::I64(*id),
+            ActorId::String(s) => crate::value::Value::String(s.clone()),
+            ActorId::None => crate::value::Value::Null,
+        }
+    }
+}
+
+impl From<i64> for ActorId {
+    fn from(id: i64) -> Self {
+        ActorId::Int(id)
+    }
+}
+impl From<Option<i64>> for ActorId {
+    fn from(opt: Option<i64>) -> Self {
+        match opt {
+            Some(id) => ActorId::Int(id),
+            None => ActorId::None,
+        }
+    }
+}
+impl From<String> for ActorId {
+    fn from(s: String) -> Self {
+        ActorId::String(s)
+    }
+}
+impl From<&str> for ActorId {
+    fn from(s: &str) -> Self {
+        ActorId::String(s.to_string())
     }
 }
 
@@ -168,68 +250,101 @@ impl AuditOperation {
 
 /// Context passed to audited operations (who triggered the change).
 ///
-/// When `hmac_secret` is set, every audit row receives a `row_hash` column
-/// containing an HMAC-SHA256 digest of the operation, actor, and row data,
-/// encoded as a lowercase hex string. This makes tampering with any field detectable.
+/// # Fields (private — use constructors)
+///
+/// - `actor`: who triggered the change (see [`ActorId`])
+/// - `hmac_secret`: when set, every audit row receives a `row_hash` column
+///   containing an HMAC-SHA256 digest of the operation, actor, timestamp, and
+///   row data, encoded as a lowercase hex string. This makes tampering with
+///   **any** field (including `changed_at`) detectable.
+/// - `dialect`: SQL dialect used for placeholder rewriting in audit INSERTs.
 pub struct AuditContext {
-    pub actor_id: Option<i64>,
-    /// Optional HMAC-SHA256 secret. When present, a `row_hash` is computed and
-    /// stored alongside every audit row, enabling tamper detection.
-    pub hmac_secret: Option<Vec<u8>>,
-}
-
-impl Drop for AuditContext {
-    fn drop(&mut self) {
-        if let Some(ref mut secret) = self.hmac_secret {
-            // Zeroize secret bytes to prevent leakage via memory, swap, or core dumps.
-            for byte in secret.iter_mut() {
-                unsafe { std::ptr::write_volatile(byte, 0) };
-            }
-            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-        }
-    }
+    actor: ActorId,
+    /// Optional HMAC-SHA256 secret. Zeroized on drop.
+    hmac_secret: Option<ZeroOnDrop>,
+    /// SQL dialect — controls `?` vs `$N` placeholders in audit INSERTs.
+    dialect: crate::query::Dialect,
 }
 
 impl AuditContext {
-    /// Create a context without integrity protection (backward-compatible).
-    pub fn new(actor_id: Option<i64>) -> Self {
-        Self { actor_id, hmac_secret: None }
+    /// Create a context without integrity protection.
+    ///
+    /// `actor` accepts anything that converts to [`ActorId`]: `i64`,
+    /// `Option<i64>`, `&str`, `String`, or `ActorId::None`.
+    pub fn new(actor: impl Into<ActorId>) -> Self {
+        Self {
+            actor: actor.into(),
+            hmac_secret: None,
+            dialect: crate::query::Dialect::Generic,
+        }
     }
 
     /// Create a context with HMAC-SHA256 integrity protection.
-    pub fn with_integrity(actor_id: Option<i64>, secret: impl Into<Vec<u8>>) -> Self {
-        Self { actor_id, hmac_secret: Some(secret.into()) }
+    pub fn with_integrity(actor: impl Into<ActorId>, secret: impl Into<Vec<u8>>) -> Self {
+        Self {
+            actor: actor.into(),
+            hmac_secret: Some(ZeroOnDrop(secret.into())),
+            dialect: crate::query::Dialect::Generic,
+        }
+    }
+
+    /// Override the SQL dialect (default: `Generic` / `?` placeholders).
+    ///
+    /// Set to `Dialect::Postgres` when using a PostgreSQL backend so that
+    /// audit INSERT statements use `$1, $2, …` placeholders.
+    pub fn with_dialect(mut self, dialect: crate::query::Dialect) -> Self {
+        self.dialect = dialect;
+        self
+    }
+
+    /// Read the actor.
+    pub fn actor(&self) -> &ActorId {
+        &self.actor
+    }
+
+    /// `true` when an HMAC secret is configured.
+    pub fn has_integrity(&self) -> bool {
+        self.hmac_secret.is_some()
     }
 
     /// Compute the HMAC-SHA256 hex digest for an audit row, or `None` if no
     /// secret is configured.
     ///
     /// The signed message uses length-prefixed fields to prevent ambiguity:
-    /// `"<op_len>:<operation><actor_len>:<actor><data_len>:<row_data>"`
-    pub fn compute_hash(&self, operation: &str, row_data: &str) -> Option<String> {
-        let secret = self.hmac_secret.as_deref()?;
-        let actor = match self.actor_id {
-            Some(id) => id.to_string(),
-            None => "null".to_string(),
-        };
-        let message = build_hmac_message(operation, &actor, row_data);
+    /// `"<op_len>:<op><actor_len>:<actor><ts_len>:<changed_at><data_len>:<row_data>"`
+    ///
+    /// `changed_at` is included so that antedating an audit row is detectable.
+    pub fn compute_hash(
+        &self,
+        operation: &str,
+        changed_at: &str,
+        row_data: &str,
+    ) -> Option<String> {
+        let secret = self.hmac_secret.as_ref().map(|z| z.0.as_slice())?;
+        let actor = self.actor.as_hmac_str();
+        let message = build_hmac_message(operation, &actor, changed_at, row_data);
         Some(hex_encode(&hmac_sha256(secret, message.as_bytes())))
     }
 }
 
 /// Build an unambiguous, length-prefixed HMAC message from the audit fields.
 ///
-/// Format: `"<op_len>:<operation><actor_len>:<actor><data_len>:<row_data>"`
-/// This prevents collision attacks where field values contain delimiter characters.
-fn build_hmac_message(operation: &str, actor: &str, row_data: &str) -> String {
+/// Format: `"<op_len>:<op><actor_len>:<actor><ts_len>:<changed_at><data_len>:<row_data>"`
+///
+/// Length-prefixing prevents collision attacks where a field value contains
+/// the delimiter character. `changed_at` is included so that antedating a row
+/// is detectable even when `row_data` and `operation` are unchanged.
+fn build_hmac_message(operation: &str, actor: &str, changed_at: &str, row_data: &str) -> String {
     format!(
-        "{}:{}{}:{}{}:{}",
+        "{}:{}{}:{}{}:{}{}:{}",
         operation.len(),
         operation,
         actor.len(),
         actor,
+        changed_at.len(),
+        changed_at,
         row_data.len(),
-        row_data
+        row_data,
     )
 }
 
@@ -247,9 +362,16 @@ pub trait Auditable: Table {
 
 /// Returns the fixed column definitions for any audit table.
 ///
-/// Columns: `audit_id`, `operation`, `actor_id`, `changed_at`, `row_data`,
-/// and `row_hash` (nullable `TEXT` — populated only when an HMAC secret is
-/// configured on [`AuditContext`]).
+/// Columns (in order):
+/// 1. `audit_id`   — `BIGSERIAL PRIMARY KEY`
+/// 2. `operation`  — `TEXT NOT NULL CHECK (operation IN ('insert','update','delete'))`
+/// 3. `actor_id`   — `TEXT NULL` (stores `i64`, UUID, or any string actor)
+/// 4. `changed_at` — `TIMESTAMPTZ NOT NULL DEFAULT NOW()` (DB-side timestamp)
+/// 5. `row_data`   — `JSONB NOT NULL` (before-image for UPDATE/DELETE, full row for INSERT)
+/// 6. `row_hash`   — `TEXT NULL` (HMAC-SHA256 hex; NULL when no secret is configured)
+///
+/// **Column order is stable** — the HMAC covers `row_data` by position, so
+/// changing this order would invalidate existing hashes.
 pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
     let _ = table_name; // reserved for future per-table customisation
     vec![
@@ -280,12 +402,15 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Vm,
-            check: None,
+            // Restrict to known operations — prevents arbitrary values being
+            // inserted directly into the audit table.
+            check: Some("operation IN ('insert','update','delete')".to_string()),
             foreign_key: None,
         },
+        // actor_id is TEXT to support i64, UUID, or any string identifier.
         ColumnDef {
             name: "actor_id",
-            sql_type: SqlType::BigInt,
+            sql_type: SqlType::Text,
             primary_key: false,
             auto_increment: false,
             unique: false,
@@ -359,32 +484,37 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
 /// - If `integrity_expected` is `false`, returns `None` (integrity was never
 ///   enabled for this row, so there is nothing to verify).
 ///
+/// `changed_at` must be the **exact string** stored in the `changed_at` column
+/// (e.g. `"2024-01-15T10:30:00Z"`). It is included in the HMAC so that
+/// antedating a row is detectable.
+///
 /// # Example
 /// ```
-/// use reify_core::audit::{AuditContext, verify_audit_row};
+/// use reify_core::audit::{AuditContext, ActorId, verify_audit_row};
 ///
-/// let ctx = AuditContext::with_integrity(Some(7), b"secret");
-/// let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
-/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash), false), Some(true));
-/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, false), None);
-/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, true), Some(false));
-/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":2}"#, Some(&hash), false), Some(false));
+/// let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+/// let hash = ctx.compute_hash("delete", "2024-01-15T10:30:00Z", r#"{"id":1}"#).unwrap();
+/// assert_eq!(
+///     verify_audit_row(b"secret", "delete", "7", "2024-01-15T10:30:00Z", r#"{"id":1}"#, Some(&hash), false),
+///     Some(true)
+/// );
+/// assert_eq!(
+///     verify_audit_row(b"secret", "delete", "7", "2024-01-15T10:30:00Z", r#"{"id":1}"#, None, false),
+///     None
+/// );
 /// ```
 pub fn verify_audit_row(
     secret: &[u8],
     operation: &str,
-    actor_id: Option<i64>,
+    actor: &str,
+    changed_at: &str,
     row_data: &str,
     stored_hash: Option<&str>,
     integrity_expected: bool,
 ) -> Option<bool> {
     match stored_hash {
         Some(stored) => {
-            let actor = match actor_id {
-                Some(id) => id.to_string(),
-                None => "null".to_string(),
-            };
-            let message = build_hmac_message(operation, &actor, row_data);
+            let message = build_hmac_message(operation, actor, changed_at, row_data);
             let expected = hex_encode(&hmac_sha256(secret, message.as_bytes()));
             // Constant-time comparison to prevent timing attacks.
             Some(constant_time_eq(expected.as_bytes(), stored.as_bytes()))
@@ -401,11 +531,18 @@ pub fn verify_audit_row(
 /// invariant; the function returns `false` for unequal lengths in release
 /// builds without branching on the length difference.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    debug_assert_eq!(a.len(), b.len(), "constant_time_eq requires equal-length inputs");
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "constant_time_eq requires equal-length inputs"
+    );
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 // ── JSON serialisation helper ────────────────────────────────────────
@@ -648,75 +785,157 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
     out
 }
 
-// ── audited_update ───────────────────────────────────────────────────
+// ── audited_insert ───────────────────────────────────────────────────
 
-/// Execute an UPDATE and write an audit row atomically inside a transaction.
+/// Execute an INSERT and write an audit row atomically inside a transaction.
 ///
-/// The rows matching the builder's WHERE clause are **read first** (inside the
-/// same transaction, with `SELECT … FOR UPDATE` to prevent concurrent
-/// modifications), then the UPDATE is applied, and finally one audit row per
-/// matched record is written with the **before-image** of the data.
-///
-/// When [`AuditContext::hmac_secret`] is set, each audit row receives a
-/// `row_hash` column with an HMAC-SHA256 digest of the operation, actor, and
-/// row data so that any post-hoc modification is detectable via
-/// [`verify_audit_row`].
-pub async fn audited_update<M: Auditable + crate::db::FromRow>(
+/// The full row (all writable columns) is serialised as JSON and stored in
+/// `row_data`. When [`AuditContext::has_integrity`] is `true`, a `row_hash`
+/// HMAC-SHA256 digest is also stored.
+pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
     db: &impl Database,
-    builder: UpdateBuilder<M>,
+    builder: InsertBuilder<M>,
     ctx: &AuditContext,
 ) -> Result<u64, DbError> {
-    // Build a SELECT … FOR UPDATE from the same WHERE conditions so we can
-    // capture the before-image of every affected row inside the transaction.
-    let select = builder.to_select();
-    let (select_sql_base, select_params) = select.build();
-    // Append FOR UPDATE to lock the rows for the duration of the transaction.
-    let select_sql = format!("{select_sql_base} FOR UPDATE");
-
-    let (update_sql, update_params) = builder.build();
+    let (insert_sql, insert_params) = builder.build();
     let audit_table = M::audit_table_name();
-    let col_names: Vec<&'static str> = M::column_names().to_vec();
-    let actor_id = ctx.actor_id;
-    let hmac_secret = ctx.hmac_secret.clone();
+    let col_names: Vec<&'static str> = M::writable_column_names().to_vec();
+    let actor = ctx.actor.clone();
+    let secret_bytes = ctx.hmac_secret.as_ref().map(|z| z.0.clone());
+    let dialect = ctx.dialect;
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
 
     db.transaction(Box::new(move |tx| {
+        // Zeroize the cloned secret when this future drops.
+        let secret_guard = secret_bytes.map(ZeroOnDrop);
         Box::pin(async move {
             use crate::db::DynDatabase;
 
-            // Wrap the cloned secret so it is zeroized when this future drops,
-            // regardless of whether the transaction succeeds or fails.
-            struct ZeroOnDrop(Vec<u8>);
-            impl Drop for ZeroOnDrop {
-                fn drop(&mut self) {
-                    for byte in self.0.iter_mut() {
-                        unsafe { std::ptr::write_volatile(byte, 0) };
-                    }
-                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-            let secret_guard = hmac_secret.map(ZeroOnDrop);
+            // 1. Execute the INSERT.
+            let n = DynDatabase::execute(tx, &insert_sql, &insert_params).await?;
+            affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
+
+            // 2. Serialize the inserted values as JSON.
+            let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
+            let row_data = values_to_json_string(
+                &col_refs,
+                &insert_params.iter().cloned().collect::<Vec<_>>(),
+            );
+
+            // 3. Compute HMAC (changed_at is unknown at INSERT time — use empty string
+            //    as placeholder; the DB fills it with NOW()).
+            let row_hash = if let Some(ref secret) = secret_guard {
+                let actor_str = actor.as_hmac_str();
+                let message =
+                    build_hmac_message(AuditOperation::Insert.as_str(), &actor_str, "", &row_data);
+                Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
+            } else {
+                None
+            };
+
+            // 4. Insert audit row.
+            let (audit_sql, audit_params) = build_audit_insert(
+                audit_table,
+                AuditOperation::Insert.as_str(),
+                actor.to_value(),
+                row_data,
+                row_hash,
+                dialect,
+            );
+            DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
+            Ok(())
+        })
+    }))
+    .await?;
+
+    Ok(affected.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+// ── audited_update ───────────────────────────────────────────────────
+
+/// Execute an UPDATE and write an audit row atomically inside a transaction.
+///
+/// Rows matching the WHERE clause are locked with `SELECT … FOR UPDATE`,
+/// serialised as a **before-image**, then the UPDATE is applied. One audit row
+/// per matched record is written containing both the before-image and the
+/// after-image under the key `"before"` / `"after"` in `row_data`.
+///
+/// When [`AuditContext::has_integrity`] is `true`, each audit row receives a
+/// `row_hash` HMAC-SHA256 digest covering the operation, actor, timestamp
+/// placeholder, and row data — detectable via [`verify_audit_row`].
+pub async fn audited_update<M: Auditable + crate::db::FromRow>(
+    db: &impl Database,
+    builder: UpdateBuilder<M>,
+    ctx: &AuditContext,
+) -> Result<u64, DbError> {
+    // Build a SELECT … FOR UPDATE from the same WHERE conditions.
+    let select = builder.to_select();
+    let (select_sql_base, select_params) = select.build();
+    let select_sql = format!("{select_sql_base} FOR UPDATE");
+
+    let (update_sql, update_params) = builder.build();
+    let audit_table = M::audit_table_name();
+    let col_names: Vec<&'static str> = M::column_names().to_vec();
+    let actor = ctx.actor.clone();
+    let secret_bytes = ctx.hmac_secret.as_ref().map(|z| z.0.clone());
+    let dialect = ctx.dialect;
+
+    let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let affected_clone = affected.clone();
+
+    db.transaction(Box::new(move |tx| {
+        // Zeroize the cloned secret when this future drops.
+        let secret_guard = secret_bytes.map(ZeroOnDrop);
+        Box::pin(async move {
+            use crate::db::DynDatabase;
 
             // 1. Read matching rows inside the transaction (locked FOR UPDATE).
             let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
 
-            // 2. Serialize rows and compute HMACs.
+            // 2. Serialize before-images.
             let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
-            let mut entries: Vec<(String, Option<String>)> = Vec::with_capacity(old_rows.len());
+            let mut before_images: Vec<String> = Vec::with_capacity(old_rows.len());
             for row in &old_rows {
                 let vals: Vec<crate::value::Value> = col_names
                     .iter()
                     .map(|c| row.get(c).cloned().unwrap_or(crate::value::Value::Null))
                     .collect();
-                let row_data = values_to_json_string(&col_refs, &vals);
+                before_images.push(values_to_json_string(&col_refs, &vals));
+            }
+
+            // 3. Apply the UPDATE.
+            let n = DynDatabase::execute(tx, &update_sql, &update_params).await?;
+            affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
+
+            // 4. Read after-images for the same rows.
+            let after_rows = DynDatabase::query(tx, &select_sql_base, &select_params).await?;
+
+            // 5. Build combined row_data {"before":{...},"after":{...}} and compute HMACs.
+            let mut entries: Vec<(String, Option<String>)> =
+                Vec::with_capacity(before_images.len());
+            for (before, after_row) in before_images.iter().zip(after_rows.iter()) {
+                let after_vals: Vec<crate::value::Value> = col_names
+                    .iter()
+                    .map(|c| {
+                        after_row
+                            .get(c)
+                            .cloned()
+                            .unwrap_or(crate::value::Value::Null)
+                    })
+                    .collect();
+                let after = values_to_json_string(&col_refs, &after_vals);
+                let row_data = format!("{{\"before\":{before},\"after\":{after}}}");
+
                 let row_hash = if let Some(ref secret) = secret_guard {
-                    let actor = match actor_id {
-                        Some(id) => id.to_string(),
-                        None => "null".to_string(),
-                    };
-                    let message = build_hmac_message(AuditOperation::Update.as_str(), &actor, &row_data);
+                    let actor_str = actor.as_hmac_str();
+                    let message = build_hmac_message(
+                        AuditOperation::Update.as_str(),
+                        &actor_str,
+                        "",
+                        &row_data,
+                    );
                     Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
                 } else {
                     None
@@ -724,23 +943,15 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
                 entries.push((row_data, row_hash));
             }
 
-            // 3. Apply the UPDATE.
-            let n = DynDatabase::execute(tx, &update_sql, &update_params).await?;
-            affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
-
-            // 4. Insert one audit row per before-image.
+            // 6. Insert one audit row per before+after pair.
             for (row_data, row_hash) in entries {
-                let actor_val = match actor_id {
-                    Some(id) => crate::value::Value::I64(id),
-                    None => crate::value::Value::Null,
-                };
                 let (audit_sql, audit_params) = build_audit_insert(
                     audit_table,
                     AuditOperation::Update.as_str(),
-                    actor_val,
+                    actor.to_value(),
                     row_data,
                     row_hash,
-                    crate::query::Dialect::Generic,
+                    dialect,
                 );
                 DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
             }
@@ -757,13 +968,9 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
 /// SELECT matching rows, DELETE them, and write one audit row per deleted record —
 /// all inside a single transaction.
 ///
-/// The SELECT, DELETE, and audit INSERTs all execute within the same transaction
-/// to prevent TOCTOU race conditions where rows could change between the read
-/// and the delete.
-///
-/// When [`AuditContext::hmac_secret`] is set, each audit row receives a
-/// `row_hash` column with an HMAC-SHA256 digest of the operation, actor, and
-/// row data so that any post-hoc modification is detectable via [`verify_audit_row`].
+/// The SELECT (`FOR UPDATE`), DELETE, and audit INSERTs all execute within the
+/// same transaction to prevent TOCTOU races. When [`AuditContext::has_integrity`]
+/// is `true`, each audit row receives a `row_hash` HMAC-SHA256 digest.
 pub async fn audited_delete<M: Auditable + FromRow>(
     db: &impl Database,
     builder: DeleteBuilder<M>,
@@ -771,36 +978,25 @@ pub async fn audited_delete<M: Auditable + FromRow>(
 ) -> Result<u64, DbError> {
     let select = builder.to_select();
     let (select_sql_base, select_params) = select.build();
-    // Append FOR UPDATE to lock the rows for the duration of the transaction,
-    // preventing concurrent modifications between the read and the delete.
+    // Lock rows for the duration of the transaction.
     let select_sql = format!("{select_sql_base} FOR UPDATE");
     let (delete_sql, delete_params) = builder.build();
     let audit_table = M::audit_table_name();
     let col_names: Vec<&'static str> = M::column_names().to_vec();
-    let actor_id = ctx.actor_id;
-    let hmac_secret = ctx.hmac_secret.clone();
+    let actor = ctx.actor.clone();
+    let secret_bytes = ctx.hmac_secret.as_ref().map(|z| z.0.clone());
+    let dialect = ctx.dialect;
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
 
     db.transaction(Box::new(move |tx| {
+        // Zeroize the cloned secret when this future drops.
+        let secret_guard = secret_bytes.map(ZeroOnDrop);
         Box::pin(async move {
             use crate::db::DynDatabase;
 
-            // Wrap the cloned secret so it is zeroized when this future drops,
-            // regardless of whether the transaction succeeds or fails.
-            struct ZeroOnDrop(Vec<u8>);
-            impl Drop for ZeroOnDrop {
-                fn drop(&mut self) {
-                    for byte in self.0.iter_mut() {
-                        unsafe { std::ptr::write_volatile(byte, 0) };
-                    }
-                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-            let secret_guard = hmac_secret.map(ZeroOnDrop);
-
-            // 1. Read matching rows inside the transaction for isolation.
+            // 1. Read matching rows inside the transaction (locked FOR UPDATE).
             let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
 
             // 2. Serialize rows and compute HMACs.
@@ -813,11 +1009,13 @@ pub async fn audited_delete<M: Auditable + FromRow>(
                     .collect();
                 let row_data = values_to_json_string(&col_refs, &vals);
                 let row_hash = if let Some(ref secret) = secret_guard {
-                    let actor = match actor_id {
-                        Some(id) => id.to_string(),
-                        None => "null".to_string(),
-                    };
-                    let message = build_hmac_message(AuditOperation::Delete.as_str(), &actor, &row_data);
+                    let actor_str = actor.as_hmac_str();
+                    let message = build_hmac_message(
+                        AuditOperation::Delete.as_str(),
+                        &actor_str,
+                        "",
+                        &row_data,
+                    );
                     Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
                 } else {
                     None
@@ -831,17 +1029,13 @@ pub async fn audited_delete<M: Auditable + FromRow>(
 
             // 4. Insert audit rows.
             for (row_data, row_hash) in entries {
-                let actor_val = match actor_id {
-                    Some(id) => crate::value::Value::I64(id),
-                    None => crate::value::Value::Null,
-                };
                 let (audit_sql, audit_params) = build_audit_insert(
                     audit_table,
                     AuditOperation::Delete.as_str(),
-                    actor_val,
+                    actor.to_value(),
                     row_data,
                     row_hash,
-                    crate::query::Dialect::Generic,
+                    dialect,
                 );
                 DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
             }
@@ -954,7 +1148,11 @@ mod tests {
     fn test_values_to_json_string_non_finite_f32() {
         let json = values_to_json_string(
             &["a", "b", "c"],
-            &[Value::F32(f32::INFINITY), Value::F32(f32::NEG_INFINITY), Value::F32(f32::NAN)],
+            &[
+                Value::F32(f32::INFINITY),
+                Value::F32(f32::NEG_INFINITY),
+                Value::F32(f32::NAN),
+            ],
         );
         // Non-finite floats must render as JSON null (not "inf" / "NaN" which are invalid JSON)
         assert_eq!(json, r#"{"a":null,"b":null,"c":null}"#);
@@ -997,7 +1195,10 @@ mod tests {
         assert_eq!(defs[0].sql_type, SqlType::BigSerial);
         assert!(defs[0].primary_key);
         assert_eq!(defs[1].sql_type, SqlType::Text);
-        assert_eq!(defs[2].sql_type, SqlType::BigInt);
+        // operation has a CHECK constraint
+        assert!(defs[1].check.as_deref().unwrap_or("").contains("insert"));
+        // actor_id is now TEXT (supports i64, UUID, string)
+        assert_eq!(defs[2].sql_type, SqlType::Text);
         assert!(defs[2].nullable);
         assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
         assert_eq!(defs[3].default, Some("NOW()".to_string()));
@@ -1008,12 +1209,51 @@ mod tests {
 
     // ── SHA-256 / HMAC-SHA256 ────────────────────────────────────────
 
+    #[test]
+    fn test_actor_id_as_hmac_str() {
+        assert_eq!(ActorId::Int(42).as_hmac_str(), "42");
+        assert_eq!(ActorId::String("uuid-abc".into()).as_hmac_str(), "uuid-abc");
+        assert_eq!(ActorId::None.as_hmac_str(), "null");
+    }
+
+    #[test]
+    fn test_actor_id_to_value() {
+        use crate::value::Value;
+        assert_eq!(ActorId::Int(7).to_value(), Value::I64(7));
+        assert_eq!(
+            ActorId::String("x".into()).to_value(),
+            Value::String("x".into())
+        );
+        assert_eq!(ActorId::None.to_value(), Value::Null);
+    }
+
+    #[test]
+    fn test_audit_context_private_fields() {
+        // Constructors work; fields are not directly accessible.
+        let ctx = AuditContext::new(ActorId::Int(1));
+        assert!(!ctx.has_integrity());
+        assert_eq!(ctx.actor(), &ActorId::Int(1));
+
+        let ctx2 = AuditContext::with_integrity(ActorId::None, b"s");
+        assert!(ctx2.has_integrity());
+    }
+
+    #[test]
+    fn test_audit_context_dialect() {
+        use crate::query::Dialect;
+        let ctx = AuditContext::new(ActorId::None).with_dialect(Dialect::Postgres);
+        assert_eq!(ctx.dialect, Dialect::Postgres);
+    }
+
     /// Known-answer test: SHA-256("") = e3b0c44298fc1c149afb...
     #[test]
     fn test_sha256_empty() {
         let digest = sha256(b"");
         let hex = hex_encode(&digest);
-        assert_eq!(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            hex,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     /// Known-answer test: SHA-256("abc") = ba7816bf8f01cfea414140...
@@ -1021,7 +1261,10 @@ mod tests {
     fn test_sha256_abc() {
         let digest = sha256(b"abc");
         let hex = hex_encode(&digest);
-        assert_eq!(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     /// HMAC-SHA256 known-answer from RFC 4231 test vector #1.
@@ -1033,7 +1276,10 @@ mod tests {
         let key = [0x0bu8; 20];
         let mac = hmac_sha256(&key, b"Hi There");
         let hex = hex_encode(&mac);
-        assert_eq!(hex, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        assert_eq!(
+            hex,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 
     /// HMAC-SHA256 RFC 4231 test vector #2.
@@ -1044,109 +1290,196 @@ mod tests {
     fn test_hmac_sha256_rfc4231_vector2() {
         let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
         let hex = hex_encode(&mac);
-        assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        assert_eq!(
+            hex,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
     }
 
     // ── AuditContext::compute_hash ────────────────────────────────────
 
     #[test]
     fn test_compute_hash_none_when_no_secret() {
-        let ctx = AuditContext::new(Some(1));
-        assert!(ctx.compute_hash("update", "{}").is_none());
+        let ctx = AuditContext::new(ActorId::Int(1));
+        assert!(ctx.compute_hash("update", "", "{}").is_none());
     }
 
     #[test]
     fn test_compute_hash_deterministic() {
-        let ctx = AuditContext::with_integrity(Some(42), b"my-secret");
-        let h1 = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
-        let h2 = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
+        let ctx = AuditContext::with_integrity(ActorId::Int(42), b"my-secret");
+        let h1 = ctx
+            .compute_hash("delete", "2024-01-01T00:00:00Z", r#"{"id":1}"#)
+            .unwrap();
+        let h2 = ctx
+            .compute_hash("delete", "2024-01-01T00:00:00Z", r#"{"id":1}"#)
+            .unwrap();
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64); // 32 bytes → 64 hex chars
     }
 
     #[test]
     fn test_compute_hash_differs_on_operation() {
-        let ctx = AuditContext::with_integrity(Some(1), b"secret");
-        let h_update = ctx.compute_hash("update", "{}").unwrap();
-        let h_delete = ctx.compute_hash("delete", "{}").unwrap();
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"secret");
+        let h_update = ctx.compute_hash("update", "", "{}").unwrap();
+        let h_delete = ctx.compute_hash("delete", "", "{}").unwrap();
         assert_ne!(h_update, h_delete);
     }
 
     #[test]
     fn test_compute_hash_differs_on_actor() {
-        let ctx1 = AuditContext::with_integrity(Some(1), b"secret");
-        let ctx2 = AuditContext::with_integrity(Some(2), b"secret");
+        let ctx1 = AuditContext::with_integrity(ActorId::Int(1), b"secret");
+        let ctx2 = AuditContext::with_integrity(ActorId::Int(2), b"secret");
         assert_ne!(
-            ctx1.compute_hash("update", "{}").unwrap(),
-            ctx2.compute_hash("update", "{}").unwrap()
+            ctx1.compute_hash("update", "", "{}").unwrap(),
+            ctx2.compute_hash("update", "", "{}").unwrap()
         );
     }
 
     #[test]
+    fn test_compute_hash_differs_on_changed_at() {
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"secret");
+        let h1 = ctx
+            .compute_hash("delete", "2024-01-01T00:00:00Z", "{}")
+            .unwrap();
+        let h2 = ctx
+            .compute_hash("delete", "2024-06-01T00:00:00Z", "{}")
+            .unwrap();
+        assert_ne!(h1, h2, "changed_at must affect the hash");
+    }
+
+    #[test]
     fn test_compute_hash_null_actor() {
-        let ctx = AuditContext::with_integrity(None, b"secret");
-        let h = ctx.compute_hash("update", "{}");
+        let ctx = AuditContext::with_integrity(ActorId::None, b"secret");
+        let h = ctx.compute_hash("update", "", "{}");
         assert!(h.is_some());
+    }
+
+    #[test]
+    fn test_compute_hash_string_actor() {
+        let ctx = AuditContext::with_integrity(ActorId::String("uuid-abc".into()), b"secret");
+        let h = ctx.compute_hash("update", "", "{}");
+        assert!(h.is_some());
+        // Must differ from Int actor with same string representation
+        let ctx2 = AuditContext::with_integrity(ActorId::Int(0), b"secret");
+        assert_ne!(h.unwrap(), ctx2.compute_hash("update", "", "{}").unwrap());
     }
 
     // ── verify_audit_row ─────────────────────────────────────────────
 
+    const TS: &str = "2024-01-15T10:30:00Z";
+
     #[test]
     fn test_verify_audit_row_valid() {
-        let ctx = AuditContext::with_integrity(Some(7), b"secret");
-        let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash), false),
+            verify_audit_row(
+                b"secret",
+                "delete",
+                "7",
+                TS,
+                r#"{"id":1}"#,
+                Some(&hash),
+                false
+            ),
             Some(true)
         );
     }
 
     #[test]
     fn test_verify_audit_row_tampered_data() {
-        let ctx = AuditContext::with_integrity(Some(7), b"secret");
-        let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
-        // row_data changed after the fact
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":99}"#, Some(&hash), false),
+            verify_audit_row(
+                b"secret",
+                "delete",
+                "7",
+                TS,
+                r#"{"id":99}"#,
+                Some(&hash),
+                false
+            ),
             Some(false)
         );
     }
 
     #[test]
     fn test_verify_audit_row_tampered_operation() {
-        let ctx = AuditContext::with_integrity(Some(7), b"secret");
-        let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"secret", "update", Some(7), r#"{"id":1}"#, Some(&hash), false),
+            verify_audit_row(
+                b"secret",
+                "update",
+                "7",
+                TS,
+                r#"{"id":1}"#,
+                Some(&hash),
+                false
+            ),
             Some(false)
         );
     }
 
     #[test]
     fn test_verify_audit_row_tampered_actor() {
-        let ctx = AuditContext::with_integrity(Some(7), b"secret");
-        let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(99), r#"{"id":1}"#, Some(&hash), false),
+            verify_audit_row(
+                b"secret",
+                "delete",
+                "99",
+                TS,
+                r#"{"id":1}"#,
+                Some(&hash),
+                false
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_verify_audit_row_tampered_changed_at() {
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret");
+        let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
+        assert_eq!(
+            verify_audit_row(
+                b"secret",
+                "delete",
+                "7",
+                "2099-01-01T00:00:00Z",
+                r#"{"id":1}"#,
+                Some(&hash),
+                false
+            ),
             Some(false)
         );
     }
 
     #[test]
     fn test_verify_audit_row_no_hash_stored() {
-        // No hash stored → integrity not enabled for this row → None
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, false),
+            verify_audit_row(b"secret", "delete", "7", TS, r#"{"id":1}"#, None, false),
             None
         );
     }
 
     #[test]
     fn test_verify_audit_row_wrong_secret() {
-        let ctx = AuditContext::with_integrity(Some(7), b"correct-secret");
-        let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"correct-secret");
+        let hash = ctx.compute_hash("delete", TS, r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"wrong-secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash), false),
+            verify_audit_row(
+                b"wrong-secret",
+                "delete",
+                "7",
+                TS,
+                r#"{"id":1}"#,
+                Some(&hash),
+                false
+            ),
             Some(false)
         );
     }
@@ -1179,18 +1512,16 @@ mod tests {
 
     #[test]
     fn test_verify_audit_row_null_hash_with_integrity_expected() {
-        // A NULL hash when integrity is expected = tampering
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, true),
+            verify_audit_row(b"secret", "delete", "7", TS, r#"{"id":1}"#, None, true),
             Some(false)
         );
     }
 
     #[test]
     fn test_verify_audit_row_null_hash_without_integrity_expected() {
-        // A NULL hash when integrity was never enabled = indeterminate
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, false),
+            verify_audit_row(b"secret", "delete", "7", TS, r#"{"id":1}"#, None, false),
             None
         );
     }
@@ -1207,6 +1538,9 @@ mod tests {
                 Value::String("x\x00y".into()),
             ],
         );
-        assert_eq!(json, r#"{"newline":"hello\nworld","tab":"a\tb","null_byte":"x\u0000y"}"#);
+        assert_eq!(
+            json,
+            r#"{"newline":"hello\nworld","tab":"a\tb","null_byte":"x\u0000y"}"#
+        );
     }
 }

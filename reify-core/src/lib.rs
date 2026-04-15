@@ -75,8 +75,8 @@ pub use rls::{
 };
 
 pub use audit::{
-    AuditContext, AuditOperation, Auditable, audit_column_defs_for, audited_delete, audited_update,
-    values_to_json_string, verify_audit_row,
+    ActorId, AuditContext, AuditOperation, Auditable, audit_column_defs_for, audited_delete,
+    audited_insert, audited_update, values_to_json_string, verify_audit_row,
 };
 
 pub use enumeration::{DbEnum, enum_from_value};
