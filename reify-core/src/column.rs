@@ -367,6 +367,41 @@ impl JsonExpr {
             vec![crate::value::Value::String(format!("%{escaped}%"))],
         )
     }
+
+    /// `column->>'key' ILIKE pattern` — raw pattern, wildcards are **not** escaped.
+    pub fn ilike(&self, pattern: &str) -> Condition {
+        Condition::Raw(
+            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
+            vec![crate::value::Value::String(pattern.to_owned())],
+        )
+    }
+
+    /// `column->>'key' ILIKE '%sub%'` — case-insensitive contains, user input is escaped.
+    pub fn icontains(&self, sub: &str) -> Condition {
+        let escaped = escape_like(sub);
+        Condition::Raw(
+            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
+            vec![crate::value::Value::String(format!("%{escaped}%"))],
+        )
+    }
+
+    /// `column->>'key' ILIKE 'prefix%'` — case-insensitive starts-with, user input is escaped.
+    pub fn istarts_with(&self, prefix: &str) -> Condition {
+        let escaped = escape_like(prefix);
+        Condition::Raw(
+            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
+            vec![crate::value::Value::String(format!("{escaped}%"))],
+        )
+    }
+
+    /// `column->>'key' ILIKE '%suffix'` — case-insensitive ends-with, user input is escaped.
+    pub fn iends_with(&self, suffix: &str) -> Condition {
+        let escaped = escape_like(suffix);
+        Condition::Raw(
+            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
+            vec![crate::value::Value::String(format!("%{escaped}"))],
+        )
+    }
 }
 
 #[cfg(feature = "postgres")]

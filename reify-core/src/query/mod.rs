@@ -163,6 +163,7 @@ pub(crate) fn write_on_conflict(
 }
 
 /// Append a `RETURNING` clause to `sql` (PostgreSQL only).
+#[cfg(feature = "postgres")]
 pub(crate) fn write_returning(sql: &mut String, returning: &Option<Vec<&'static str>>) {
     if let Some(ret_cols) = returning {
         sql.push_str(" RETURNING ");
@@ -174,6 +175,7 @@ pub(crate) fn write_returning(sql: &mut String, returning: &Option<Vec<&'static 
 ///
 /// Call this on the SQL string returned by `build()` when targeting PostgreSQL.
 /// This is a pure string transformation with a single allocation.
+#[cfg(feature = "postgres")]
 pub fn rewrite_placeholders_pg(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len() + 16);
     let mut idx = 1u32;

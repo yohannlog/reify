@@ -652,31 +652,32 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
 
 /// Execute an UPDATE and write an audit row atomically inside a transaction.
 ///
-/// The audit row captures the operation kind (`"update"`) and the actor id.
-/// Because the old values are not fetched (UPDATE does not return old data
-/// without a RETURNING clause), `row_data` is set to `"{}"` for UPDATE — use
-/// `audited_delete` when you need the full old snapshot.
+/// The rows matching the builder's WHERE clause are **read first** (inside the
+/// same transaction, with `SELECT … FOR UPDATE` to prevent concurrent
+/// modifications), then the UPDATE is applied, and finally one audit row per
+/// matched record is written with the **before-image** of the data.
 ///
-/// When [`AuditContext::hmac_secret`] is set, a `row_hash` column is also
-/// written with `HMAC-SHA256(secret, "update|<actor_id>|{}")` so that any
-/// post-hoc modification of the audit row is detectable via [`verify_audit_row`].
-pub async fn audited_update<M: Auditable>(
+/// When [`AuditContext::hmac_secret`] is set, each audit row receives a
+/// `row_hash` column with an HMAC-SHA256 digest of the operation, actor, and
+/// row data so that any post-hoc modification is detectable via
+/// [`verify_audit_row`].
+pub async fn audited_update<M: Auditable + crate::db::FromRow>(
     db: &impl Database,
     builder: UpdateBuilder<M>,
     ctx: &AuditContext,
 ) -> Result<u64, DbError> {
+    // Build a SELECT … FOR UPDATE from the same WHERE conditions so we can
+    // capture the before-image of every affected row inside the transaction.
+    let select = builder.to_select();
+    let (select_sql_base, select_params) = select.build();
+    // Append FOR UPDATE to lock the rows for the duration of the transaction.
+    let select_sql = format!("{select_sql_base} FOR UPDATE");
+
     let (update_sql, update_params) = builder.build();
     let audit_table = M::audit_table_name();
+    let col_names: Vec<&'static str> = M::column_names().to_vec();
     let actor_id = ctx.actor_id;
-    let row_data = "{}".to_string();
-    let row_hash = ctx.compute_hash("update", &row_data);
-
-    let actor_val = match actor_id {
-        Some(id) => crate::value::Value::I64(id),
-        None => crate::value::Value::Null,
-    };
-
-    let (audit_sql, audit_params) = build_audit_insert(audit_table, "update", actor_val, row_data, row_hash);
+    let hmac_secret = ctx.hmac_secret.clone();
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
@@ -684,9 +685,46 @@ pub async fn audited_update<M: Auditable>(
     db.transaction(Box::new(move |tx| {
         Box::pin(async move {
             use crate::db::DynDatabase;
+
+            // 1. Read matching rows inside the transaction (locked FOR UPDATE).
+            let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
+
+            // 2. Serialize rows and compute HMACs.
+            let mut entries: Vec<(String, Option<String>)> = Vec::with_capacity(old_rows.len());
+            for row in &old_rows {
+                let vals: Vec<crate::value::Value> = col_names
+                    .iter()
+                    .map(|c| row.get(c).cloned().unwrap_or(crate::value::Value::Null))
+                    .collect();
+                let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
+                let row_data = values_to_json_string(&col_refs, &vals);
+                let row_hash = if let Some(ref secret) = hmac_secret {
+                    let actor = match actor_id {
+                        Some(id) => id.to_string(),
+                        None => "null".to_string(),
+                    };
+                    let message = build_hmac_message("update", &actor, &row_data);
+                    Some(hex_encode(&hmac_sha256(secret, message.as_bytes())))
+                } else {
+                    None
+                };
+                entries.push((row_data, row_hash));
+            }
+
+            // 3. Apply the UPDATE.
             let n = DynDatabase::execute(tx, &update_sql, &update_params).await?;
             affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
-            DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
+
+            // 4. Insert one audit row per before-image.
+            for (row_data, row_hash) in entries {
+                let actor_val = match actor_id {
+                    Some(id) => crate::value::Value::I64(id),
+                    None => crate::value::Value::Null,
+                };
+                let (audit_sql, audit_params) =
+                    build_audit_insert(audit_table, "update", actor_val, row_data, row_hash);
+                DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
+            }
             Ok(())
         })
     }))

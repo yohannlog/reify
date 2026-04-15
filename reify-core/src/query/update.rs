@@ -73,6 +73,17 @@ impl<M: Table> UpdateBuilder<M> {
         self
     }
 
+    /// Convert this `UpdateBuilder` into a `SelectBuilder` with the same WHERE conditions.
+    ///
+    /// Used by `audited_update` to capture the before-image of rows before modification.
+    pub fn to_select(&self) -> crate::query::SelectBuilder<M> {
+        let mut sel = crate::query::SelectBuilder::new();
+        for cond in &self.conditions {
+            sel = sel.filter(cond.clone());
+        }
+        sel
+    }
+
     /// Explicitly allow an UPDATE without a WHERE clause.
     ///
     /// By default, `build()` and `try_build()` reject unfiltered updates

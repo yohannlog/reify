@@ -429,12 +429,26 @@ fn pg_column_to_value(
             .flatten()
             .map(Value::ArrayUuid)
             .unwrap_or(Value::Null),
-        _ => row
-            .try_get::<_, Option<String>>(idx)
-            .ok()
-            .flatten()
-            .map(Value::String)
-            .unwrap_or(Value::Null),
+        _ => {
+            // Unknown PostgreSQL type — fall back to text representation.
+            // Log a warning so users know which type OID is not natively mapped.
+            let oid = ty.oid();
+            let type_name = ty.name();
+            tracing::warn!(
+                target: "reify::postgres",
+                oid,
+                type_name,
+                column_index = idx,
+                "Unknown PostgreSQL column type — falling back to String representation. \
+                 Consider opening an issue or using a raw SQL query if precision is required."
+            );
+            row
+                .try_get::<_, Option<String>>(idx)
+                .ok()
+                .flatten()
+                .map(Value::String)
+                .unwrap_or(Value::Null)
+        }
     }
 }
 
@@ -546,6 +560,14 @@ impl Database for PostgresDb {
         pg_query(&conn, sql, params).await
     }
 
+    /// # Connection lifecycle
+    ///
+    /// The underlying connection is held for the **entire lifetime of the stream**
+    /// and returned to the pool only when the stream is **dropped**. If the stream
+    /// is never fully consumed (e.g. via `take(n)` or an early `break`), the
+    /// connection is still returned to the pool once the stream value is dropped —
+    /// but it will remain checked out until that point. Avoid holding streams
+    /// across long-running operations to prevent pool exhaustion.
     async fn query_stream<'a>(
         &'a self,
         sql: String,
@@ -587,7 +609,10 @@ impl Database for PostgresDb {
         let conn = get_conn(&self.pool).await?;
         conn.execute("BEGIN", &[]).await.map_err(pg_err)?;
 
-        let txn = PgTransaction { conn };
+        let txn = PgTransaction {
+            conn,
+            savepoint_counter: std::sync::atomic::AtomicU64::new(0),
+        };
         match f(&txn).await {
             Ok(()) => {
                 debug!(target: "reify::postgres", "COMMIT transaction");
@@ -612,6 +637,11 @@ impl Database for PostgresDb {
 /// ACID guarantees.
 struct PgTransaction {
     conn: deadpool_postgres::Object,
+    /// Monotonically-increasing counter for generating unique SAVEPOINT names
+    /// within this connection. Using an atomic counter guarantees uniqueness
+    /// even when multiple nested transactions start in the same nanosecond
+    /// (which can happen on Windows or coarse-clock Linux kernels).
+    savepoint_counter: std::sync::atomic::AtomicU64,
 }
 
 impl Database for PgTransaction {
@@ -628,16 +658,13 @@ impl Database for PgTransaction {
     }
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
-        // Nested transaction via SAVEPOINT with a unique name to support
-        // multiple concurrent nested transactions on the same connection.
-        let sp_name = format!(
-            "sp_{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-                ^ (self as *const _ as u64) as u32
-        );
+        // Nested transaction via SAVEPOINT. The counter is incremented atomically
+        // so every nested call on this connection gets a distinct name, regardless
+        // of clock resolution or concurrent usage.
+        let n = self
+            .savepoint_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sp_name = format!("sp_{n}");
         debug!(target: "reify::postgres", savepoint = %sp_name, "SAVEPOINT (nested)");
         self.conn
             .execute(&format!("SAVEPOINT {sp_name}"), &[])
