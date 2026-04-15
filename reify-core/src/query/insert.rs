@@ -470,7 +470,6 @@ impl<M: Table> InsertManyBuilder<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ColumnDef, IndexDef};
 
     struct Row3 {
         a: i32,
@@ -487,12 +486,6 @@ mod tests {
         }
         fn into_values(&self) -> Vec<Value> {
             vec![Value::I32(self.a), Value::I32(self.b), Value::I32(self.c)]
-        }
-        fn column_defs() -> Vec<ColumnDef> {
-            Vec::new()
-        }
-        fn indexes() -> Vec<IndexDef> {
-            Vec::new()
         }
     }
 

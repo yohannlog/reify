@@ -1,9 +1,7 @@
 use quote::quote;
 use syn::{Attribute, Data, DeriveInput, Fields, Lit};
 
-use crate::helpers::{
-    parse_column_attrs, parse_sql_type_string, rust_type_to_sql_type, unwrap_option_type,
-};
+use crate::helpers::parse_column_attrs;
 
 struct ViewAttr {
     name: String,
@@ -73,7 +71,6 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
     let mut col_names = Vec::new();
     let mut col_idents = Vec::new();
     let mut col_types = Vec::new();
-    let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for field in fields.iter() {
         let ident = field.ident.as_ref().unwrap();
@@ -84,32 +81,8 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
         col_idents.push(ident.clone());
         col_types.push(ty.clone());
 
-        let col_attrs = parse_column_attrs(&field.attrs)?;
-        let (is_option, inner_ty) = unwrap_option_type(ty);
-        let is_nullable = col_attrs.nullable || is_option;
-        let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
-            parse_sql_type_string(custom)
-        } else {
-            rust_type_to_sql_type(inner_ty)
-        };
-
-        col_defs_tokens.push(quote! {
-            reify_core::schema::ColumnDef {
-                name: #name_str,
-                sql_type: #sql_type_token,
-                primary_key: false,
-                auto_increment: false,
-                unique: false,
-                index: false,
-                nullable: #is_nullable,
-                default: None,
-                computed: None,
-                timestamp_kind: None,
-                timestamp_source: reify_core::schema::TimestampSource::Vm,
-                check: None,
-                foreign_key: None,
-            }
-        });
+        // Parse column attrs to allow #[column(...)] on view fields without error
+        let _ = parse_column_attrs(&field.attrs)?;
     }
 
     let col_name_strs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
@@ -156,9 +129,6 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                 vec![]
             }
 
-            fn column_defs() -> Vec<reify_core::schema::ColumnDef> {
-                vec![#(#col_defs_tokens),*]
-            }
         }
 
         impl reify_core::view::View for #struct_name {

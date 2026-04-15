@@ -1,32 +1,15 @@
-use reify::{IndexKind, Schema, SortDirection, Table, TableSchema};
+use reify::{IndexKind, Schema, SortDirection, Table};
 
 // ═══════════════════════════════════════════════════════════════════
-//  Approach 1 — Macro-based indexes
+//  Indexes via Schema::schema() — single source of truth for DDL
 // ═══════════════════════════════════════════════════════════════════
-
-// Single-column indexes via #[column(index)]
-// Composite indexes via #[table(index(...))]
-// Both can coexist on the same table.
 
 #[derive(Table, Debug, Clone)]
-#[table(
-    name = "orders",
-    // Composite index on (user_id ASC, created_at DESC) — for queries like
-    //   SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC
-    index(columns("user_id", "created_at DESC")),
-    // Unique composite index with explicit name
-    index(columns("user_id", "product_id"), unique, name = "idx_one_product_per_user"),
-    // Three-column composite
-    index(columns("status", "region", "created_at")),
-    // Partial index: unique product only for non-cancelled orders
-    index(columns("user_id", "product_id"), unique, predicate = "status != 'cancelled'", name = "idx_orders_live_product"),
-)]
+#[table(name = "orders")]
 pub struct Order {
     #[column(primary_key, auto_increment)]
     pub id: i64,
-    #[column(index)] // ← single-column index, auto-named "idx_orders_user_id"
     pub user_id: i64,
-    #[column(index)] // ← another single-column index
     pub product_id: i64,
     pub status: String,
     pub region: String,
@@ -50,64 +33,17 @@ pub struct Event {
     pub created_at: i64,
 }
 
-impl Schema for Event {
-    fn schema() -> TableSchema<Self> {
-        reify::table::<Self>("events")
-            .column(Event::id, |c| c.primary_key().auto_increment())
-            .column(Event::tenant_id, |c| c)
-            .column(Event::user_id, |c| c)
-            .column(Event::action, |c| c)
-            .column(Event::payload, |c| c)
-            .column(Event::created_at, |c| c)
-            // Single-column index
-            .index(|idx| idx.column(Event::tenant_id))
-            // Composite: tenant scoped queries by time (tenant ASC, time DESC)
-            .index(|idx| {
-                idx.column(Event::tenant_id)
-                    .column_desc(Event::created_at)
-                    .name("idx_events_tenant_timeline")
-            })
-            // Composite unique: one action per user per timestamp
-            .index(|idx| {
-                idx.column(Event::user_id)
-                    .column(Event::action)
-                    .column(Event::created_at)
-                    .unique()
-                    .name("idx_events_user_action_unique")
-            })
-            // Hash index for exact-match lookups (PostgreSQL)
-            .index(|idx| idx.column(Event::action).hash())
-            // GIN index for full-text search on payload (PostgreSQL)
-            .index(|idx| {
-                idx.column(Event::payload)
-                    .gin()
-                    .name("idx_events_payload_fts")
-            })
-            // Partial index: only index active events (PostgreSQL)
-            .index(|idx| {
-                idx.column(Event::tenant_id)
-                    .column(Event::created_at)
-                    .predicate("action != 'deleted'")
-                    .name("idx_events_active_timeline")
-            })
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════
 
 fn main() {
-    println!("=== Order indexes (macro) ===\n");
+    println!("=== Order indexes ===\n");
     print_indexes::<Order>();
 
-    println!("\n=== Event indexes (builder) ===\n");
-    let schema = Event::schema();
-    println!("Table: {}\n", schema.name);
-    for idx in &schema.indexes {
-        print_index(idx);
-    }
+    println!("\n=== Event indexes ===\n");
+    print_indexes::<Event>();
 }
 
-fn print_indexes<T: Table>() {
+fn print_indexes<T: Schema>() {
     println!("Table: {}\n", T::table_name());
     for idx in T::indexes() {
         print_index(&idx);

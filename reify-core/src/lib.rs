@@ -64,7 +64,7 @@ pub use db::{delete_returning, insert_many_returning, insert_returning, update_r
 
 pub use migration::{
     ColumnDiff, DbColumnInfo, Migration, MigrationContext, MigrationError, MigrationPlan,
-    MigrationRunner, MigrationStatus, SchemaDiff, TableDiff, create_table_sql,
+    MigrationRunner, MigrationStatus, SchemaDiff, TableDiff, add_column_sql, create_table_sql,
     create_table_sql_with_checks, generate_migration_file, generate_view_migration_file,
     normalize_sql_type,
 };

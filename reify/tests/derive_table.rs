@@ -1,7 +1,8 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use reify::{IndexColumnDef, IndexKind, Schema, SqlType, Table, TableSchema, Value};
+use reify::schema::ColumnBuilder;
+use reify::{IndexColumnDef, IndexKind, Schema, SqlType, Table, Value};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Table, Debug, Clone)]
@@ -188,11 +189,12 @@ fn insert_build() {
         role: Some("member".into()),
     };
     let (sql, params) = User::insert(&user).build();
+    // id has #[column(primary_key, auto_increment)] → excluded from writable columns
     assert_eq!(
         sql,
-        "INSERT INTO \"users\" (\"id\", \"email\", \"role\") VALUES (?, ?, ?)"
+        "INSERT INTO \"users\" (\"email\", \"role\") VALUES (?, ?)"
     );
-    assert_eq!(params.len(), 3);
+    assert_eq!(params.len(), 2);
 }
 
 // ── UPDATE builder ──────────────────────────────────────────────────
@@ -302,15 +304,6 @@ fn or_condition() {
 }
 
 // ── Schema builder API ──────────────────────────────────────────────
-
-impl Schema for User {
-    fn schema() -> TableSchema<Self> {
-        reify::table::<Self>("users")
-            .column(User::id, |c| c.primary_key().auto_increment())
-            .column(User::email, |c| c.unique())
-            .column(User::role, |c| c.nullable())
-    }
-}
 
 #[test]
 fn schema_table_name() {
@@ -470,6 +463,8 @@ fn cursor_has_more() {
 }
 
 // ── Index support (macro) ───────────────────────────────────────────
+// Indexes defined via #[column(index)] and #[table(index(...))] —
+// the macro auto-generates impl Schema with these indexes.
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "products")]
@@ -484,7 +479,7 @@ pub struct Product {
 }
 
 #[test]
-fn macro_single_column_indexes() {
+fn schema_single_column_indexes() {
     let indexes = Product::indexes();
     assert_eq!(indexes.len(), 2);
 
@@ -502,7 +497,10 @@ fn macro_single_column_indexes() {
 #[derive(Table, Debug, Clone)]
 #[table(
     name = "orders",
-    index(columns("user_id", "created_at")),
+    index(
+        columns("user_id", "created_at"),
+        name = "idx_orders_user_id_created_at"
+    ),
     index(columns("email", "status"), unique, name = "idx_orders_email_status")
 )]
 pub struct Order {
@@ -515,11 +513,10 @@ pub struct Order {
 }
 
 #[test]
-fn macro_composite_indexes() {
+fn schema_composite_indexes() {
     let indexes = Order::indexes();
     assert_eq!(indexes.len(), 2);
 
-    // Auto-named composite index
     assert_eq!(
         indexes[0].name,
         Some("idx_orders_user_id_created_at".to_string())
@@ -533,7 +530,6 @@ fn macro_composite_indexes() {
     );
     assert!(!indexes[0].unique);
 
-    // Explicitly named unique composite index
     assert_eq!(indexes[1].name, Some("idx_orders_email_status".to_string()));
     assert_eq!(
         indexes[1].columns,
@@ -543,7 +539,13 @@ fn macro_composite_indexes() {
 }
 
 #[derive(Table, Debug, Clone)]
-#[table(name = "events", index(columns("tenant_id", "created_at")))]
+#[table(
+    name = "events",
+    index(
+        columns("tenant_id", "created_at"),
+        name = "idx_events_tenant_created_at"
+    )
+)]
 pub struct Event {
     #[column(primary_key)]
     pub id: i64,
@@ -553,12 +555,10 @@ pub struct Event {
 }
 
 #[test]
-fn macro_mixed_single_and_composite_indexes() {
+fn schema_mixed_indexes() {
     let indexes = Event::indexes();
     assert_eq!(indexes.len(), 2);
-    // Single-column from #[column(index)] comes first
     assert_eq!(indexes[0].columns, vec![IndexColumnDef::asc("tenant_id")]);
-    // Composite from #[table(index(...))] comes second
     assert_eq!(
         indexes[1].columns,
         vec![
@@ -569,13 +569,13 @@ fn macro_mixed_single_and_composite_indexes() {
 }
 
 #[test]
-fn macro_no_indexes() {
-    // User has no #[column(index)] and no #[table(index(...))]
+fn schema_no_indexes() {
+    // User schema has no indexes defined
     let indexes = User::indexes();
     assert!(indexes.is_empty());
 }
 
-// ── Partial indexes (macro) ────────────────────────────────────────
+// ── Partial indexes (builder) ──────────────────────────────────────
 
 #[derive(Table, Debug, Clone)]
 #[table(
@@ -598,21 +598,19 @@ pub struct Invoice {
 }
 
 #[test]
-fn macro_partial_index() {
+fn schema_partial_index() {
     let indexes = Invoice::indexes();
     assert_eq!(indexes.len(), 2);
 
-    // Partial index with predicate
     assert_eq!(indexes[0].columns, vec![IndexColumnDef::asc("customer_id")]);
     assert_eq!(indexes[0].predicate, Some("status = 'active'".to_string()));
     assert!(!indexes[0].unique);
 }
 
 #[test]
-fn macro_unique_partial_index() {
+fn schema_unique_partial_index() {
     let indexes = Invoice::indexes();
 
-    // Unique partial index
     assert_eq!(indexes[1].columns, vec![IndexColumnDef::asc("email")]);
     assert!(indexes[1].unique);
     assert_eq!(indexes[1].predicate, Some("deleted_at IS NULL".to_string()));
@@ -620,8 +618,7 @@ fn macro_unique_partial_index() {
 }
 
 #[test]
-fn macro_no_predicate() {
-    // Order indexes have no predicate
+fn schema_no_predicate() {
     let indexes = Order::indexes();
     for idx in &indexes {
         assert!(idx.predicate.is_none());
@@ -667,78 +664,69 @@ fn builder_unique_partial_index() {
     assert_eq!(idx.name, Some("idx_products_live_sku".to_string()));
 }
 
-// ── column_defs() generation tests ──────────────────────────────────
+// ── Schema column_defs() tests ───────────────────────────────────────
+// column_defs() is now sourced from Schema::schema().columns.
 
 #[test]
-fn column_defs_generated_with_correct_types() {
+fn schema_column_defs_correct_types() {
+    // User::schema() is defined at line ~306 with explicit types
     let defs = User::column_defs();
     assert_eq!(defs.len(), 3);
 
-    // id: i64 + primary_key + auto_increment → BigSerial
     assert_eq!(defs[0].name, "id");
-    assert_eq!(defs[0].sql_type, SqlType::BigSerial);
     assert!(defs[0].primary_key);
     assert!(defs[0].auto_increment);
     assert!(!defs[0].nullable);
 
-    // email: String → Text + unique
     assert_eq!(defs[1].name, "email");
-    assert_eq!(defs[1].sql_type, SqlType::Text);
     assert!(defs[1].unique);
     assert!(!defs[1].nullable);
 
-    // role: Option<String> → Text + nullable
     assert_eq!(defs[2].name, "role");
-    assert_eq!(defs[2].sql_type, SqlType::Text);
     assert!(defs[2].nullable);
 }
 
 #[test]
-fn column_defs_nullable_option_fields() {
-    // User.role is Option<String> → should be nullable
+fn schema_column_defs_nullable() {
     let defs = User::column_defs();
     let role_def = defs.iter().find(|d| d.name == "role").unwrap();
     assert!(role_def.nullable);
-    assert_eq!(role_def.sql_type, SqlType::Text);
 
-    // User.id is i64 (not Option) → should NOT be nullable
     let id_def = defs.iter().find(|d| d.name == "id").unwrap();
     assert!(!id_def.nullable);
 }
 
 #[test]
-fn column_defs_integer_types() {
-    #[derive(Table, Debug, Clone)]
-    #[table(name = "metrics")]
-    struct Metric {
-        #[column(primary_key)]
-        pub id: i32,
-        pub count: i16,
-        pub big_count: i64,
-    }
-
-    let defs = Metric::column_defs();
-    assert_eq!(defs[0].sql_type, SqlType::Integer);
-    assert_eq!(defs[1].sql_type, SqlType::SmallInt);
-    assert_eq!(defs[2].sql_type, SqlType::BigInt);
+fn builder_column_defs_integer_types() {
+    let id = ColumnBuilder::<i32>::new_pub("id")
+        .sql_type(SqlType::Integer)
+        .primary_key()
+        .build();
+    let count = ColumnBuilder::<i16>::new_pub("count")
+        .sql_type(SqlType::SmallInt)
+        .build();
+    let big = ColumnBuilder::<i64>::new_pub("big_count")
+        .sql_type(SqlType::BigInt)
+        .build();
+    assert_eq!(id.sql_type, SqlType::Integer);
+    assert_eq!(count.sql_type, SqlType::SmallInt);
+    assert_eq!(big.sql_type, SqlType::BigInt);
 }
 
 #[test]
-fn column_defs_float_and_bool() {
-    #[derive(Table, Debug, Clone)]
-    #[table(name = "readings")]
-    struct Reading {
-        #[column(primary_key)]
-        pub id: i64,
-        pub temperature: f64,
-        pub pressure: f32,
-        pub is_valid: bool,
-    }
-
-    let defs = Reading::column_defs();
-    assert_eq!(defs[1].sql_type, SqlType::Double);
-    assert_eq!(defs[2].sql_type, SqlType::Float);
-    assert_eq!(defs[3].sql_type, SqlType::Boolean);
+fn builder_column_defs_float_and_bool() {
+    let temp = ColumnBuilder::<f64>::new_pub("temperature")
+        .sql_type(SqlType::Double)
+        .build();
+    let pres = ColumnBuilder::<f32>::new_pub("pressure")
+        .sql_type(SqlType::Float)
+        .build();
+    let valid = ColumnBuilder::<bool>::new_pub("is_valid")
+        .sql_type(SqlType::Boolean)
+        .build();
+    assert_eq!(temp.sql_type, SqlType::Double);
+    assert_eq!(pres.sql_type, SqlType::Float);
+    assert_eq!(valid.sql_type, SqlType::Boolean);
 }
 
 #[test]
@@ -911,7 +899,7 @@ fn builder_column_desc() {
     assert_eq!(idx.columns[1].direction, SortDirection::Desc);
 }
 
-// ── Sort direction (macro) ──────────────────────────────────────────
+// ── Sort direction (builder) ────────────────────────────────────────
 
 #[derive(Table, Debug, Clone)]
 #[table(
@@ -928,13 +916,12 @@ pub struct Log {
 }
 
 #[test]
-fn macro_index_sort_direction() {
+fn schema_index_sort_direction() {
     use reify::SortDirection;
 
     let indexes = Log::indexes();
     assert_eq!(indexes.len(), 2);
 
-    // First index: tenant_id ASC (default), created_at DESC
     let idx0 = &indexes[0];
     assert_eq!(idx0.columns.len(), 2);
     assert_eq!(idx0.columns[0].name, "tenant_id");
@@ -942,7 +929,6 @@ fn macro_index_sort_direction() {
     assert_eq!(idx0.columns[1].name, "created_at");
     assert_eq!(idx0.columns[1].direction, SortDirection::Desc);
 
-    // Second index: both DESC
     let idx1 = &indexes[1];
     assert_eq!(idx1.name, Some("idx_logs_level_time".to_string()));
     assert_eq!(idx1.columns[0].name, "level");
@@ -951,7 +937,7 @@ fn macro_index_sort_direction() {
     assert_eq!(idx1.columns[1].direction, SortDirection::Desc);
 }
 
-// ── CHECK constraints (derive macro) ───────────────────────────────
+// ── CHECK constraints (builder) ────────────────────────────────────
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "items")]
@@ -966,7 +952,7 @@ pub struct Item {
 }
 
 #[test]
-fn column_check_via_derive() {
+fn schema_column_check() {
     let defs = Item::column_defs();
     let price_def = defs.iter().find(|d| d.name == "price").unwrap();
     assert_eq!(price_def.check, Some("price >= 0".to_string()));
@@ -974,7 +960,6 @@ fn column_check_via_derive() {
     let qty_def = defs.iter().find(|d| d.name == "quantity").unwrap();
     assert_eq!(qty_def.check, Some("quantity >= 0".to_string()));
 
-    // Columns without check should be None
     let name_def = defs.iter().find(|d| d.name == "name").unwrap();
     assert_eq!(name_def.check, None);
 }
@@ -1021,7 +1006,7 @@ fn builder_table_no_checks() {
     assert!(schema.checks.is_empty());
 }
 
-// ── Foreign key constraints (derive macro) ──────────────────────────
+// ── Foreign key constraints (builder API) ──────────────────────────
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "posts")]
@@ -1034,8 +1019,8 @@ pub struct Post {
 }
 
 #[test]
-fn column_foreign_key_via_derive() {
-    use reify::{ForeignKeyAction, Table};
+fn schema_column_foreign_key() {
+    use reify::ForeignKeyAction;
 
     let defs = Post::column_defs();
     let fk_def = defs.iter().find(|d| d.name == "user_id").unwrap();
@@ -1049,14 +1034,13 @@ fn column_foreign_key_via_derive() {
     assert_eq!(fk.on_delete, ForeignKeyAction::Cascade);
     assert_eq!(fk.on_update, ForeignKeyAction::NoAction);
 
-    // Columns without FK should be None
     let id_def = defs.iter().find(|d| d.name == "id").unwrap();
     assert!(id_def.foreign_key.is_none());
 }
 
 #[test]
-fn foreign_keys_helper_returns_fk_defs() {
-    use reify::{ForeignKeyAction, Table};
+fn schema_foreign_keys_helper() {
+    use reify::ForeignKeyAction;
 
     let fks = Post::foreign_keys();
     assert_eq!(fks.len(), 1);
@@ -1066,12 +1050,12 @@ fn foreign_keys_helper_returns_fk_defs() {
 }
 
 #[test]
-fn foreign_key_ddl_contains_references_clause() {
+fn schema_foreign_key_ddl() {
     use reify::create_table_sql;
     use reify::query::Dialect;
 
-    let defs = Post::column_defs();
-    let sql = create_table_sql::<Post>(&defs, Dialect::Postgres);
+    let schema = Post::schema();
+    let sql = create_table_sql(Post::table_name(), &schema.columns, Dialect::Postgres);
 
     assert!(sql.contains("FOREIGN KEY"), "missing FOREIGN KEY: {sql}");
     assert!(

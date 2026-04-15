@@ -1,4 +1,4 @@
-use reify::{Table, TimestampKind, TimestampSource, Value};
+use reify::{Schema, Table, TimestampKind, TimestampSource, Value};
 
 // ── VM-source timestamps (default) ─────────────────────────────────
 
@@ -28,7 +28,7 @@ pub struct Event {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-// ── ColumnDef metadata ──────────────────────────────────────────────
+// ── ColumnDef metadata (via Schema) ─────────────────────────────────
 
 #[test]
 fn vm_timestamp_column_defs() {
@@ -85,7 +85,8 @@ fn writable_columns_exclude_db_timestamps() {
     let cols = Event::writable_column_names();
     assert!(!cols.contains(&"created_at"));
     assert!(!cols.contains(&"updated_at"));
-    assert_eq!(cols, vec!["id", "name"]);
+    // id is auto_increment → also excluded
+    assert_eq!(cols, vec!["name"]);
 }
 
 // ── into_values() injects Utc::now() for VM-source timestamps ──────
@@ -123,7 +124,7 @@ fn insert_sql_excludes_db_timestamps() {
     let (sql, params) = Event::insert(&event).build();
     assert!(!sql.contains("created_at"));
     assert!(!sql.contains("updated_at"));
-    assert_eq!(params.len(), 2); // only id and name
+    assert_eq!(params.len(), 1); // only name (id is auto_increment, timestamps are db-source)
 }
 
 // ── UPDATE SQL auto-injects VM-source update_timestamp ──────────────
@@ -164,8 +165,12 @@ fn update_builder_skips_if_already_set() {
 
 #[test]
 fn ddl_db_source_postgres_default_now() {
-    let defs = Event::column_defs();
-    let sql = reify::create_table_sql::<Event>(&defs, reify::Dialect::Postgres);
+    let schema = Event::schema();
+    let sql = reify::create_table_sql(
+        Event::table_name(),
+        &schema.columns,
+        reify::Dialect::Postgres,
+    );
     assert!(
         sql.contains("DEFAULT NOW()"),
         "DDL should contain DEFAULT NOW(): {sql}"
@@ -174,8 +179,8 @@ fn ddl_db_source_postgres_default_now() {
 
 #[test]
 fn ddl_db_source_mysql_current_timestamp() {
-    let defs = Event::column_defs();
-    let sql = reify::create_table_sql::<Event>(&defs, reify::Dialect::Mysql);
+    let schema = Event::schema();
+    let sql = reify::create_table_sql(Event::table_name(), &schema.columns, reify::Dialect::Mysql);
     assert!(
         sql.contains("DEFAULT CURRENT_TIMESTAMP"),
         "DDL should contain DEFAULT CURRENT_TIMESTAMP: {sql}"

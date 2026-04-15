@@ -5,12 +5,13 @@
 use std::sync::{Arc, Mutex};
 
 use reify::{
-    Database, DbError, Row, TransactionFn, Value,
+    Database, DbError, Row, Schema, SqlType, TransactionFn, Value,
     migration::{
         Migration, MigrationContext, MigrationError, MigrationPlan, MigrationRunner,
         generate_migration_file,
     },
 };
+use reify::schema::ColumnBuilder;
 
 // ── MockDb ───────────────────────────────────────────────────────────
 
@@ -458,97 +459,52 @@ fn normalize_sql_type_parameterized() {
 // ── Metadata-based DDL tests ────────────────────────────────────────
 
 #[test]
-fn create_table_uses_metadata_types_not_heuristics() {
+fn create_table_uses_builder_types() {
     use reify::Dialect;
     use reify::migration::create_table_sql;
-    use reify::schema::{ColumnDef, SqlType};
 
-    // Build column defs with explicit types matching User's columns
+    // Build column defs via ColumnBuilder — explicit types, no heuristics
     let defs = vec![
-        ColumnDef {
-            name: "id",
-            sql_type: SqlType::BigSerial,
-            primary_key: true,
-            auto_increment: true,
-            unique: false,
-            index: false,
-            nullable: false,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
-        ColumnDef {
-            name: "email",
-            sql_type: SqlType::Uuid,
-            primary_key: false,
-            auto_increment: false,
-            unique: true,
-            index: false,
-            nullable: false,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
-        ColumnDef {
-            name: "role",
-            sql_type: SqlType::Text,
-            primary_key: false,
-            auto_increment: false,
-            unique: false,
-            index: false,
-            nullable: true,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
+        ColumnBuilder::<i64>::new_pub("id")
+            .sql_type(SqlType::BigSerial)
+            .primary_key()
+            .auto_increment()
+            .build(),
+        ColumnBuilder::<String>::new_pub("email")
+            .sql_type(SqlType::Uuid) // deliberately Uuid to verify it renders as UUID
+            .unique()
+            .build(),
+        ColumnBuilder::<Option<String>>::new_pub("role")
+            .sql_type(SqlType::Text)
+            .nullable()
+            .build(),
     ];
 
-    let sql = create_table_sql::<User>(&defs, Dialect::Postgres);
+    let sql = create_table_sql("users", &defs, Dialect::Postgres);
     assert!(sql.contains("BIGSERIAL"), "expected BIGSERIAL, got: {sql}");
-    // email uses Uuid type → should render as UUID for Postgres, not TEXT
     assert!(
         sql.contains("UUID"),
-        "expected UUID (from metadata, not name heuristic), got: {sql}"
+        "expected UUID (explicit type, not name heuristic), got: {sql}"
     );
     assert!(sql.contains("TEXT"), "expected TEXT for role, got: {sql}");
-    assert!(
-        sql.contains("PRIMARY KEY"),
-        "expected PRIMARY KEY, got: {sql}"
-    );
+    assert!(sql.contains("PRIMARY KEY"), "expected PRIMARY KEY, got: {sql}");
     assert!(sql.contains("UNIQUE"), "expected UNIQUE, got: {sql}");
 }
 
 #[test]
-fn column_defs_from_derive_macro_have_correct_types() {
-    use reify::Table;
-    use reify::schema::SqlType;
-
+fn schema_columns_have_correct_types() {
+    // Schema is the single source of truth — column_defs() delegates to schema().columns
     let defs = User::column_defs();
     assert_eq!(defs.len(), 3);
 
-    // id: i64 + primary_key + auto_increment → BigSerial
     let id = &defs[0];
-    assert_eq!(id.sql_type, SqlType::BigSerial);
     assert!(id.primary_key);
     assert!(id.auto_increment);
 
-    // email: String → Text + unique
     let email = &defs[1];
-    assert_eq!(email.sql_type, SqlType::Text);
     assert!(email.unique);
 
-    // role: Option<String> → Text + nullable
     let role = &defs[2];
-    assert_eq!(role.sql_type, SqlType::Text);
     assert!(role.nullable);
 }
 
@@ -590,69 +546,34 @@ async fn auto_migration_uses_metadata_types_in_create_table() {
 fn create_table_with_column_check() {
     use reify::Dialect;
     use reify::migration::create_table_sql;
-    use reify::schema::{ColumnDef, SqlType};
 
-    // Use column names matching User::column_names() = ["id", "email", "role"]
     let defs = vec![
-        ColumnDef {
-            name: "id",
-            sql_type: SqlType::BigSerial,
-            primary_key: true,
-            auto_increment: true,
-            unique: false,
-            index: false,
-            nullable: false,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
-        ColumnDef {
-            name: "email",
-            sql_type: SqlType::Text,
-            primary_key: false,
-            auto_increment: false,
-            unique: true,
-            index: false,
-            nullable: false,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: Some("length(email) > 0".to_string()),
-            foreign_key: None,
-        },
-        ColumnDef {
-            name: "role",
-            sql_type: SqlType::Text,
-            primary_key: false,
-            auto_increment: false,
-            unique: false,
-            index: false,
-            nullable: true,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
+        ColumnBuilder::<i64>::new_pub("id")
+            .sql_type(SqlType::BigSerial)
+            .primary_key()
+            .auto_increment()
+            .build(),
+        ColumnBuilder::<String>::new_pub("email")
+            .sql_type(SqlType::Text)
+            .unique()
+            .check("length(email) > 0")
+            .build(),
+        ColumnBuilder::<Option<String>>::new_pub("role")
+            .sql_type(SqlType::Text)
+            .nullable()
+            .build(),
     ];
 
-    let sql = create_table_sql::<User>(&defs, Dialect::Postgres);
+    let sql = create_table_sql("users", &defs, Dialect::Postgres);
     assert!(
         sql.contains("CHECK (length(email) > 0)"),
         "expected CHECK (length(email) > 0) in: {sql}"
     );
-    // CHECK should be on the email line
     let email_line = sql.lines().find(|l| l.contains("email")).unwrap();
     assert!(
         email_line.contains("CHECK (length(email) > 0)"),
         "CHECK should be inline with email column: {email_line}"
     );
-    // role should NOT have a CHECK
     let role_line = sql.lines().find(|l| l.contains("role")).unwrap();
     assert!(
         !role_line.contains("CHECK"),
@@ -664,68 +585,30 @@ fn create_table_with_column_check() {
 fn create_table_with_table_level_checks() {
     use reify::Dialect;
     use reify::migration::create_table_sql_with_checks;
-    use reify::schema::{ColumnDef, SqlType};
 
-    // Use column names matching User::column_names() = ["id", "email", "role"]
     let defs = vec![
-        ColumnDef {
-            name: "id",
-            sql_type: SqlType::BigSerial,
-            primary_key: true,
-            auto_increment: true,
-            unique: false,
-            index: false,
-            nullable: false,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
-        ColumnDef {
-            name: "email",
-            sql_type: SqlType::Text,
-            primary_key: false,
-            auto_increment: false,
-            unique: true,
-            index: false,
-            nullable: false,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
-        ColumnDef {
-            name: "role",
-            sql_type: SqlType::Text,
-            primary_key: false,
-            auto_increment: false,
-            unique: false,
-            index: false,
-            nullable: true,
-            default: None,
-            computed: None,
-            timestamp_kind: None,
-            timestamp_source: reify::TimestampSource::Vm,
-            check: None,
-            foreign_key: None,
-        },
+        ColumnBuilder::<i64>::new_pub("id")
+            .sql_type(SqlType::BigSerial)
+            .primary_key()
+            .auto_increment()
+            .build(),
+        ColumnBuilder::<String>::new_pub("email")
+            .sql_type(SqlType::Text)
+            .unique()
+            .build(),
+        ColumnBuilder::<Option<String>>::new_pub("role")
+            .sql_type(SqlType::Text)
+            .nullable()
+            .build(),
     ];
 
     let checks = vec!["length(email) > 5".to_string()];
-    let sql = create_table_sql_with_checks::<User>(&defs, &checks, Dialect::Postgres);
+    let sql = create_table_sql_with_checks("users", &defs, &checks, Dialect::Postgres);
     assert!(
         sql.contains("CHECK (length(email) > 5)"),
         "expected table-level CHECK in: {sql}"
     );
-    // Table-level CHECK should be a separate line, not on a column line
-    let check_line = sql
-        .lines()
-        .find(|l| l.contains("length(email) > 5"))
-        .unwrap();
+    let check_line = sql.lines().find(|l| l.contains("length(email) > 5")).unwrap();
     assert!(
         !check_line.contains("TEXT"),
         "table-level CHECK should be on its own line: {check_line}"
@@ -736,25 +619,16 @@ fn create_table_with_table_level_checks() {
 fn create_table_with_no_checks_matches_base() {
     use reify::Dialect;
     use reify::migration::{create_table_sql, create_table_sql_with_checks};
-    use reify::schema::{ColumnDef, SqlType};
 
-    let defs = vec![ColumnDef {
-        name: "id",
-        sql_type: SqlType::BigSerial,
-        primary_key: true,
-        auto_increment: true,
-        unique: false,
-        index: false,
-        nullable: false,
-        default: None,
-        computed: None,
-        timestamp_kind: None,
-        timestamp_source: reify::TimestampSource::Vm,
-        check: None,
-        foreign_key: None,
-    }];
+    let defs = vec![
+        ColumnBuilder::<i64>::new_pub("id")
+            .sql_type(SqlType::BigSerial)
+            .primary_key()
+            .auto_increment()
+            .build(),
+    ];
 
-    let base = create_table_sql::<User>(&defs, Dialect::Generic);
-    let with_empty = create_table_sql_with_checks::<User>(&defs, &[], Dialect::Generic);
+    let base = create_table_sql("users", &defs, Dialect::Generic);
+    let with_empty = create_table_sql_with_checks("users", &defs, &[], Dialect::Generic);
     assert_eq!(base, with_empty);
 }

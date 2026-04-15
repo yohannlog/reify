@@ -9,7 +9,6 @@ mod traits;
 
 pub use codegen::{generate_migration_file, generate_view_migration_file};
 pub use context::MigrationContext;
-pub(crate) use ddl::create_table_sql_named;
 pub use ddl::{add_column_sql, create_table_sql, create_table_sql_with_checks};
 pub use diff::{ColumnDiff, DbColumnInfo, SchemaDiff, TableDiff, normalize_sql_type};
 pub use error::MigrationError;
@@ -83,63 +82,25 @@ mod tests {
 
     struct Users;
     impl Table for Users {
-        fn table_name() -> &'static str {
-            "users"
-        }
-        fn column_names() -> &'static [&'static str] {
-            &["id", "email", "role"]
-        }
-        fn into_values(&self) -> Vec<Value> {
-            vec![]
-        }
-        fn column_defs() -> Vec<crate::schema::ColumnDef> {
-            vec![
-                crate::schema::ColumnDef {
-                    name: "id",
-                    sql_type: crate::schema::SqlType::BigInt,
-                    primary_key: true,
-                    auto_increment: false,
-                    unique: false,
-                    index: false,
-                    nullable: false,
-                    default: None,
-                    computed: None,
-                    timestamp_kind: None,
-                    timestamp_source: crate::schema::TimestampSource::Vm,
-                    check: None,
-                    foreign_key: None,
-                },
-                crate::schema::ColumnDef {
-                    name: "email",
-                    sql_type: crate::schema::SqlType::Text,
-                    primary_key: false,
-                    auto_increment: false,
-                    unique: false,
-                    index: false,
-                    nullable: false,
-                    default: None,
-                    computed: None,
-                    timestamp_kind: None,
-                    timestamp_source: crate::schema::TimestampSource::Vm,
-                    check: None,
-                    foreign_key: None,
-                },
-                crate::schema::ColumnDef {
-                    name: "role",
-                    sql_type: crate::schema::SqlType::Text,
-                    primary_key: false,
-                    auto_increment: false,
-                    unique: false,
-                    index: false,
-                    nullable: false,
-                    default: None,
-                    computed: None,
-                    timestamp_kind: None,
-                    timestamp_source: crate::schema::TimestampSource::Vm,
-                    check: None,
-                    foreign_key: None,
-                },
-            ]
+        fn table_name() -> &'static str { "users" }
+        fn column_names() -> &'static [&'static str] { &["id", "email", "role"] }
+        fn into_values(&self) -> Vec<Value> { vec![] }
+    }
+    impl crate::schema::Schema for Users {
+        fn schema() -> crate::schema::TableSchema<Self> {
+            crate::schema::table::<Self>("users")
+                .column(
+                    crate::column::Column::<Users, i64>::new("id"),
+                    |c| c.sql_type(crate::schema::SqlType::BigInt).primary_key(),
+                )
+                .column(
+                    crate::column::Column::<Users, String>::new("email"),
+                    |c| c.sql_type(crate::schema::SqlType::Text),
+                )
+                .column(
+                    crate::column::Column::<Users, String>::new("role"),
+                    |c| c.sql_type(crate::schema::SqlType::Text),
+                )
         }
     }
 
@@ -773,39 +734,19 @@ mod tests {
 
     #[test]
     fn create_table_sql_contains_all_columns() {
-        let defs: Vec<crate::schema::ColumnDef> = vec![
-            crate::schema::ColumnDef {
-                name: "id",
-                sql_type: crate::schema::SqlType::BigSerial,
-                primary_key: true,
-                auto_increment: true,
-                unique: false,
-                index: false,
-                nullable: false,
-                default: None,
-                computed: None,
-                timestamp_kind: None,
-                timestamp_source: crate::schema::TimestampSource::Vm,
-                check: None,
-                foreign_key: None,
-            },
-            crate::schema::ColumnDef {
-                name: "email",
-                sql_type: crate::schema::SqlType::Text,
-                primary_key: false,
-                auto_increment: false,
-                unique: true,
-                index: false,
-                nullable: false,
-                default: None,
-                computed: None,
-                timestamp_kind: None,
-                timestamp_source: crate::schema::TimestampSource::Vm,
-                check: None,
-                foreign_key: None,
-            },
+        use crate::schema::{ColumnBuilder, SqlType};
+        let defs = vec![
+            ColumnBuilder::<i64>::new_pub("id")
+                .sql_type(SqlType::BigSerial)
+                .primary_key()
+                .auto_increment()
+                .build(),
+            ColumnBuilder::<String>::new_pub("email")
+                .sql_type(SqlType::Text)
+                .unique()
+                .build(),
         ];
-        let sql = create_table_sql::<Users>(&defs, crate::query::Dialect::Postgres);
+        let sql = create_table_sql("users", &defs, crate::query::Dialect::Postgres);
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"users\""));
         assert!(sql.contains("id"));
         assert!(sql.contains("email"));
@@ -815,59 +756,21 @@ mod tests {
 
     #[test]
     fn create_table_sql_emits_foreign_key_constraint() {
-        use crate::schema::{ForeignKeyAction, ForeignKeyDef};
+        use crate::schema::{ColumnBuilder, ForeignKeyAction, SqlType};
 
-        struct Posts;
-        impl Table for Posts {
-            fn table_name() -> &'static str {
-                "posts"
-            }
-            fn column_names() -> &'static [&'static str] {
-                &["id", "user_id"]
-            }
-            fn into_values(&self) -> Vec<Value> {
-                vec![]
-            }
-        }
-
-        let defs: Vec<crate::schema::ColumnDef> = vec![
-            crate::schema::ColumnDef {
-                name: "id",
-                sql_type: crate::schema::SqlType::BigSerial,
-                primary_key: true,
-                auto_increment: true,
-                unique: false,
-                index: false,
-                nullable: false,
-                default: None,
-                computed: None,
-                timestamp_kind: None,
-                timestamp_source: crate::schema::TimestampSource::Vm,
-                check: None,
-                foreign_key: None,
-            },
-            crate::schema::ColumnDef {
-                name: "user_id",
-                sql_type: crate::schema::SqlType::BigInt,
-                primary_key: false,
-                auto_increment: false,
-                unique: false,
-                index: false,
-                nullable: false,
-                default: None,
-                computed: None,
-                timestamp_kind: None,
-                timestamp_source: crate::schema::TimestampSource::Vm,
-                check: None,
-                foreign_key: Some(ForeignKeyDef {
-                    references_table: "users".to_string(),
-                    references_column: "id".to_string(),
-                    on_delete: ForeignKeyAction::Cascade,
-                    on_update: ForeignKeyAction::NoAction,
-                }),
-            },
+        let defs = vec![
+            ColumnBuilder::<i64>::new_pub("id")
+                .sql_type(SqlType::BigSerial)
+                .primary_key()
+                .auto_increment()
+                .build(),
+            ColumnBuilder::<i64>::new_pub("user_id")
+                .sql_type(SqlType::BigInt)
+                .references("users", "id")
+                .on_delete(ForeignKeyAction::Cascade)
+                .build(),
         ];
-        let sql = create_table_sql::<Posts>(&defs, crate::query::Dialect::Postgres);
+        let sql = create_table_sql("posts", &defs, crate::query::Dialect::Postgres);
         assert!(sql.contains("FOREIGN KEY"), "missing FOREIGN KEY: {sql}");
         assert!(
             sql.contains("REFERENCES \"users\" (\"id\")"),
@@ -877,7 +780,6 @@ mod tests {
             sql.contains("ON DELETE CASCADE"),
             "missing ON DELETE CASCADE: {sql}"
         );
-        // ON UPDATE NO ACTION should be omitted (default)
         assert!(
             !sql.contains("ON UPDATE"),
             "unexpected ON UPDATE clause: {sql}"

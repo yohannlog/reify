@@ -1,13 +1,11 @@
-use reify::{Table, Value, query::Order};
+use reify::{Table, query::Order};
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "users")]
 pub struct User {
     #[column(primary_key, auto_increment)]
     pub id: i64,
-    #[column(unique)]
     pub email: String,
-    #[column(nullable)]
     pub role: Option<String>,
 }
 
@@ -18,7 +16,6 @@ pub struct Post {
     pub id: i64,
     pub user_id: i64,
     pub title: String,
-    #[column(nullable)]
     pub body: Option<String>,
 }
 

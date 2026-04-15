@@ -1,4 +1,4 @@
-use reify::{ComputedColumn, Dialect, Table, Value};
+use reify::{ComputedColumn, Dialect, Schema, Table, Value};
 
 // ── DB-generated computed column (GENERATED ALWAYS AS … STORED) ─────
 
@@ -17,7 +17,8 @@ pub struct Product {
 #[test]
 fn computed_stored_excluded_from_column_defs_writable() {
     let writable = Product::writable_column_names();
-    assert_eq!(writable, vec!["id", "price", "quantity"]);
+    // id is auto_increment → excluded; total is computed → excluded
+    assert_eq!(writable, vec!["price", "quantity"]);
     assert!(
         !writable.contains(&"total"),
         "computed column should not be writable"
@@ -60,11 +61,11 @@ fn computed_stored_excluded_from_insert() {
     );
     assert_eq!(
         params.len(),
-        3,
-        "should have 3 params (id, price, quantity)"
+        2,
+        "should have 2 params (price, quantity) — id is auto_increment"
     );
     assert!(
-        sql.contains("\"id\", \"price\", \"quantity\""),
+        sql.contains("\"price\", \"quantity\""),
         "should list writable columns: {sql}"
     );
 }
@@ -90,7 +91,11 @@ fn computed_stored_excluded_from_insert_many() {
         !sql.contains("total"),
         "INSERT MANY should not include computed column: {sql}"
     );
-    assert_eq!(params.len(), 6, "should have 6 params (3 per row × 2 rows)");
+    assert_eq!(
+        params.len(),
+        4,
+        "should have 4 params (2 per row × 2 rows) — id excluded"
+    );
 }
 
 #[test]
@@ -102,10 +107,10 @@ fn computed_stored_writable_values_excludes_computed() {
         total: 29.97,
     };
     let writable = product.writable_values();
-    assert_eq!(writable.len(), 3);
-    assert_eq!(writable[0], Value::I64(1));
-    assert_eq!(writable[1], Value::F64(9.99));
-    assert_eq!(writable[2], Value::I32(3));
+    // id (auto_increment) excluded, total (computed) excluded
+    assert_eq!(writable.len(), 2);
+    assert_eq!(writable[0], Value::F64(9.99));
+    assert_eq!(writable[1], Value::I32(3));
 }
 
 #[test]
@@ -123,7 +128,7 @@ fn computed_stored_create_table_sql_postgres() {
     use reify::migration::create_table_sql;
 
     let defs = Product::column_defs();
-    let sql = create_table_sql::<Product>(&defs, Dialect::Postgres);
+    let sql = create_table_sql("products", &defs, Dialect::Postgres);
     assert!(
         sql.contains("GENERATED ALWAYS AS (price * quantity) STORED"),
         "CREATE TABLE should include GENERATED ALWAYS AS clause: {sql}"
@@ -152,7 +157,8 @@ pub struct User {
 #[test]
 fn virtual_excluded_from_writable() {
     let writable = User::writable_column_names();
-    assert_eq!(writable, vec!["id", "first_name", "last_name"]);
+    // id is auto_increment → excluded; display_name is computed_rust → excluded
+    assert_eq!(writable, vec!["first_name", "last_name"]);
     assert!(!writable.contains(&"display_name"));
 }
 
@@ -186,7 +192,8 @@ fn virtual_excluded_from_insert() {
         !sql.contains("display_name"),
         "INSERT should not include virtual column: {sql}"
     );
-    assert_eq!(params.len(), 3);
+    // id (auto_increment) and display_name (computed_rust) excluded
+    assert_eq!(params.len(), 2);
 }
 
 #[test]
@@ -194,7 +201,7 @@ fn virtual_excluded_from_create_table() {
     use reify::migration::create_table_sql;
 
     let defs = User::column_defs();
-    let sql = create_table_sql::<User>(&defs, Dialect::Postgres);
+    let sql = create_table_sql("users", &defs, Dialect::Postgres);
     assert!(
         !sql.contains("display_name"),
         "CREATE TABLE should not include virtual column: {sql}"
@@ -260,7 +267,7 @@ pub struct Item {
 
 #[test]
 fn schema_builder_computed_stored() {
-    use reify::{Schema, SqlType, TableSchema, table};
+    use reify::{table, SqlType, TableSchema};
 
     let schema: TableSchema<Item> = table::<Item>("items")
         .column(Item::id, |c| c.primary_key())
@@ -278,7 +285,7 @@ fn schema_builder_computed_stored() {
 
 #[test]
 fn schema_builder_computed_virtual() {
-    use reify::{TableSchema, table};
+    use reify::{table, TableSchema};
 
     let schema: TableSchema<Item> = table::<Item>("items")
         .column(Item::id, |c| c.primary_key())

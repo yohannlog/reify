@@ -3,7 +3,7 @@
 //!
 //! Run: `cargo run --example timestamps`
 
-use reify::{Table, query::Order};
+use reify::{query::Order, Schema, Table};
 
 // ── VM-source (default): Rust generates Utc::now() ─────────────────
 
@@ -77,11 +77,15 @@ fn main() {
     println!("INSERT (timestamps excluded):\n  {sql}\n  params: {params:?}\n");
 
     // DDL — shows DEFAULT NOW() for Postgres
-    let defs = Event::column_defs();
-    let ddl = reify::create_table_sql::<Event>(&defs, reify::Dialect::Postgres);
+    let schema = Event::schema();
+    let ddl = reify::create_table_sql(
+        Event::table_name(),
+        &schema.columns,
+        reify::Dialect::Postgres,
+    );
     println!("DDL (Postgres):\n{ddl}\n");
 
     // DDL — shows DEFAULT CURRENT_TIMESTAMP + ON UPDATE for MySQL
-    let ddl = reify::create_table_sql::<Event>(&defs, reify::Dialect::Mysql);
+    let ddl = reify::create_table_sql(Event::table_name(), &schema.columns, reify::Dialect::Mysql);
     println!("DDL (MySQL):\n{ddl}");
 }

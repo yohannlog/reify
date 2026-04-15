@@ -451,18 +451,13 @@ impl<T, S: TimestampState> ColumnBuilder<T, S> {
 
     /// Mark as a creation timestamp — set once on INSERT.
     ///
-    /// Only available when `T: Temporal` (requires `postgres` or `mysql` feature).
     /// Transitions the builder state to [`HasTimestamp`], enabling `.source_db()`.
     ///
     /// ```ignore
     /// .column(User::created_at, |c| c.creation_timestamp())
     /// .column(User::created_at, |c| c.creation_timestamp().source_db())
     /// ```
-    #[cfg(any(feature = "postgres", feature = "mysql"))]
-    pub fn creation_timestamp(mut self) -> ColumnBuilder<T, HasTimestamp>
-    where
-        T: crate::column::Temporal,
-    {
+    pub fn creation_timestamp(mut self) -> ColumnBuilder<T, HasTimestamp> {
         self.def.timestamp_kind = Some(TimestampKind::Creation);
         ColumnBuilder {
             def: self.def,
@@ -473,18 +468,13 @@ impl<T, S: TimestampState> ColumnBuilder<T, S> {
 
     /// Mark as an update timestamp — set on INSERT **and** every UPDATE.
     ///
-    /// Only available when `T: Temporal` (requires `postgres` or `mysql` feature).
     /// Transitions the builder state to [`HasTimestamp`], enabling `.source_db()`.
     ///
     /// ```ignore
     /// .column(User::updated_at, |c| c.update_timestamp())
     /// .column(User::updated_at, |c| c.update_timestamp().source_db())
     /// ```
-    #[cfg(any(feature = "postgres", feature = "mysql"))]
-    pub fn update_timestamp(mut self) -> ColumnBuilder<T, HasTimestamp>
-    where
-        T: crate::column::Temporal,
-    {
+    pub fn update_timestamp(mut self) -> ColumnBuilder<T, HasTimestamp> {
         self.def.timestamp_kind = Some(TimestampKind::Update);
         ColumnBuilder {
             def: self.def,
@@ -832,7 +822,15 @@ pub fn table<M>(name: &'static str) -> TableSchema<M> {
 
 // ── Schema trait ────────────────────────────────────────────────────
 
-/// Trait for defining table schema via the builder API (alternative to `#[column(...)]` attributes).
+/// Trait for defining table schema — the **single source of truth** for DDL.
+///
+/// Implement this trait (instead of using `#[column(...)]` attributes) to
+/// describe column types, constraints, indexes, and CHECK expressions with
+/// full autocompletion and no proc-macro magic.
+///
+/// `#[derive(Table)]` still handles row serialisation (`column_names`,
+/// `into_values`, typed `Column<M,T>` constants, query builders).
+/// `Schema` handles everything DDL-related.
 ///
 /// ```ignore
 /// impl reify::Schema for User {
@@ -847,5 +845,25 @@ pub fn table<M>(name: &'static str) -> TableSchema<M> {
 /// }
 /// ```
 pub trait Schema: crate::table::Table {
+    /// Return the full schema definition for this table.
     fn schema() -> TableSchema<Self>;
+
+    /// Convenience accessor — returns the column definitions from `schema()`.
+    fn column_defs() -> Vec<ColumnDef> {
+        Self::schema().columns
+    }
+
+    /// Convenience accessor — returns the index definitions from `schema()`.
+    fn indexes() -> Vec<IndexDef> {
+        Self::schema().indexes
+    }
+
+    /// Foreign-key constraints collected from `schema().columns`.
+    fn foreign_keys() -> Vec<ForeignKeyDef> {
+        Self::schema()
+            .columns
+            .into_iter()
+            .filter_map(|d| d.foreign_key)
+            .collect()
+    }
 }

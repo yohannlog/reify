@@ -1,13 +1,11 @@
 use super::context::MigrationContext;
-use super::ddl::{
-    add_column_sql, create_table_sql, create_table_sql_named, create_table_sql_with_checks,
-};
+use super::ddl::{add_column_sql, create_table_sql, create_table_sql_with_checks};
 use super::diff::{ColumnDiff, DbColumnInfo, SchemaDiff, TableDiff, normalize_sql_type};
 use super::error::MigrationError;
 use super::plan::{MigrationPlan, MigrationStatus};
 use super::traits::Migration;
 use crate::db::{Database, DbError};
-use crate::schema;
+use crate::schema::Schema;
 use crate::table::Table;
 use crate::value::Value;
 use std::collections::HashSet;
@@ -70,61 +68,18 @@ impl MigrationRunner {
         }
     }
 
-    /// Register a `Table` type for automatic diff-based migration.
+    /// Register a `Table + Schema` type for automatic diff-based migration.
+    ///
+    /// Reads the full schema from `T::schema()` — column types, constraints,
+    /// indexes, and table-level CHECK expressions are all sourced from there.
     ///
     /// - If the table does not exist → emits `CREATE TABLE IF NOT EXISTS`.
     /// - If the table exists but has new columns → emits `ALTER TABLE ADD COLUMN`.
     /// - Drops, renames, and type changes are **never** auto-generated.
-    pub fn add_table<T: Table>(mut self) -> Self {
-        // Use rich metadata from column_defs() when available;
-        // fall back to minimal defs from column_names() for plain Table impls.
-        let column_defs = {
-            let defs = T::column_defs();
-            if defs.is_empty() {
-                T::column_names()
-                    .iter()
-                    .map(|name| crate::schema::ColumnDef {
-                        name,
-                        sql_type: if *name == "id" {
-                            crate::schema::SqlType::BigSerial
-                        } else {
-                            crate::schema::SqlType::Text
-                        },
-                        primary_key: *name == "id",
-                        auto_increment: *name == "id",
-                        unique: false,
-                        index: false,
-                        nullable: false,
-                        default: None,
-                        computed: None,
-                        timestamp_kind: None,
-                        timestamp_source: crate::schema::TimestampSource::Vm,
-                        check: None,
-                        foreign_key: None,
-                    })
-                    .collect()
-            } else {
-                defs
-            }
-        };
-
-        let create_sql = create_table_sql::<T>(&column_defs, crate::query::Dialect::Generic);
-
-        self.tables.push(TableEntry {
-            table_name: T::table_name(),
-            column_names: T::column_names(),
-            column_defs,
-            create_sql,
-        });
-        self
-    }
-
-    /// Register a `Table` type with explicit `Schema` metadata for richer DDL.
-    pub fn add_table_with_schema<T>(mut self, schema: crate::schema::TableSchema<T>) -> Self
-    where
-        T: Table,
-    {
-        let create_sql = create_table_sql_with_checks::<T>(
+    pub fn add_table<T: Schema>(mut self) -> Self {
+        let schema = T::schema();
+        let create_sql = create_table_sql_with_checks(
+            schema.name,
             &schema.columns,
             &schema.checks,
             crate::query::Dialect::Generic,
@@ -138,38 +93,16 @@ impl MigrationRunner {
         self
     }
 
-    /// Register a `Table` type that has `#[table(audit)]` for automatic diff-based migration.
+    /// Register a `Schema + Auditable` type for automatic diff-based migration.
     ///
-    /// Registers both the main table (via `add_table::<T>()`) and a synthetic audit companion
-    /// table (`<table>_audit`) with the 5 fixed audit columns.
-    pub fn add_audited_table<T: Table + crate::audit::Auditable>(mut self) -> Self {
+    /// Registers both the main table (via `add_table::<T>()`) and a synthetic
+    /// audit companion table (`<table>_audit`) with the 5 fixed audit columns.
+    pub fn add_audited_table<T: Schema + crate::audit::Auditable>(mut self) -> Self {
         self = self.add_table::<T>();
         let audit_defs = T::audit_column_defs();
         let audit_name = T::audit_table_name();
         let create_sql =
-            create_table_sql_named(audit_name, &audit_defs, crate::query::Dialect::Generic);
-        self.tables.push(TableEntry {
-            table_name: audit_name,
-            column_names: &[],
-            column_defs: audit_defs,
-            create_sql,
-        });
-        self
-    }
-
-    /// Register a `Table` type with explicit `Schema` metadata, plus its audit companion table.
-    ///
-    /// Same as `add_audited_table` but delegates the main table registration to
-    /// `add_table_with_schema(schema)` for users who define their schema via the builder API.
-    pub fn add_audited_table_with_schema<T>(mut self, schema: crate::schema::TableSchema<T>) -> Self
-    where
-        T: Table + crate::audit::Auditable,
-    {
-        self = self.add_table_with_schema(schema);
-        let audit_defs = T::audit_column_defs();
-        let audit_name = T::audit_table_name();
-        let create_sql =
-            create_table_sql_named(audit_name, &audit_defs, crate::query::Dialect::Generic);
+            create_table_sql(audit_name, &audit_defs, crate::query::Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: audit_name,
             column_names: &[],
