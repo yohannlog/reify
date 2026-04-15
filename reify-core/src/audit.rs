@@ -451,7 +451,7 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
         }
         // key
         out.push('"');
-        out.push_str(col);
+        out.push_str(&json_escape(col));
         out.push_str("\":");
         // value
         match val {
@@ -686,25 +686,38 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
         Box::pin(async move {
             use crate::db::DynDatabase;
 
+            // Wrap the cloned secret so it is zeroized when this future drops,
+            // regardless of whether the transaction succeeds or fails.
+            struct ZeroOnDrop(Vec<u8>);
+            impl Drop for ZeroOnDrop {
+                fn drop(&mut self) {
+                    for byte in self.0.iter_mut() {
+                        unsafe { std::ptr::write_volatile(byte, 0) };
+                    }
+                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let secret_guard = hmac_secret.map(ZeroOnDrop);
+
             // 1. Read matching rows inside the transaction (locked FOR UPDATE).
             let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
 
             // 2. Serialize rows and compute HMACs.
+            let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
             let mut entries: Vec<(String, Option<String>)> = Vec::with_capacity(old_rows.len());
             for row in &old_rows {
                 let vals: Vec<crate::value::Value> = col_names
                     .iter()
                     .map(|c| row.get(c).cloned().unwrap_or(crate::value::Value::Null))
                     .collect();
-                let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
                 let row_data = values_to_json_string(&col_refs, &vals);
-                let row_hash = if let Some(ref secret) = hmac_secret {
+                let row_hash = if let Some(ref secret) = secret_guard {
                     let actor = match actor_id {
                         Some(id) => id.to_string(),
                         None => "null".to_string(),
                     };
-                    let message = build_hmac_message("update", &actor, &row_data);
-                    Some(hex_encode(&hmac_sha256(secret, message.as_bytes())))
+                    let message = build_hmac_message(AuditOperation::Update.as_str(), &actor, &row_data);
+                    Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
                 } else {
                     None
                 };
@@ -721,8 +734,14 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
                     Some(id) => crate::value::Value::I64(id),
                     None => crate::value::Value::Null,
                 };
-                let (audit_sql, audit_params) =
-                    build_audit_insert(audit_table, "update", actor_val, row_data, row_hash);
+                let (audit_sql, audit_params) = build_audit_insert(
+                    audit_table,
+                    AuditOperation::Update.as_str(),
+                    actor_val,
+                    row_data,
+                    row_hash,
+                    crate::query::Dialect::Generic,
+                );
                 DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
             }
             Ok(())
@@ -751,7 +770,10 @@ pub async fn audited_delete<M: Auditable + FromRow>(
     ctx: &AuditContext,
 ) -> Result<u64, DbError> {
     let select = builder.to_select();
-    let (select_sql, select_params) = select.build();
+    let (select_sql_base, select_params) = select.build();
+    // Append FOR UPDATE to lock the rows for the duration of the transaction,
+    // preventing concurrent modifications between the read and the delete.
+    let select_sql = format!("{select_sql_base} FOR UPDATE");
     let (delete_sql, delete_params) = builder.build();
     let audit_table = M::audit_table_name();
     let col_names: Vec<&'static str> = M::column_names().to_vec();
@@ -765,25 +787,38 @@ pub async fn audited_delete<M: Auditable + FromRow>(
         Box::pin(async move {
             use crate::db::DynDatabase;
 
+            // Wrap the cloned secret so it is zeroized when this future drops,
+            // regardless of whether the transaction succeeds or fails.
+            struct ZeroOnDrop(Vec<u8>);
+            impl Drop for ZeroOnDrop {
+                fn drop(&mut self) {
+                    for byte in self.0.iter_mut() {
+                        unsafe { std::ptr::write_volatile(byte, 0) };
+                    }
+                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let secret_guard = hmac_secret.map(ZeroOnDrop);
+
             // 1. Read matching rows inside the transaction for isolation.
             let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
 
             // 2. Serialize rows and compute HMACs.
+            let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
             let mut entries: Vec<(String, Option<String>)> = Vec::with_capacity(old_rows.len());
             for row in &old_rows {
                 let vals: Vec<crate::value::Value> = col_names
                     .iter()
                     .map(|c| row.get(c).cloned().unwrap_or(crate::value::Value::Null))
                     .collect();
-                let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
                 let row_data = values_to_json_string(&col_refs, &vals);
-                let row_hash = if let Some(ref secret) = hmac_secret {
+                let row_hash = if let Some(ref secret) = secret_guard {
                     let actor = match actor_id {
                         Some(id) => id.to_string(),
                         None => "null".to_string(),
                     };
-                    let message = build_hmac_message("delete", &actor, &row_data);
-                    Some(hex_encode(&hmac_sha256(secret, message.as_bytes())))
+                    let message = build_hmac_message(AuditOperation::Delete.as_str(), &actor, &row_data);
+                    Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
                 } else {
                     None
                 };
@@ -800,8 +835,14 @@ pub async fn audited_delete<M: Auditable + FromRow>(
                     Some(id) => crate::value::Value::I64(id),
                     None => crate::value::Value::Null,
                 };
-                let (audit_sql, audit_params) =
-                    build_audit_insert(audit_table, "delete", actor_val, row_data, row_hash);
+                let (audit_sql, audit_params) = build_audit_insert(
+                    audit_table,
+                    AuditOperation::Delete.as_str(),
+                    actor_val,
+                    row_data,
+                    row_hash,
+                    crate::query::Dialect::Generic,
+                );
                 DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
             }
             Ok(())
@@ -818,14 +859,18 @@ pub async fn audited_delete<M: Auditable + FromRow>(
 ///
 /// When `row_hash` is `Some`, includes the `row_hash` column; otherwise omits
 /// it so that existing audit tables without the column still work.
+///
+/// The `dialect` parameter controls placeholder style: `?` for Generic/MySQL,
+/// `$1, $2, …` for PostgreSQL.
 fn build_audit_insert(
     audit_table: &str,
     operation: &str,
     actor_val: crate::value::Value,
     row_data: String,
     row_hash: Option<String>,
+    dialect: crate::query::Dialect,
 ) -> (String, Vec<crate::value::Value>) {
-    if let Some(hash) = row_hash {
+    let (sql, params) = if let Some(hash) = row_hash {
         let sql = format!(
             "INSERT INTO {} (\"operation\", \"actor_id\", \"row_data\", \"row_hash\") VALUES (?, ?, ?, ?)",
             qi(audit_table)
@@ -848,7 +893,23 @@ fn build_audit_insert(
             crate::value::Value::String(row_data),
         ];
         (sql, params)
+    };
+    // Rewrite ? placeholders to $N for PostgreSQL.
+    if dialect == crate::query::Dialect::Postgres {
+        use std::fmt::Write as _;
+        let mut rewritten = String::with_capacity(sql.len() + 16);
+        let mut idx = 1u32;
+        for ch in sql.chars() {
+            if ch == '?' {
+                let _ = write!(rewritten, "${idx}");
+                idx += 1;
+            } else {
+                rewritten.push(ch);
+            }
+        }
+        return (rewritten, params);
     }
+    (sql, params)
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────
@@ -912,7 +973,7 @@ mod tests {
     fn test_values_to_json_string_finite_floats() {
         let json = values_to_json_string(
             &["f32", "f64"],
-            &[Value::F32(1.5), Value::F64(3.14)],
+            &[Value::F32(1.5), Value::F64(std::f64::consts::PI)],
         );
         assert!(json.contains("1.5"), "expected 1.5 in: {json}");
         assert!(json.contains("3.14"), "expected 3.14 in: {json}");

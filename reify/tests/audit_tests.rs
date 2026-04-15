@@ -111,7 +111,7 @@ fn audit_table_name() {
 #[test]
 fn audit_column_defs_count() {
     let defs = AuditUser::audit_column_defs();
-    assert_eq!(defs.len(), 5);
+    assert_eq!(defs.len(), 6);
 }
 
 #[test]
@@ -122,6 +122,7 @@ fn audit_column_defs_names() {
     assert_eq!(defs[2].name, "actor_id");
     assert_eq!(defs[3].name, "changed_at");
     assert_eq!(defs[4].name, "row_data");
+    assert_eq!(defs[5].name, "row_hash");
 }
 
 #[test]
@@ -137,6 +138,8 @@ fn audit_column_defs_types() {
     assert_eq!(defs[3].default, Some("NOW()".to_string()));
     assert_eq!(defs[4].sql_type, SqlType::Jsonb);
     assert!(!defs[4].nullable);
+    assert_eq!(defs[5].sql_type, SqlType::Text);
+    assert!(defs[5].nullable);
 }
 
 // ── MigrationRunner::add_audited_table ───────────────────────────────
@@ -237,6 +240,14 @@ fn json_string_escaping() {
 #[tokio::test]
 async fn audited_update_executes_update_and_audit_insert() {
     let db = MockDb::new();
+
+    // Pre-load the SELECT FOR UPDATE result (before-image of the row being updated).
+    let old_row = Row::new(
+        vec!["id".into(), "email".into(), "role".into()],
+        vec![Value::I64(1), Value::String("old@example.com".into()), Value::Null],
+    );
+    db.push_rows(vec![old_row]);
+
     let ctx = AuditContext { actor_id: Some(42), hmac_secret: None };
 
     let builder = AuditUser::update()
@@ -262,6 +273,14 @@ async fn audited_update_executes_update_and_audit_insert() {
 #[tokio::test]
 async fn audited_update_null_actor() {
     let db = MockDb::new();
+
+    // Pre-load the SELECT FOR UPDATE result so the audit INSERT fires.
+    let old_row = Row::new(
+        vec!["id".into(), "email".into(), "role".into()],
+        vec![Value::I64(1), Value::String("old@example.com".into()), Value::Null],
+    );
+    db.push_rows(vec![old_row]);
+
     let ctx = AuditContext { actor_id: None, hmac_secret: None };
 
     let builder = AuditUser::update()
