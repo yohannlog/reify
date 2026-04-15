@@ -281,8 +281,9 @@ impl Cursor {
         let bytes = base64_decode(cursor)?;
         let raw = std::str::from_utf8(&bytes).ok()?;
         let mut result = Vec::new();
-        for part in raw.split('|') {
-            let (col, val) = decode_field(part)?;
+        // Split on unescaped `|` (escaped `\|` is part of a value)
+        for part in split_cursor_fields(raw) {
+            let (col, val) = decode_field(&part)?;
             result.push((col, val));
         }
         if result.is_empty() {
@@ -303,6 +304,36 @@ impl std::fmt::Display for Cursor {
     }
 }
 
+/// Escape `|` and `\` in a string so it is safe to embed in the
+/// `col:type:value` cursor format (which uses `|` as field separator).
+fn escape_cursor_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+/// Unescape a string that was escaped by `escape_cursor_str`.
+fn unescape_cursor_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('|') => {
+                    out.push('|');
+                    chars.next();
+                }
+                Some('\\') => {
+                    out.push('\\');
+                    chars.next();
+                }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn encode_value(val: &Value) -> String {
     match val {
         Value::I16(v) => format!("i16:{v}"),
@@ -310,7 +341,7 @@ fn encode_value(val: &Value) -> String {
         Value::I64(v) => format!("i64:{v}"),
         Value::F32(v) => format!("f32:{v}"),
         Value::F64(v) => format!("f64:{v}"),
-        Value::String(s) => format!("str:{s}"),
+        Value::String(s) => format!("str:{}", escape_cursor_str(s)),
         Value::Bool(b) => format!("bool:{b}"),
         #[cfg(feature = "postgres")]
         Value::Uuid(u) => format!("uuid:{u}"),
@@ -341,7 +372,7 @@ fn decode_field(part: &str) -> Option<(String, Value)> {
         "i64" => Value::I64(raw.parse().ok()?),
         "f32" => Value::F32(raw.parse().ok()?),
         "f64" => Value::F64(raw.parse().ok()?),
-        "str" => Value::String(raw.to_string()),
+        "str" => Value::String(unescape_cursor_str(raw)),
         "bool" => Value::Bool(raw.parse().ok()?),
         #[cfg(feature = "postgres")]
         "uuid" => Value::Uuid(raw.parse().ok()?),
@@ -391,12 +422,12 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let mut i = 0;
     while i < bytes.len() {
         let remaining = bytes.len() - i;
-        let b0 = b64_val(bytes[i])?;
-        let b1 = if i + 1 < bytes.len() {
-            b64_val(bytes[i + 1])?
-        } else {
+        // Need at least 2 chars to decode 1 byte
+        if remaining < 2 {
             return None;
-        };
+        }
+        let b0 = b64_val(bytes[i])?;
+        let b1 = b64_val(bytes[i + 1])?;
         let b2 = if i + 2 < bytes.len() {
             b64_val(bytes[i + 2])?
         } else {
@@ -408,16 +439,51 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
             0
         };
         let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
+        // Always emit the first byte
         out.push(((triple >> 16) & 0xFF) as u8);
-        if remaining > 2 {
+        // Emit second byte if we had at least 3 chars in this group
+        if remaining >= 3 {
             out.push(((triple >> 8) & 0xFF) as u8);
         }
-        if remaining > 3 {
+        // Emit third byte only if we had a full group of 4
+        if remaining >= 4 {
             out.push((triple & 0xFF) as u8);
         }
         i += 4;
     }
     Some(out)
+}
+
+/// Split a cursor raw string on unescaped `|` separators.
+/// `\|` is treated as a literal pipe inside a field value.
+fn split_cursor_fields(s: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('|') => {
+                    current.push('\\');
+                    current.push('|');
+                    chars.next();
+                }
+                Some('\\') => {
+                    current.push('\\');
+                    current.push('\\');
+                    chars.next();
+                }
+                _ => current.push(c),
+            }
+        } else if c == '|' {
+            fields.push(current.clone());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current);
+    fields
 }
 
 fn b64_val(c: u8) -> Option<u32> {
@@ -794,7 +860,8 @@ fn build_cursor_condition(
         let use_gt = first_desc == backward;
         let op = if use_gt { ">" } else { "<" };
 
-        let col_list: Vec<&str> = columns.iter().map(|c| c.name).collect();
+        // Quote each column name to handle reserved words and mixed-case identifiers.
+        let col_list: Vec<String> = columns.iter().map(|c| qi(c.name)).collect();
         let placeholders: Vec<&str> = vec!["?"; columns.len()];
 
         let raw_sql = format!(
@@ -945,3 +1012,111 @@ impl<M: Table> SelectBuilder<M> {
 
 // Text-based helpers removed — pagination now operates on SqlFragment AST.
 // See SqlFragment::to_count_query(), without_limit_offset(), without_order_by().
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::Value;
+
+    // ── Cursor encode/decode round-trips ────────────────────────────
+
+    #[test]
+    fn cursor_roundtrip_simple_i64() {
+        let fields = [("id", &Value::I64(42))];
+        let cursor = Cursor::encode(&fields);
+        let decoded = Cursor::decode(cursor.as_str()).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "id");
+        assert_eq!(decoded[0].1, Value::I64(42));
+    }
+
+    #[test]
+    fn cursor_roundtrip_string_with_pipe() {
+        // A string value containing `|` must survive encode/decode without
+        // being split into multiple fields.
+        let s = Value::String("foo|bar|baz".to_string());
+        let fields = [("name", &s)];
+        let cursor = Cursor::encode(&fields);
+        let decoded = Cursor::decode(cursor.as_str()).unwrap();
+        assert_eq!(decoded.len(), 1, "pipe in value must not split fields");
+        assert_eq!(decoded[0].0, "name");
+        assert_eq!(decoded[0].1, Value::String("foo|bar|baz".to_string()));
+    }
+
+    #[test]
+    fn cursor_roundtrip_string_with_backslash() {
+        let s = Value::String("back\\slash".to_string());
+        let fields = [("path", &s)];
+        let cursor = Cursor::encode(&fields);
+        let decoded = Cursor::decode(cursor.as_str()).unwrap();
+        assert_eq!(decoded[0].1, Value::String("back\\slash".to_string()));
+    }
+
+    #[test]
+    fn cursor_roundtrip_multi_field() {
+        let a = Value::I64(99);
+        let b = Value::String("hello|world".to_string());
+        let fields = [("id", &a), ("name", &b)];
+        let cursor = Cursor::encode(&fields);
+        let decoded = Cursor::decode(cursor.as_str()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].1, Value::I64(99));
+        assert_eq!(decoded[1].1, Value::String("hello|world".to_string()));
+    }
+
+    #[test]
+    fn cursor_decode_invalid_returns_none() {
+        assert!(Cursor::decode("!!!not-base64!!!").is_none());
+    }
+
+    // ── base64 unpadded round-trips ─────────────────────────────────
+
+    #[test]
+    fn base64_roundtrip_various_lengths() {
+        for len in 0usize..=9 {
+            let input: Vec<u8> = (0..len as u8).collect();
+            let encoded = base64_encode(&input);
+            let decoded = base64_decode(&encoded).unwrap_or_else(|| {
+                panic!("base64_decode failed for len={len}, encoded={encoded:?}")
+            });
+            assert_eq!(decoded, input, "roundtrip failed for len={len}");
+        }
+    }
+
+    #[test]
+    fn base64_known_values() {
+        // "Man" → "TWFu" (standard base64, same chars in URL-safe alphabet)
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        let decoded = base64_decode("TWFu").unwrap();
+        assert_eq!(decoded, b"Man");
+    }
+
+    // ── escape_cursor_str / unescape_cursor_str ─────────────────────
+
+    #[test]
+    fn escape_unescape_roundtrip() {
+        let cases = ["plain", "with|pipe", "back\\slash", "both|and\\mixed", ""];
+        for s in &cases {
+            let escaped = escape_cursor_str(s);
+            let unescaped = unescape_cursor_str(&escaped);
+            assert_eq!(&unescaped, s, "roundtrip failed for: {s:?}");
+        }
+    }
+
+    #[test]
+    fn escape_pipes_are_preceded_by_backslash() {
+        let escaped = escape_cursor_str("a|b|c");
+        // Every `|` in the escaped output must be preceded by `\`.
+        let bytes = escaped.as_bytes();
+        for i in 0..bytes.len() {
+            if bytes[i] == b'|' {
+                assert!(
+                    i > 0 && bytes[i - 1] == b'\\',
+                    "bare pipe at position {i} in escaped string: {escaped:?}"
+                );
+            }
+        }
+        // And the roundtrip must recover the original.
+        assert_eq!(unescape_cursor_str(&escaped), "a|b|c");
+    }
+}

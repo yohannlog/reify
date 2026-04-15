@@ -36,7 +36,7 @@ const H0: [u32; 8] = [
 ];
 
 /// Compute SHA-256 over arbitrary bytes. Returns a 32-byte digest.
-pub fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = H0;
 
     // Pre-processing: pad to a multiple of 512 bits (64 bytes).
@@ -107,7 +107,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 ///
 /// Implements RFC 2104: `HMAC(K, m) = H((K' ⊕ opad) ∥ H((K' ⊕ ipad) ∥ m))`
 /// where `K'` is the key zero-padded (or hashed) to the block size (64 bytes).
-pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     // Derive block-sized key.
     let mut k = [0u8; 64];
     if key.len() > 64 {
@@ -138,7 +138,7 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 }
 
 /// Encode a byte slice as a lowercase hex string.
-pub fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
         use std::fmt::Write;
         let _ = write!(s, "{b:02x}");
@@ -169,13 +169,25 @@ impl AuditOperation {
 /// Context passed to audited operations (who triggered the change).
 ///
 /// When `hmac_secret` is set, every audit row receives a `row_hash` column
-/// containing `HMAC-SHA256(secret, "<operation>|<actor_id>|<row_data>")` encoded
-/// as a lowercase hex string. This makes tampering with any field detectable.
+/// containing an HMAC-SHA256 digest of the operation, actor, and row data,
+/// encoded as a lowercase hex string. This makes tampering with any field detectable.
 pub struct AuditContext {
     pub actor_id: Option<i64>,
     /// Optional HMAC-SHA256 secret. When present, a `row_hash` is computed and
     /// stored alongside every audit row, enabling tamper detection.
     pub hmac_secret: Option<Vec<u8>>,
+}
+
+impl Drop for AuditContext {
+    fn drop(&mut self) {
+        if let Some(ref mut secret) = self.hmac_secret {
+            // Zeroize secret bytes to prevent leakage via memory, swap, or core dumps.
+            for byte in secret.iter_mut() {
+                unsafe { std::ptr::write_volatile(byte, 0) };
+            }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 impl AuditContext {
@@ -192,16 +204,33 @@ impl AuditContext {
     /// Compute the HMAC-SHA256 hex digest for an audit row, or `None` if no
     /// secret is configured.
     ///
-    /// The signed message is: `"<operation>|<actor_id_or_null>|<row_data>"`
+    /// The signed message uses length-prefixed fields to prevent ambiguity:
+    /// `"<op_len>:<operation><actor_len>:<actor><data_len>:<row_data>"`
     pub fn compute_hash(&self, operation: &str, row_data: &str) -> Option<String> {
         let secret = self.hmac_secret.as_deref()?;
         let actor = match self.actor_id {
             Some(id) => id.to_string(),
             None => "null".to_string(),
         };
-        let message = format!("{operation}|{actor}|{row_data}");
+        let message = build_hmac_message(operation, &actor, row_data);
         Some(hex_encode(&hmac_sha256(secret, message.as_bytes())))
     }
+}
+
+/// Build an unambiguous, length-prefixed HMAC message from the audit fields.
+///
+/// Format: `"<op_len>:<operation><actor_len>:<actor><data_len>:<row_data>"`
+/// This prevents collision attacks where field values contain delimiter characters.
+fn build_hmac_message(operation: &str, actor: &str, row_data: &str) -> String {
+    format!(
+        "{}:{}{}:{}{}:{}",
+        operation.len(),
+        operation,
+        actor.len(),
+        actor,
+        row_data.len(),
+        row_data
+    )
 }
 
 // ── Auditable trait ──────────────────────────────────────────────────
@@ -323,8 +352,12 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
 /// Verify that a stored `row_hash` matches the expected HMAC-SHA256 for the
 /// given audit row fields.
 ///
-/// Returns `true` when the hash is valid, `false` when it has been tampered
-/// with, and `None` when `stored_hash` is `None` (integrity not enabled).
+/// Returns `Some(true)` when the hash is valid, `Some(false)` when it has been
+/// tampered with. When `stored_hash` is `None`:
+/// - If `integrity_expected` is `true`, returns `Some(false)` (a missing hash
+///   is treated as tampering — an attacker may have nullified it).
+/// - If `integrity_expected` is `false`, returns `None` (integrity was never
+///   enabled for this row, so there is nothing to verify).
 ///
 /// # Example
 /// ```
@@ -332,9 +365,10 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
 ///
 /// let ctx = AuditContext::with_integrity(Some(7), b"secret");
 /// let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
-/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash)), Some(true));
-/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None), None);
-/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":2}"#, Some(&hash)), Some(false));
+/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash), false), Some(true));
+/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, false), None);
+/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, true), Some(false));
+/// assert_eq!(verify_audit_row(b"secret", "delete", Some(7), r#"{"id":2}"#, Some(&hash), false), Some(false));
 /// ```
 pub fn verify_audit_row(
     secret: &[u8],
@@ -342,21 +376,32 @@ pub fn verify_audit_row(
     actor_id: Option<i64>,
     row_data: &str,
     stored_hash: Option<&str>,
+    integrity_expected: bool,
 ) -> Option<bool> {
-    let stored = stored_hash?;
-    let actor = match actor_id {
-        Some(id) => id.to_string(),
-        None => "null".to_string(),
-    };
-    let message = format!("{operation}|{actor}|{row_data}");
-    let expected = hex_encode(&hmac_sha256(secret, message.as_bytes()));
-    // Constant-time comparison to prevent timing attacks.
-    Some(constant_time_eq(expected.as_bytes(), stored.as_bytes()))
+    match stored_hash {
+        Some(stored) => {
+            let actor = match actor_id {
+                Some(id) => id.to_string(),
+                None => "null".to_string(),
+            };
+            let message = build_hmac_message(operation, &actor, row_data);
+            let expected = hex_encode(&hmac_sha256(secret, message.as_bytes()));
+            // Constant-time comparison to prevent timing attacks.
+            Some(constant_time_eq(expected.as_bytes(), stored.as_bytes()))
+        }
+        None if integrity_expected => Some(false),
+        None => None,
+    }
 }
 
 /// Constant-time byte-slice equality — prevents timing side-channels when
 /// comparing MAC values.
+///
+/// Both inputs MUST have the same length. A debug assertion checks this
+/// invariant; the function returns `false` for unequal lengths in release
+/// builds without branching on the length difference.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), b.len(), "constant_time_eq requires equal-length inputs");
     if a.len() != b.len() {
         return false;
     }
@@ -364,6 +409,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ── JSON serialisation helper ────────────────────────────────────────
+
+/// Escape a string for safe embedding in a JSON string literal per RFC 8259.
+///
+/// Escapes: `"`, `\`, and all C0 control characters (U+0000–U+001F).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Serialise column-value pairs to a JSON object string without any external crate.
 ///
@@ -392,11 +460,23 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::I16(n) => out.push_str(&n.to_string()),
             Value::I32(n) => out.push_str(&n.to_string()),
             Value::I64(n) => out.push_str(&n.to_string()),
-            Value::F32(f) => out.push_str(&f.to_string()),
-            Value::F64(f) => out.push_str(&f.to_string()),
+            Value::F32(f) => {
+                if f.is_finite() {
+                    out.push_str(&f.to_string());
+                } else {
+                    out.push_str("null");
+                }
+            }
+            Value::F64(f) => {
+                if f.is_finite() {
+                    out.push_str(&f.to_string());
+                } else {
+                    out.push_str("null");
+                }
+            }
             Value::String(s) => {
                 out.push('"');
-                out.push_str(&s.replace('\\', "\\\\").replace('"', "\\\""));
+                out.push_str(&json_escape(s));
                 out.push('"');
             }
             Value::Bytes(b) => {
@@ -544,7 +624,7 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
                         out.push(',');
                     }
                     out.push('"');
-                    out.push_str(&v.replace('\\', "\\\\").replace('"', "\\\""));
+                    out.push_str(&json_escape(v));
                     out.push('"');
                 }
                 out.push(']');
@@ -603,9 +683,10 @@ pub async fn audited_update<M: Auditable>(
 
     db.transaction(Box::new(move |tx| {
         Box::pin(async move {
-            let n = tx.execute(&update_sql, &update_params).await?;
+            use crate::db::DynDatabase;
+            let n = DynDatabase::execute(tx, &update_sql, &update_params).await?;
             affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
-            tx.execute(&audit_sql, &audit_params).await?;
+            DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
             Ok(())
         })
     }))
@@ -619,44 +700,63 @@ pub async fn audited_update<M: Auditable>(
 /// SELECT matching rows, DELETE them, and write one audit row per deleted record —
 /// all inside a single transaction.
 ///
+/// The SELECT, DELETE, and audit INSERTs all execute within the same transaction
+/// to prevent TOCTOU race conditions where rows could change between the read
+/// and the delete.
+///
 /// When [`AuditContext::hmac_secret`] is set, each audit row receives a
-/// `row_hash` column with `HMAC-SHA256(secret, "delete|<actor_id>|<row_data>")`
-/// so that any post-hoc modification is detectable via [`verify_audit_row`].
+/// `row_hash` column with an HMAC-SHA256 digest of the operation, actor, and
+/// row data so that any post-hoc modification is detectable via [`verify_audit_row`].
 pub async fn audited_delete<M: Auditable + FromRow>(
     db: &impl Database,
     builder: DeleteBuilder<M>,
     ctx: &AuditContext,
 ) -> Result<u64, DbError> {
-    // 1. Capture old rows before deletion (outside the transaction — read-only).
     let select = builder.to_select();
     let (select_sql, select_params) = select.build();
-    let old_rows = db.query(&select_sql, &select_params).await?;
-
-    // Serialize each row to JSON and pre-compute its HMAC (before the closure).
-    let col_names: Vec<&'static str> = M::column_names().to_vec();
-    let mut entries: Vec<(String, Option<String>)> = Vec::with_capacity(old_rows.len());
-    for row in &old_rows {
-        let vals: Vec<crate::value::Value> = col_names
-            .iter()
-            .map(|c| row.get(c).cloned().unwrap_or(crate::value::Value::Null))
-            .collect();
-        let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
-        let row_data = values_to_json_string(&col_refs, &vals);
-        let row_hash = ctx.compute_hash("delete", &row_data);
-        entries.push((row_data, row_hash));
-    }
-
     let (delete_sql, delete_params) = builder.build();
     let audit_table = M::audit_table_name();
+    let col_names: Vec<&'static str> = M::column_names().to_vec();
     let actor_id = ctx.actor_id;
+    let hmac_secret = ctx.hmac_secret.clone();
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
 
     db.transaction(Box::new(move |tx| {
         Box::pin(async move {
-            let n = tx.execute(&delete_sql, &delete_params).await?;
+            use crate::db::DynDatabase;
+
+            // 1. Read matching rows inside the transaction for isolation.
+            let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
+
+            // 2. Serialize rows and compute HMACs.
+            let mut entries: Vec<(String, Option<String>)> = Vec::with_capacity(old_rows.len());
+            for row in &old_rows {
+                let vals: Vec<crate::value::Value> = col_names
+                    .iter()
+                    .map(|c| row.get(c).cloned().unwrap_or(crate::value::Value::Null))
+                    .collect();
+                let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
+                let row_data = values_to_json_string(&col_refs, &vals);
+                let row_hash = if let Some(ref secret) = hmac_secret {
+                    let actor = match actor_id {
+                        Some(id) => id.to_string(),
+                        None => "null".to_string(),
+                    };
+                    let message = build_hmac_message("delete", &actor, &row_data);
+                    Some(hex_encode(&hmac_sha256(secret, message.as_bytes())))
+                } else {
+                    None
+                };
+                entries.push((row_data, row_hash));
+            }
+
+            // 3. Delete the rows.
+            let n = DynDatabase::execute(tx, &delete_sql, &delete_params).await?;
             affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
+
+            // 4. Insert audit rows.
             for (row_data, row_hash) in entries {
                 let actor_val = match actor_id {
                     Some(id) => crate::value::Value::I64(id),
@@ -664,7 +764,7 @@ pub async fn audited_delete<M: Auditable + FromRow>(
                 };
                 let (audit_sql, audit_params) =
                     build_audit_insert(audit_table, "delete", actor_val, row_data, row_hash);
-                tx.execute(&audit_sql, &audit_params).await?;
+                DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
             }
             Ok(())
         })
@@ -749,6 +849,35 @@ mod tests {
     fn test_values_to_json_string_escaping() {
         let json = values_to_json_string(&["msg"], &[Value::String(r#"say "hi""#.into())]);
         assert_eq!(json, r#"{"msg":"say \"hi\""}"#);
+    }
+
+    #[test]
+    fn test_values_to_json_string_non_finite_f32() {
+        let json = values_to_json_string(
+            &["a", "b", "c"],
+            &[Value::F32(f32::INFINITY), Value::F32(f32::NEG_INFINITY), Value::F32(f32::NAN)],
+        );
+        // Non-finite floats must render as JSON null (not "inf" / "NaN" which are invalid JSON)
+        assert_eq!(json, r#"{"a":null,"b":null,"c":null}"#);
+    }
+
+    #[test]
+    fn test_values_to_json_string_non_finite_f64() {
+        let json = values_to_json_string(
+            &["x", "y"],
+            &[Value::F64(f64::INFINITY), Value::F64(f64::NAN)],
+        );
+        assert_eq!(json, r#"{"x":null,"y":null}"#);
+    }
+
+    #[test]
+    fn test_values_to_json_string_finite_floats() {
+        let json = values_to_json_string(
+            &["f32", "f64"],
+            &[Value::F32(1.5), Value::F64(3.14)],
+        );
+        assert!(json.contains("1.5"), "expected 1.5 in: {json}");
+        assert!(json.contains("3.14"), "expected 3.14 in: {json}");
     }
 
     #[test]
@@ -868,7 +997,7 @@ mod tests {
         let ctx = AuditContext::with_integrity(Some(7), b"secret");
         let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash)),
+            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash), false),
             Some(true)
         );
     }
@@ -879,7 +1008,7 @@ mod tests {
         let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
         // row_data changed after the fact
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":99}"#, Some(&hash)),
+            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":99}"#, Some(&hash), false),
             Some(false)
         );
     }
@@ -889,7 +1018,7 @@ mod tests {
         let ctx = AuditContext::with_integrity(Some(7), b"secret");
         let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"secret", "update", Some(7), r#"{"id":1}"#, Some(&hash)),
+            verify_audit_row(b"secret", "update", Some(7), r#"{"id":1}"#, Some(&hash), false),
             Some(false)
         );
     }
@@ -899,7 +1028,7 @@ mod tests {
         let ctx = AuditContext::with_integrity(Some(7), b"secret");
         let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(99), r#"{"id":1}"#, Some(&hash)),
+            verify_audit_row(b"secret", "delete", Some(99), r#"{"id":1}"#, Some(&hash), false),
             Some(false)
         );
     }
@@ -908,7 +1037,7 @@ mod tests {
     fn test_verify_audit_row_no_hash_stored() {
         // No hash stored → integrity not enabled for this row → None
         assert_eq!(
-            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None),
+            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, false),
             None
         );
     }
@@ -918,7 +1047,7 @@ mod tests {
         let ctx = AuditContext::with_integrity(Some(7), b"correct-secret");
         let hash = ctx.compute_hash("delete", r#"{"id":1}"#).unwrap();
         assert_eq!(
-            verify_audit_row(b"wrong-secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash)),
+            verify_audit_row(b"wrong-secret", "delete", Some(7), r#"{"id":1}"#, Some(&hash), false),
             Some(false)
         );
     }
@@ -937,6 +1066,48 @@ mod tests {
 
     #[test]
     fn test_constant_time_eq_different_lengths() {
-        assert!(!constant_time_eq(b"hi", b"hello"));
+        // In debug builds, this triggers a debug_assert (panic).
+        // In release, unequal lengths return false.
+        let result = std::panic::catch_unwind(|| constant_time_eq(b"hi", b"hello"));
+        match result {
+            Ok(false) => {} // release mode: returns false
+            Err(_) => {}    // debug mode: debug_assert panics
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    // ── integrity_expected flag ───────────────────────────────────────
+
+    #[test]
+    fn test_verify_audit_row_null_hash_with_integrity_expected() {
+        // A NULL hash when integrity is expected = tampering
+        assert_eq!(
+            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, true),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_verify_audit_row_null_hash_without_integrity_expected() {
+        // A NULL hash when integrity was never enabled = indeterminate
+        assert_eq!(
+            verify_audit_row(b"secret", "delete", Some(7), r#"{"id":1}"#, None, false),
+            None
+        );
+    }
+
+    // ── JSON escaping ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_values_to_json_string_control_chars() {
+        let json = values_to_json_string(
+            &["newline", "tab", "null_byte"],
+            &[
+                Value::String("hello\nworld".into()),
+                Value::String("a\tb".into()),
+                Value::String("x\x00y".into()),
+            ],
+        );
+        assert_eq!(json, r#"{"newline":"hello\nworld","tab":"a\tb","null_byte":"x\u0000y"}"#);
     }
 }

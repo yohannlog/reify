@@ -237,7 +237,7 @@ fn json_string_escaping() {
 #[tokio::test]
 async fn audited_update_executes_update_and_audit_insert() {
     let db = MockDb::new();
-    let ctx = AuditContext { actor_id: Some(42) };
+    let ctx = AuditContext { actor_id: Some(42), hmac_secret: None };
 
     let builder = AuditUser::update()
         .set(AuditUser::email, "new@example.com")
@@ -262,7 +262,7 @@ async fn audited_update_executes_update_and_audit_insert() {
 #[tokio::test]
 async fn audited_update_null_actor() {
     let db = MockDb::new();
-    let ctx = AuditContext { actor_id: None };
+    let ctx = AuditContext { actor_id: None, hmac_secret: None };
 
     let builder = AuditUser::update()
         .set(AuditUser::email, "x@example.com")
@@ -292,7 +292,7 @@ async fn audited_delete_captures_rows_and_inserts_audit() {
     );
     db.push_rows(vec![old_row]);
 
-    let ctx = AuditContext { actor_id: Some(7) };
+    let ctx = AuditContext { actor_id: Some(7), hmac_secret: None };
     let builder = AuditUser::delete().filter(AuditUser::id.eq(1i64));
 
     reify::audited_delete::<AuditUser>(&db, builder, &ctx)
@@ -331,7 +331,7 @@ async fn audited_delete_no_rows_no_audit_insert() {
     // SELECT returns empty — nothing to delete
     db.push_rows(vec![]);
 
-    let ctx = AuditContext { actor_id: Some(1) };
+    let ctx = AuditContext { actor_id: Some(1), hmac_secret: None };
     let builder = AuditUser::delete().filter(AuditUser::id.eq(999i64));
 
     reify::audited_delete::<AuditUser>(&db, builder, &ctx)

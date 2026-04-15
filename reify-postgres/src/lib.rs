@@ -628,16 +628,25 @@ impl Database for PgTransaction {
     }
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
-        // Nested transaction via SAVEPOINT
-        debug!(target: "reify::postgres", "SAVEPOINT nested_txn");
+        // Nested transaction via SAVEPOINT with a unique name to support
+        // multiple concurrent nested transactions on the same connection.
+        let sp_name = format!(
+            "sp_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                ^ (self as *const _ as u64) as u32
+        );
+        debug!(target: "reify::postgres", savepoint = %sp_name, "SAVEPOINT (nested)");
         self.conn
-            .execute("SAVEPOINT nested_txn", &[])
+            .execute(&format!("SAVEPOINT {sp_name}"), &[])
             .await
             .map_err(pg_err)?;
         match f(self).await {
             Ok(()) => {
                 self.conn
-                    .execute("RELEASE SAVEPOINT nested_txn", &[])
+                    .execute(&format!("RELEASE SAVEPOINT {sp_name}"), &[])
                     .await
                     .map_err(pg_err)?;
                 Ok(())
@@ -645,7 +654,7 @@ impl Database for PgTransaction {
             Err(e) => {
                 let _ = self
                     .conn
-                    .execute("ROLLBACK TO SAVEPOINT nested_txn", &[])
+                    .execute(&format!("ROLLBACK TO SAVEPOINT {sp_name}"), &[])
                     .await;
                 Err(e)
             }

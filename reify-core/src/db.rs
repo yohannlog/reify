@@ -4,26 +4,40 @@ use crate::value::Value;
 // ── Row abstraction ─────────────────────────────────────────────────
 
 /// A single row returned by a query.
+///
+/// Column lookup by name is O(1) via an internal index map built lazily on
+/// the first call to [`get`](Row::get). Positional access via
+/// [`get_idx`](Row::get_idx) is always O(1).
 #[derive(Debug, Clone)]
 pub struct Row {
     columns: Vec<String>,
     values: Vec<Value>,
+    /// Lazily-built column-name → index map for O(1) named lookups.
+    index: std::sync::OnceLock<std::collections::HashMap<String, usize>>,
 }
 
 impl Row {
     pub fn new(columns: Vec<String>, values: Vec<Value>) -> Self {
-        Self { columns, values }
+        Self {
+            columns,
+            values,
+            index: std::sync::OnceLock::new(),
+        }
     }
 
-    /// Get a value by column name.
+    /// Get a value by column name (O(1) after the first call).
     pub fn get(&self, column: &str) -> Option<&Value> {
-        self.columns
-            .iter()
-            .position(|c| c == column)
-            .map(|i| &self.values[i])
+        let idx_map = self.index.get_or_init(|| {
+            self.columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.clone(), i))
+                .collect()
+        });
+        idx_map.get(column).and_then(|&i| self.values.get(i))
     }
 
-    /// Get a value by column index.
+    /// Get a value by column index (always O(1)).
     pub fn get_idx(&self, index: usize) -> Option<&Value> {
         self.values.get(index)
     }
@@ -753,6 +767,50 @@ mod tests {
         );
         assert_eq!(DbError::Other("oops".into()).to_string(), "error: oops");
     }
+
+    // ── Row::get index cache ─────────────────────────────────────────
+
+    #[test]
+    fn row_get_by_name_returns_correct_value() {
+        let row = Row::new(
+            vec!["id".into(), "name".into(), "active".into()],
+            vec![Value::I64(7), Value::String("alice".into()), Value::Bool(true)],
+        );
+        assert_eq!(row.get("id"), Some(&Value::I64(7)));
+        assert_eq!(row.get("name"), Some(&Value::String("alice".into())));
+        assert_eq!(row.get("active"), Some(&Value::Bool(true)));
+        assert_eq!(row.get("missing"), None);
+    }
+
+    #[test]
+    fn row_get_is_idempotent_after_cache_build() {
+        let row = Row::new(
+            vec!["x".into(), "y".into()],
+            vec![Value::I32(1), Value::I32(2)],
+        );
+        // Call twice — second call uses the cached index map.
+        assert_eq!(row.get("x"), Some(&Value::I32(1)));
+        assert_eq!(row.get("x"), Some(&Value::I32(1)));
+        assert_eq!(row.get("y"), Some(&Value::I32(2)));
+    }
+
+    #[test]
+    fn row_get_idx_returns_correct_value() {
+        let row = Row::new(
+            vec!["a".into(), "b".into()],
+            vec![Value::I64(10), Value::I64(20)],
+        );
+        assert_eq!(row.get_idx(0), Some(&Value::I64(10)));
+        assert_eq!(row.get_idx(1), Some(&Value::I64(20)));
+        assert_eq!(row.get_idx(2), None);
+    }
+
+    #[test]
+    fn row_columns_and_values_accessors() {
+        let row = Row::new(vec!["col".into()], vec![Value::Bool(false)]);
+        assert_eq!(row.columns(), &["col".to_string()]);
+        assert_eq!(row.values(), &[Value::Bool(false)]);
+    }
 }
 
 /// Execute an INSERT, calling `ModelHooks::before_insert` and `after_insert` if implemented.
@@ -766,8 +824,16 @@ pub async fn insert_with_hooks<M: Table + crate::hooks::ModelHooks>(
 ) -> Result<u64, DbError> {
     model.before_insert();
     let builder = builder_fn(model);
-    let (sql, params) = builder.build();
-    let result = db.execute(&sql, &params).await?;
+    #[cfg(feature = "postgres")]
+    let result = {
+        let q = builder.build_pg();
+        db.execute(&q.sql, &q.params).await?
+    };
+    #[cfg(not(feature = "postgres"))]
+    let result = {
+        let (sql, params) = builder.build();
+        db.execute(&sql, &params).await?
+    };
     model.after_insert();
     Ok(result)
 }
@@ -780,8 +846,16 @@ pub async fn update_with_hooks<M: Table + crate::hooks::ModelHooks>(
 ) -> Result<u64, DbError> {
     model.before_update();
     let builder = builder_fn(model);
-    let (sql, params) = builder.build();
-    db.execute(&sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        db.execute(&q.sql, &q.params).await
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.execute(&sql, &params).await
+    }
 }
 
 /// Execute a DELETE, calling `ModelHooks::before_delete` if implemented.

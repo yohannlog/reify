@@ -305,15 +305,20 @@ impl ToSql for Condition {
                 let _ = write!(buf, "{} LIKE ? ESCAPE '\\'", qi(col));
             }
             Condition::In(col, vals) => {
-                let _ = write!(buf, "{} IN (", qi(col));
-                for (i, v) in vals.iter().enumerate() {
-                    if i > 0 {
-                        buf.push_str(", ");
+                if vals.is_empty() {
+                    // Empty IN list is invalid SQL — emit a always-false condition.
+                    buf.push_str("1 = 0");
+                } else {
+                    let _ = write!(buf, "{} IN (", qi(col));
+                    for (i, v) in vals.iter().enumerate() {
+                        if i > 0 {
+                            buf.push_str(", ");
+                        }
+                        buf.push('?');
+                        params.push(v.clone());
                     }
-                    buf.push('?');
-                    params.push(v.clone());
+                    buf.push(')');
                 }
-                buf.push(')');
             }
             Condition::IsNull(col) => {
                 let _ = write!(buf, "{} IS NULL", qi(col));
@@ -431,5 +436,43 @@ impl ToSql for PgCondition {
                 let _ = write!(buf, "{} && ?", qi(col));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::Value;
+
+    #[test]
+    fn condition_in_empty_renders_always_false() {
+        let cond = Condition::In("id", vec![]);
+        let mut params = Vec::new();
+        let mut buf = String::new();
+        cond.write_sql(&mut buf, &mut params);
+        assert_eq!(buf, "1 = 0", "empty IN should render as always-false");
+        assert!(params.is_empty(), "empty IN should produce no params");
+    }
+
+    #[test]
+    fn condition_in_nonempty_renders_correctly() {
+        let cond = Condition::In("id", vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
+        let mut params = Vec::new();
+        let mut buf = String::new();
+        cond.write_sql(&mut buf, &mut params);
+        assert_eq!(buf, "\"id\" IN (?, ?, ?)");
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn condition_logical_and_or() {
+        let cond = Condition::Eq("a", Value::I32(1))
+            .and(Condition::Eq("b", Value::I32(2)))
+            .or(Condition::Eq("c", Value::I32(3)));
+        let mut params = Vec::new();
+        let mut buf = String::new();
+        cond.write_sql(&mut buf, &mut params);
+        assert!(buf.contains("OR"), "expected OR in: {buf}");
+        assert_eq!(params.len(), 3);
     }
 }
