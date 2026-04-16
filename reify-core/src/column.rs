@@ -286,18 +286,29 @@ where
 
 // ── JSONB operators (PostgreSQL) ───────────────────────────────────
 
-/// A JSONB field access expression: `column->>'key'`.
+/// Validate that a JSONB key is safe to use.
 ///
-/// Returned by [`Column<M, serde_json::Value>::json_get()`]. This is an
-/// *expression* (it returns a value), not a condition. Use the methods
-/// on this struct to build actual WHERE conditions:
+/// Keys are passed as bound parameters, but we still reject null bytes
+/// and excessively long strings as a defence-in-depth measure.
+#[cfg(feature = "postgres")]
+fn validate_json_key(key: &str) -> &str {
+    assert!(!key.contains('\0'), "JSON key must not contain null bytes");
+    assert!(key.len() <= 512, "JSON key too long (max 512 chars)");
+    key
+}
+
+/// A JSONB single-key access expression: `column ->> $key`.
+///
+/// Returned by [`Column<M, serde_json::Value>::json_get()`]. The key is
+/// **always passed as a bound parameter** — never interpolated into SQL —
+/// so user-supplied keys are safe.
 ///
 /// ```ignore
 /// User::metadata.json_get("role").eq("admin")
-/// // → metadata->>'role' = ?
+/// // → "metadata" ->> $1 = $2
 ///
 /// User::metadata.json_get("bio").is_null()
-/// // → metadata->>'bio' IS NULL
+/// // → "metadata" ->> $1 IS NULL
 /// ```
 #[cfg(feature = "postgres")]
 pub struct JsonExpr {
@@ -307,118 +318,147 @@ pub struct JsonExpr {
 
 #[cfg(feature = "postgres")]
 impl JsonExpr {
-    /// `column->>'key' = value`
+    /// Render `"column" ->> ?` and push the key as a bound param.
+    fn col_arrow_text(&self, params: &mut Vec<crate::value::Value>) -> String {
+        params.push(crate::value::Value::String(self.key.clone()));
+        format!("{} ->> ?", crate::ident::qi(self.column))
+    }
+
+    /// `"column" ->> ? = ?`
     pub fn eq(&self, val: impl IntoValue) -> Condition {
+        let mut params = vec![crate::value::Value::String(self.key.clone())];
+        params.push(val.into_value());
         Condition::Raw(
-            format!("{}->>'{}' = ?", crate::ident::qi(self.column), self.key),
-            vec![val.into_value()],
+            format!("{} ->> ? = ?", crate::ident::qi(self.column)),
+            params,
         )
     }
 
-    /// `column->>'key' != value`
+    /// `"column" ->> ? != ?`
     pub fn neq(&self, val: impl IntoValue) -> Condition {
+        let mut params = vec![crate::value::Value::String(self.key.clone())];
+        params.push(val.into_value());
         Condition::Raw(
-            format!("{}->>'{}' != ?", crate::ident::qi(self.column), self.key),
-            vec![val.into_value()],
+            format!("{} ->> ? != ?", crate::ident::qi(self.column)),
+            params,
         )
     }
 
-    /// `column->>'key' IS NULL`
+    /// `"column" ->> ? IS NULL`
     pub fn is_null(&self) -> Condition {
         Condition::Raw(
-            format!("{}->>'{}' IS NULL", crate::ident::qi(self.column), self.key),
-            vec![],
+            format!("{} ->> ? IS NULL", crate::ident::qi(self.column)),
+            vec![crate::value::Value::String(self.key.clone())],
         )
     }
 
-    /// `column->>'key' IS NOT NULL`
+    /// `"column" ->> ? IS NOT NULL`
     pub fn is_not_null(&self) -> Condition {
         Condition::Raw(
-            format!(
-                "{}->>'{}' IS NOT NULL",
-                crate::ident::qi(self.column),
-                self.key
-            ),
-            vec![],
+            format!("{} ->> ? IS NOT NULL", crate::ident::qi(self.column)),
+            vec![crate::value::Value::String(self.key.clone())],
         )
     }
 
-    /// `column->>'key' LIKE pattern` — raw pattern, wildcards not escaped.
+    /// `"column" ->> ? LIKE ?` — raw pattern, wildcards not escaped.
     pub fn like(&self, pattern: &str) -> Condition {
         Condition::Raw(
-            format!(
-                "{}->>'{}' LIKE ? ESCAPE '\\'",
-                crate::ident::qi(self.column),
-                self.key
-            ),
-            vec![crate::value::Value::String(pattern.to_owned())],
+            format!("{} ->> ? LIKE ? ESCAPE '\\'", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::String(self.key.clone()),
+                crate::value::Value::String(pattern.to_owned()),
+            ],
         )
     }
 
-    /// `column->>'key' LIKE '%sub%'` — user input is escaped.
+    /// `"column" ->> ? LIKE '%sub%'` — user input is escaped.
     pub fn contains(&self, sub: &str) -> Condition {
         let escaped = escape_like(sub);
         Condition::Raw(
-            format!(
-                "{}->>'{}' LIKE ? ESCAPE '\\'",
-                crate::ident::qi(self.column),
-                self.key
-            ),
-            vec![crate::value::Value::String(format!("%{escaped}%"))],
+            format!("{} ->> ? LIKE ? ESCAPE '\\'", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::String(self.key.clone()),
+                crate::value::Value::String(format!("%{escaped}%")),
+            ],
         )
     }
 
-    /// `column->>'key' ILIKE pattern` — raw pattern, wildcards are **not** escaped.
+    /// `"column" ->> ? ILIKE ?` — raw pattern, wildcards are **not** escaped.
     pub fn ilike(&self, pattern: &str) -> Condition {
         Condition::Raw(
-            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
-            vec![crate::value::Value::String(pattern.to_owned())],
+            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::String(self.key.clone()),
+                crate::value::Value::String(pattern.to_owned()),
+            ],
         )
     }
 
-    /// `column->>'key' ILIKE '%sub%'` — case-insensitive contains, user input is escaped.
+    /// `"column" ->> ? ILIKE '%sub%'` — case-insensitive contains, user input is escaped.
     pub fn icontains(&self, sub: &str) -> Condition {
         let escaped = escape_like(sub);
         Condition::Raw(
-            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
-            vec![crate::value::Value::String(format!("%{escaped}%"))],
+            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::String(self.key.clone()),
+                crate::value::Value::String(format!("%{escaped}%")),
+            ],
         )
     }
 
-    /// `column->>'key' ILIKE 'prefix%'` — case-insensitive starts-with, user input is escaped.
+    /// `"column" ->> ? ILIKE 'prefix%'` — case-insensitive starts-with, user input is escaped.
     pub fn istarts_with(&self, prefix: &str) -> Condition {
         let escaped = escape_like(prefix);
         Condition::Raw(
-            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
-            vec![crate::value::Value::String(format!("{escaped}%"))],
+            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::String(self.key.clone()),
+                crate::value::Value::String(format!("{escaped}%")),
+            ],
         )
     }
 
-    /// `column->>'key' ILIKE '%suffix'` — case-insensitive ends-with, user input is escaped.
+    /// `"column" ->> ? ILIKE '%suffix'` — case-insensitive ends-with, user input is escaped.
     pub fn iends_with(&self, suffix: &str) -> Condition {
         let escaped = escape_like(suffix);
         Condition::Raw(
-            format!("{}->>'{}' ILIKE ?", crate::ident::qi(self.column), self.key),
-            vec![crate::value::Value::String(format!("%{escaped}"))],
+            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::String(self.key.clone()),
+                crate::value::Value::String(format!("%{escaped}")),
+            ],
         )
     }
 }
 
 #[cfg(feature = "postgres")]
 impl<M: 'static> Column<M, serde_json::Value> {
-    /// JSONB field access as text: `column->>'key'`.
+    /// JSONB single-key access as text: `"column" ->> ?`.
     ///
-    /// Returns a [`JsonExpr`] — use `.eq()`, `.neq()`, `.is_null()`, etc.
-    /// to build a WHERE condition.
+    /// The key is passed as a **bound parameter** — safe for user-supplied input.
+    /// Returns a [`JsonExpr`] — chain `.eq()`, `.neq()`, `.is_null()`, etc.
     ///
     /// ```ignore
     /// User::metadata.json_get("role").eq("admin")
-    /// // → metadata->>'role' = ?
+    /// // → "metadata" ->> $1 = $2
     /// ```
     pub fn json_get(&self, key: &str) -> JsonExpr {
         JsonExpr {
             column: self.name,
-            key: key.to_owned(),
+            key: validate_json_key(key).to_owned(),
+        }
+    }
+
+    /// JSONB nested path access as text: `"column" #>> ARRAY[...]`.
+    ///
+    /// ```ignore
+    /// User::metadata.json_get_path(&["address", "city"]).eq("Paris")
+    /// // → "metadata" #>> $1 = $2  (where $1 = ARRAY['address','city'])
+    /// ```
+    pub fn json_get_path(&self, path: &[&str]) -> JsonPathExpr {
+        JsonPathExpr {
+            column: self.name,
+            path: path.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -426,20 +466,158 @@ impl<M: 'static> Column<M, serde_json::Value> {
     ///
     /// ```ignore
     /// User::metadata.json_contains(serde_json::json!({"active": true}))
-    /// // → metadata @> '{"active": true}'
+    /// // → "metadata" @> $1
     /// ```
     pub fn json_contains(&self, val: impl crate::value::IntoValue) -> Condition {
         Condition::Postgres(PgCondition::JsonContains(self.name, val.into_value()))
+    }
+
+    /// JSONB is contained by: `column <@ value`.
+    ///
+    /// ```ignore
+    /// User::metadata.json_contained_by(serde_json::json!({"role": "admin", "active": true}))
+    /// // → "metadata" <@ $1
+    /// ```
+    pub fn json_contained_by(&self, val: impl crate::value::IntoValue) -> Condition {
+        Condition::Postgres(PgCondition::JsonContainedBy(self.name, val.into_value()))
     }
 
     /// JSONB key exists: `column ? key`.
     ///
     /// ```ignore
     /// User::metadata.json_has_key("email")
-    /// // → metadata ? 'email'
+    /// // → "metadata" ? $1
     /// ```
     pub fn json_has_key(&self, key: &str) -> Condition {
         Condition::Postgres(PgCondition::JsonHasKey(self.name, key.to_owned()))
+    }
+
+    /// JSONB any key exists: `column ?| keys`.
+    ///
+    /// ```ignore
+    /// User::metadata.json_has_any_key(&["email", "phone"])
+    /// // → "metadata" ?| $1
+    /// ```
+    pub fn json_has_any_key(&self, keys: &[&str]) -> Condition {
+        Condition::Postgres(PgCondition::JsonHasAnyKey(
+            self.name,
+            keys.iter().map(|s| s.to_string()).collect(),
+        ))
+    }
+
+    /// JSONB all keys exist: `column ?& keys`.
+    ///
+    /// ```ignore
+    /// User::metadata.json_has_all_keys(&["name", "email"])
+    /// // → "metadata" ?& $1
+    /// ```
+    pub fn json_has_all_keys(&self, keys: &[&str]) -> Condition {
+        Condition::Postgres(PgCondition::JsonHasAllKeys(
+            self.name,
+            keys.iter().map(|s| s.to_string()).collect(),
+        ))
+    }
+
+    /// JSONB path match: `column @? path`.
+    ///
+    /// Tests whether the jsonpath expression returns any item.
+    ///
+    /// ```ignore
+    /// User::metadata.json_path_match("$.tags[*] ? (@ == \"rust\")")
+    /// // → "metadata" @? $1
+    /// ```
+    pub fn json_path_match(&self, path: &str) -> Condition {
+        Condition::Postgres(PgCondition::JsonPathMatch(self.name, path.to_owned()))
+    }
+
+    /// JSONB path predicate: `column @@ path`.
+    ///
+    /// Tests whether the jsonpath predicate holds for the whole document.
+    ///
+    /// ```ignore
+    /// User::metadata.json_path_test("$.active == true")
+    /// // → "metadata" @@ $1
+    /// ```
+    pub fn json_path_test(&self, path: &str) -> Condition {
+        Condition::Postgres(PgCondition::JsonPathTest(self.name, path.to_owned()))
+    }
+}
+
+/// A JSONB nested path access expression: `"column" #>> ARRAY[...]`.
+///
+/// Returned by [`Column<M, serde_json::Value>::json_get_path()`].
+/// The path is passed as a bound parameter array — safe for user-supplied input.
+///
+/// ```ignore
+/// User::metadata.json_get_path(&["address", "city"]).eq("Paris")
+/// // → "metadata" #>> $1 = $2
+/// ```
+#[cfg(feature = "postgres")]
+pub struct JsonPathExpr {
+    column: &'static str,
+    path: Vec<String>,
+}
+
+#[cfg(feature = "postgres")]
+impl JsonPathExpr {
+    /// `"column" #>> ? = ?`
+    pub fn eq(&self, val: impl IntoValue) -> Condition {
+        Condition::Raw(
+            format!("{} #>> ? = ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::ArrayString(self.path.clone()),
+                val.into_value(),
+            ],
+        )
+    }
+
+    /// `"column" #>> ? != ?`
+    pub fn neq(&self, val: impl IntoValue) -> Condition {
+        Condition::Raw(
+            format!("{} #>> ? != ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::ArrayString(self.path.clone()),
+                val.into_value(),
+            ],
+        )
+    }
+
+    /// `"column" #>> ? IS NULL`
+    pub fn is_null(&self) -> Condition {
+        Condition::Raw(
+            format!("{} #>> ? IS NULL", crate::ident::qi(self.column)),
+            vec![crate::value::Value::ArrayString(self.path.clone())],
+        )
+    }
+
+    /// `"column" #>> ? IS NOT NULL`
+    pub fn is_not_null(&self) -> Condition {
+        Condition::Raw(
+            format!("{} #>> ? IS NOT NULL", crate::ident::qi(self.column)),
+            vec![crate::value::Value::ArrayString(self.path.clone())],
+        )
+    }
+
+    /// `"column" #>> ? LIKE ?` — raw pattern, wildcards not escaped.
+    pub fn like(&self, pattern: &str) -> Condition {
+        Condition::Raw(
+            format!("{} #>> ? LIKE ? ESCAPE '\\'", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::ArrayString(self.path.clone()),
+                crate::value::Value::String(pattern.to_owned()),
+            ],
+        )
+    }
+
+    /// `"column" #>> ? ILIKE ?` — case-insensitive, raw pattern.
+    pub fn ilike(&self, pattern: &str) -> Condition {
+        Condition::Raw(
+            format!("{} #>> ? ILIKE ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::ArrayString(self.path.clone()),
+                crate::value::Value::String(pattern.to_owned()),
+            ],
+        )
     }
 }
 
@@ -478,6 +656,26 @@ where
     /// ```
     pub fn overlaps(&self, val: Vec<T>) -> Condition {
         Condition::Postgres(PgCondition::ArrayOverlaps(self.name, val.into_value()))
+    }
+
+    /// Scalar equals any array element: `val = ANY(column)`.
+    ///
+    /// ```ignore
+    /// Post::scores.array_any_eq(10i32)
+    /// // → $1 = ANY("scores")
+    /// ```
+    pub fn array_any_eq(&self, val: impl IntoValue) -> Condition {
+        Condition::Postgres(PgCondition::ArrayAnyEq(self.name, val.into_value()))
+    }
+
+    /// Scalar equals all array elements: `val = ALL(column)`.
+    ///
+    /// ```ignore
+    /// Post::scores.array_all_eq(10i32)
+    /// // → $1 = ALL("scores")
+    /// ```
+    pub fn array_all_eq(&self, val: impl IntoValue) -> Condition {
+        Condition::Postgres(PgCondition::ArrayAllEq(self.name, val.into_value()))
     }
 }
 

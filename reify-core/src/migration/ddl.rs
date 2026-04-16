@@ -221,8 +221,20 @@ pub fn add_column_sql(
         .map(|d| d.sql_type.to_sql(dialect))
         .unwrap_or(std::borrow::Cow::Borrowed("TEXT"));
     let null_clause = if is_nullable { "" } else { " NOT NULL" };
+    // For NOT NULL columns, emit a DEFAULT so existing rows don't violate the constraint.
+    // If the ColumnDef carries an explicit default, prefer it; otherwise fall back to a
+    // type-inferred safe default. For types where no safe default exists (UUID, JSONB, …)
+    // we omit DEFAULT entirely and let the database reject the statement — the user must
+    // supply an explicit `default` in their ColumnDef.
     let default_clause = if !is_nullable {
-        format!(" DEFAULT {}", default_for_type(&sql_type))
+        let explicit = def.and_then(|d| d.default.as_deref());
+        match explicit {
+            Some(dv) => format!(" DEFAULT {dv}"),
+            None => match default_for_type(&sql_type) {
+                Some(dv) => format!(" DEFAULT {dv}"),
+                None => String::new(),
+            },
+        }
     } else {
         String::new()
     };
@@ -233,17 +245,28 @@ pub fn add_column_sql(
     )
 }
 
-fn default_for_type(ty: &str) -> &'static str {
-    if ty.starts_with("DECIMAL") || ty.starts_with("NUMERIC") {
-        return "0";
+/// Return a safe SQL literal to use as a `DEFAULT` when adding a NOT NULL column
+/// to an existing table.
+///
+/// Returns `None` for types where no universally safe default exists (e.g. `UUID`,
+/// `JSONB`, `BYTEA`). In that case the caller must supply an explicit `default` in
+/// the `ColumnDef`, or the database will reject the `ALTER TABLE`.
+fn default_for_type(ty: &str) -> Option<&'static str> {
+    let upper = ty.to_uppercase();
+    if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") {
+        return Some("0");
     }
-    if ty.starts_with("VARCHAR") || ty.starts_with("CHAR(") {
-        return "''";
+    if upper.starts_with("VARCHAR") || upper.starts_with("CHAR(") {
+        return Some("''");
     }
-    match ty {
-        "BIGINT" | "INTEGER" | "SMALLINT" | "NUMERIC" | "BIGSERIAL" | "SERIAL" => "0",
-        "BOOLEAN" => "FALSE",
-        "TIMESTAMPTZ" | "TIMESTAMP" | "DATETIME" => "NOW()",
-        _ => "''",
+    match upper.as_str() {
+        "BIGINT" | "INTEGER" | "SMALLINT" | "BIGSERIAL" | "SERIAL" | "INT" | "INT2" | "INT4"
+        | "INT8" => Some("0"),
+        "REAL" | "FLOAT4" | "FLOAT8" | "DOUBLE PRECISION" => Some("0"),
+        "BOOLEAN" | "BOOL" => Some("FALSE"),
+        "TEXT" => Some("''"),
+        "TIMESTAMPTZ" | "TIMESTAMP" | "DATETIME" => Some("NOW()"),
+        // UUID, JSONB, BYTEA, arrays, custom types — no safe default
+        _ => None,
     }
 }

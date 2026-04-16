@@ -172,6 +172,34 @@ pub(crate) fn rust_type_to_sql_type(ty: &syn::Type) -> proc_macro2::TokenStream 
         "serde_json::Value" | "JsonValue" => {
             quote! { reify_core::schema::SqlType::Jsonb }
         }
+        // ── PostgreSQL array types ─────────────────────────────────────
+        "Vec<i16>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::SmallInt))
+        },
+        "Vec<i32>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Integer))
+        },
+        "Vec<i64>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::BigInt))
+        },
+        "Vec<f32>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Float))
+        },
+        "Vec<f64>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Double))
+        },
+        "Vec<bool>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Boolean))
+        },
+        "Vec<String>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Text))
+        },
+        "Vec<uuid::Uuid>" | "Vec<Uuid>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Uuid))
+        },
+        "Vec<serde_json::Value>" | "Vec<JsonValue>" => quote! {
+            reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Jsonb))
+        },
         _ => quote! { reify_core::schema::SqlType::Text },
     }
 }

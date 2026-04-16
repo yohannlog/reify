@@ -3,17 +3,20 @@ mod context;
 mod ddl;
 mod diff;
 mod error;
+mod lock;
 mod plan;
 mod runner;
 mod traits;
 
-pub use codegen::{generate_migration_file, generate_view_migration_file};
+pub use codegen::{generate_migration_file, generate_materialized_view_migration_file, generate_view_migration_file};
 pub use context::MigrationContext;
 pub(crate) use ddl::create_table_sql_named;
 pub use ddl::{add_column_sql, create_table_sql, create_table_sql_with_checks};
 pub use diff::{ColumnDiff, DbColumnInfo, SchemaDiff, TableDiff, normalize_sql_type};
 pub use error::MigrationError;
-pub use plan::{MigrationPlan, MigrationStatus};
+pub use lock::MigrationLock;
+pub use plan::{MigrationPlan, MigrationStatus, compute_checksum};
+pub use runner::MigrationHooks;
 pub use runner::MigrationRunner;
 pub use traits::Migration;
 // ── Tests ────────────────────────────────────────────────────────────
@@ -272,25 +275,37 @@ mod tests {
     #[tokio::test]
     async fn run_creates_tracking_table_and_executes_ddl() {
         let db = MockDb::new();
-        db.push_query_result(vec![]); // applied_versions → empty
+        // applied_checksums → empty (queried after lock acquire)
+        db.push_query_result(vec![]);
         db.push_query_result(vec![]); // existing_columns users → absent
 
         let runner = MigrationRunner::new().add_table::<Users>();
         runner.run(&db).await.unwrap();
 
         let sql = db.executed_sql();
-        // First statement: CREATE tracking table
-        assert!(sql[0].contains("_reify_migrations"));
-        // Second: CREATE TABLE users
-        assert!(sql[1].contains("CREATE TABLE IF NOT EXISTS \"users\""));
-        // Third: INSERT into tracking table
-        assert!(sql[2].contains("INSERT INTO \"_reify_migrations\""));
+        // Sequence: CREATE tracking table, CREATE lock table, INSERT sentinel,
+        // UPDATE acquire lock, then DDL, then INSERT tracking, then UPDATE release.
+        assert!(
+            sql.iter().any(|s| s.contains("_reify_migrations")),
+            "tracking table not found: {sql:?}"
+        );
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
+            "CREATE TABLE users not found: {sql:?}"
+        );
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("INSERT INTO \"_reify_migrations\"")),
+            "INSERT tracking not found: {sql:?}"
+        );
     }
 
     #[tokio::test]
     async fn run_manual_migration_executes_up_statements() {
         let db = MockDb::new();
-        db.push_query_result(vec![]); // applied_versions → empty
+        // applied_checksums → empty (queried after lock acquire)
+        db.push_query_result(vec![]);
 
         let runner = MigrationRunner::new().add(AddUserCity);
         runner.run(&db).await.unwrap();
@@ -345,25 +360,63 @@ mod tests {
         ctx.rename_column("users", "nm", "name");
         ctx.execute("UPDATE users SET city = 'Paris';");
 
-        assert_eq!(ctx.statements.len(), 4);
-        assert!(ctx.statements[0].contains("ADD COLUMN \"city\""));
-        assert!(ctx.statements[1].contains("DROP COLUMN \"old_col\""));
-        assert!(ctx.statements[2].contains("RENAME COLUMN \"nm\" TO \"name\""));
-        assert!(ctx.statements[3].contains("UPDATE users"));
+        assert_eq!(ctx.statements().len(), 4);
+        assert!(ctx.statements()[0].contains("ADD COLUMN \"city\""));
+        assert!(ctx.statements()[1].contains("DROP COLUMN \"old_col\""));
+        assert!(ctx.statements()[2].contains("RENAME COLUMN \"nm\" TO \"name\""));
+        assert!(ctx.statements()[3].contains("UPDATE users"));
     }
 
     #[tokio::test]
     async fn migration_plan_display_format() {
+        use super::plan::compute_checksum;
+        let stmts = vec!["ALTER TABLE users ADD COLUMN city TEXT NOT NULL;".to_string()];
+        let checksum = compute_checksum(&stmts);
         let plan = MigrationPlan {
             version: "20240320_000001_add_user_city".into(),
             description: "Add city column to users".into(),
-            statements: vec!["ALTER TABLE users ADD COLUMN city TEXT NOT NULL;".into()],
-            is_up: true,
+            comment: None,
+            statements: stmts,
+            checksum,
+            schema_diff: None,
         };
         let display = plan.display();
         assert!(display.contains("Would apply (up)"));
         assert!(display.contains("20240320_000001_add_user_city"));
         assert!(display.contains("ALTER TABLE users"));
+        assert!(display.contains("SQL:"));
+    }
+
+    #[test]
+    fn migration_plan_display_includes_schema_diff_when_present() {
+        use super::plan::compute_checksum;
+        let stmts = vec!["CREATE TABLE IF NOT EXISTS \"users\" (\"id\" BIGSERIAL PRIMARY KEY);".to_string()];
+        let checksum = compute_checksum(&stmts);
+        let plan = MigrationPlan {
+            version: "auto__users".into(),
+            description: "Create table users".into(),
+            comment: None,
+            statements: stmts,
+            checksum,
+            schema_diff: Some(SchemaDiff {
+                tables: vec![TableDiff {
+                    table_name: "users".into(),
+                    is_new_table: true,
+                    column_diffs: vec![
+                        ColumnDiff::Added { column: "id".into() },
+                        ColumnDiff::Added { column: "email".into() },
+                    ],
+                }],
+            }),
+        };
+        let display = plan.display();
+        assert!(display.contains("Would apply (up)"));
+        assert!(display.contains("Schema diff:"), "missing Schema diff header: {display}");
+        assert!(display.contains("✚ table `users`"), "missing table symbol: {display}");
+        assert!(display.contains("✚ `id`"), "missing id column: {display}");
+        assert!(display.contains("✚ `email`"), "missing email column: {display}");
+        assert!(display.contains("SQL:"), "missing SQL: label: {display}");
+        assert!(display.contains("CREATE TABLE"), "missing SQL body: {display}");
     }
 
     #[test]
@@ -403,6 +456,11 @@ mod tests {
         // Unknown types pass through lowercased
         assert_eq!(normalize_sql_type("JSONB"), "jsonb");
         assert_eq!(normalize_sql_type("uuid"), "uuid");
+        // Array types
+        assert_eq!(normalize_sql_type("integer[]"), "integer[]");
+        assert_eq!(normalize_sql_type("_int4"), "integer[]");
+        assert_eq!(normalize_sql_type("text[]"), "text[]");
+        assert_eq!(normalize_sql_type("_text"), "text[]");
     }
 
     #[test]
@@ -893,17 +951,17 @@ mod tests {
             "active_users",
             "SELECT id, email FROM users WHERE deleted_at IS NULL",
         );
-        assert_eq!(ctx.statements.len(), 1);
-        assert!(ctx.statements[0].contains("CREATE OR REPLACE VIEW \"active_users\""));
-        assert!(ctx.statements[0].contains("SELECT id, email FROM users"));
+        assert_eq!(ctx.statements().len(), 1);
+        assert!(ctx.statements()[0].contains("CREATE OR REPLACE VIEW \"active_users\""));
+        assert!(ctx.statements()[0].contains("SELECT id, email FROM users"));
     }
 
     #[test]
     fn migration_context_drop_view() {
         let mut ctx = MigrationContext::new();
         ctx.drop_view("active_users");
-        assert_eq!(ctx.statements.len(), 1);
-        assert!(ctx.statements[0].contains("DROP VIEW IF EXISTS \"active_users\""));
+        assert_eq!(ctx.statements().len(), 1);
+        assert!(ctx.statements()[0].contains("DROP VIEW IF EXISTS \"active_users\""));
     }
 
     // Minimal View impl for tests
@@ -980,5 +1038,201 @@ mod tests {
         assert!(content.contains("impl Migration for ActiveUsers"));
         assert!(content.contains("ctx.create_view(\"active_users\""));
         assert!(content.contains("ctx.drop_view(\"active_users\""));
+    }
+
+    // ── Materialized view migration tests ──────────────────────────────
+
+    #[test]
+    fn migration_context_create_materialized_view() {
+        let mut ctx = MigrationContext::new();
+        ctx.create_materialized_view(
+            "sales_summary",
+            "SELECT seller_no, invoice_date, sum(invoice_amt) FROM invoice GROUP BY 1, 2",
+        );
+        assert_eq!(ctx.statements().len(), 1);
+        assert!(ctx.statements()[0].contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"sales_summary\""));
+        assert!(ctx.statements()[0].contains("WITH DATA"));
+    }
+
+    #[test]
+    fn migration_context_create_materialized_view_no_data() {
+        let mut ctx = MigrationContext::new();
+        ctx.create_materialized_view_no_data("sales_summary", "SELECT 1");
+        assert_eq!(ctx.statements().len(), 1);
+        assert!(ctx.statements()[0].contains("WITH NO DATA"));
+    }
+
+    #[test]
+    fn migration_context_drop_materialized_view() {
+        let mut ctx = MigrationContext::new();
+        ctx.drop_materialized_view("sales_summary");
+        assert_eq!(ctx.statements().len(), 1);
+        assert!(ctx.statements()[0].contains("DROP MATERIALIZED VIEW IF EXISTS \"sales_summary\""));
+    }
+
+    #[test]
+    fn migration_context_refresh_materialized_view_blocking() {
+        let mut ctx = MigrationContext::new();
+        ctx.refresh_materialized_view("sales_summary", false);
+        assert_eq!(ctx.statements().len(), 1);
+        assert_eq!(ctx.statements()[0], "REFRESH MATERIALIZED VIEW \"sales_summary\";");
+    }
+
+    #[test]
+    fn migration_context_refresh_materialized_view_concurrently() {
+        let mut ctx = MigrationContext::new();
+        ctx.refresh_materialized_view("sales_summary", true);
+        assert_eq!(ctx.statements().len(), 1);
+        assert_eq!(ctx.statements()[0], "REFRESH MATERIALIZED VIEW CONCURRENTLY \"sales_summary\";");
+    }
+
+    // Minimal View impl for materialized view tests
+    struct TestMatView;
+    impl Table for TestMatView {
+        fn table_name() -> &'static str { "sales_summary" }
+        fn column_names() -> &'static [&'static str] { &["seller_no", "sales_amt"] }
+        fn into_values(&self) -> Vec<Value> { vec![] }
+    }
+    impl crate::view::View for TestMatView {
+        fn view_name() -> &'static str { "sales_summary" }
+        fn view_query() -> crate::view::ViewQuery {
+            crate::view::ViewQuery::Raw(
+                "SELECT seller_no, sum(invoice_amt) FROM invoice GROUP BY seller_no".into(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_materialized_view_emits_create_materialized_view() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+
+        let runner = MigrationRunner::new().add_materialized_view::<TestMatView>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version, "auto_matview__sales_summary");
+        assert!(plans[0].statements[0].contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"sales_summary\""));
+        assert!(plans[0].statements[0].contains("WITH DATA"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_materialized_view_skips_already_applied() {
+        let db = MockDb::new();
+        let applied_row = Row::new(
+            vec!["version".into()],
+            vec![Value::String("auto_matview__sales_summary".into())],
+        );
+        db.push_query_result(vec![applied_row]);
+
+        let runner = MigrationRunner::new().add_materialized_view::<TestMatView>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert!(plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_materialized_view_executes_create_materialized_view() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+
+        let runner = MigrationRunner::new().add_materialized_view::<TestMatView>();
+        runner.run(&db).await.unwrap();
+
+        let sql = db.executed_sql();
+        let has_create = sql
+            .iter()
+            .any(|s| s.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"sales_summary\""));
+        assert!(has_create, "expected CREATE MATERIALIZED VIEW in: {sql:?}");
+    }
+
+    #[test]
+    fn generate_materialized_view_migration_file_produces_valid_template() {
+        let content = generate_materialized_view_migration_file("sales_summary", "20240320_000001_sales_summary");
+        assert!(content.contains("struct SalesSummary"));
+        assert!(content.contains("impl Migration for SalesSummary"));
+        assert!(content.contains("ctx.create_materialized_view(\"sales_summary\""));
+        assert!(content.contains("ctx.drop_materialized_view(\"sales_summary\""));
+    }
+
+    // ── Hook tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hooks_before_each_called() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns users → absent
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        let runner = MigrationRunner::new()
+            .add_table::<Users>()
+            .on_before_each(move |_plan| {
+                let c = counter_clone.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+        runner.run(&db).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "before_each should be called once");
+    }
+
+    #[tokio::test]
+    async fn hooks_after_each_called() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns users → absent
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        let runner = MigrationRunner::new()
+            .add_table::<Users>()
+            .on_after_each(move |_plan| {
+                let c = counter_clone.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+        runner.run(&db).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "after_each should be called once after success");
+    }
+
+    #[tokio::test]
+    async fn hooks_before_each_can_abort() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns users → absent
+
+        let runner = MigrationRunner::new()
+            .add_table::<Users>()
+            .on_before_each(|_plan| {
+                Box::pin(async move {
+                    Err(MigrationError::Other("aborted by hook".into()))
+                })
+            });
+
+        let result = runner.run(&db).await;
+        assert!(
+            matches!(result, Err(MigrationError::Other(ref msg)) if msg.contains("aborted by hook")),
+            "run() should propagate the hook error: {result:?}"
+        );
+        // The user table DDL should NOT have been executed (tracking table setup runs before hooks).
+        let sql = db.executed_sql();
+        assert!(
+            !sql.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
+            "CREATE TABLE users should not run when before_each aborts: {sql:?}"
+        );
     }
 }

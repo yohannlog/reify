@@ -7,6 +7,24 @@ pub enum MigrationError {
     Db(DbError),
     /// A migration is not reversible but rollback was requested.
     NotReversible(String),
+    /// The stored checksum for an applied migration no longer matches the
+    /// checksum computed from the current code — the migration was modified
+    /// after being applied.
+    ChecksumMismatch {
+        /// Migration version string.
+        version: String,
+        /// SHA-256 hex digest stored in the database (applied previously).
+        stored: String,
+        /// SHA-256 hex digest computed from the current code.
+        computed: String,
+    },
+    /// The migration lock is already held by another process.
+    Locked {
+        /// Identity of the lock holder, if available.
+        locked_by: Option<String>,
+        /// Timestamp when the lock was acquired, if available.
+        locked_at: Option<String>,
+    },
     /// Generic migration error.
     Other(String),
 }
@@ -18,6 +36,33 @@ impl std::fmt::Display for MigrationError {
             MigrationError::NotReversible(v) => {
                 write!(f, "migration '{v}' is not reversible")
             }
+            MigrationError::ChecksumMismatch {
+                version,
+                stored,
+                computed,
+            } => {
+                write!(
+                    f,
+                    "checksum mismatch for migration '{version}': \
+                     stored={}, computed={} — migration was modified after being applied",
+                    &stored[..stored.len().min(8)],
+                    &computed[..computed.len().min(8)],
+                )
+            }
+            MigrationError::Locked {
+                locked_by,
+                locked_at,
+            } => match locked_by {
+                Some(by) => write!(
+                    f,
+                    "migration lock is already held by '{by}'{}",
+                    locked_at
+                        .as_deref()
+                        .map(|t| format!(" (since {t})"))
+                        .unwrap_or_default()
+                ),
+                None => write!(f, "migration lock is already held by another process"),
+            },
             MigrationError::Other(msg) => write!(f, "migration error: {msg}"),
         }
     }

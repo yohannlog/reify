@@ -61,6 +61,13 @@ pub enum SqlType {
     Serial,
     /// Escape hatch — raw SQL type string.
     Custom(&'static str),
+    /// PostgreSQL array type: `element_type[]`.
+    ///
+    /// Renders as `INTEGER[]`, `TEXT[]`, etc. on PostgreSQL.
+    /// Falls back to `TEXT` on other dialects (arrays are PG-specific).
+    ///
+    /// Generated automatically by `#[derive(Table)]` for `Vec<T>` fields.
+    Array(Box<SqlType>),
 }
 
 impl SqlType {
@@ -126,6 +133,10 @@ impl SqlType {
                 _ => Cow::Borrowed("INTEGER"),
             },
             SqlType::Custom(s) => Cow::Borrowed(s),
+            SqlType::Array(inner) => match dialect {
+                Dialect::Postgres => Cow::Owned(format!("{}[]", inner.to_sql(dialect))),
+                _ => Cow::Borrowed("TEXT"),
+            },
         }
     }
 }

@@ -168,4 +168,134 @@ mod postgres_tests {
             ]
         );
     }
+
+    // ── FromValue Vec<f32> / Vec<f64> ─────────────────────────────────
+
+    #[test]
+    fn from_value_vec_f32() {
+        use reify::value::FromValue;
+        let val = Value::ArrayF32(vec![1.0f32, 2.5, 3.14]);
+        let result = Vec::<f32>::from_value(val).unwrap();
+        assert_eq!(result, vec![1.0f32, 2.5, 3.14]);
+    }
+
+    #[test]
+    fn from_value_vec_f64() {
+        use reify::value::FromValue;
+        let val = Value::ArrayF64(vec![1.0f64, 2.5]);
+        let result = Vec::<f64>::from_value(val).unwrap();
+        assert_eq!(result, vec![1.0f64, 2.5]);
+    }
+
+    #[test]
+    fn from_value_vec_f32_wrong_type_errors() {
+        use reify::value::FromValue;
+        let val = Value::ArrayI32(vec![1, 2]);
+        assert!(Vec::<f32>::from_value(val).is_err());
+    }
+
+    // ── SqlType::Array DDL rendering ──────────────────────────────────
+
+    #[test]
+    fn sql_type_array_integer_ddl() {
+        use reify::query::Dialect;
+        use reify::schema::SqlType;
+        let t = SqlType::Array(Box::new(SqlType::Integer));
+        assert_eq!(t.to_sql(Dialect::Postgres), "INTEGER[]");
+    }
+
+    #[test]
+    fn sql_type_array_text_ddl() {
+        use reify::query::Dialect;
+        use reify::schema::SqlType;
+        let t = SqlType::Array(Box::new(SqlType::Text));
+        assert_eq!(t.to_sql(Dialect::Postgres), "TEXT[]");
+    }
+
+    #[test]
+    fn sql_type_array_bigint_ddl() {
+        use reify::query::Dialect;
+        use reify::schema::SqlType;
+        let t = SqlType::Array(Box::new(SqlType::BigInt));
+        assert_eq!(t.to_sql(Dialect::Postgres), "BIGINT[]");
+    }
+
+    #[test]
+    fn sql_type_array_non_pg_falls_back_to_text() {
+        use reify::query::Dialect;
+        use reify::schema::SqlType;
+        let t = SqlType::Array(Box::new(SqlType::Integer));
+        assert_eq!(t.to_sql(Dialect::Generic), "TEXT");
+    }
+
+    // ── ANY / ALL operators ───────────────────────────────────────────
+
+    #[test]
+    fn filter_array_any_eq() {
+        let (sql, params) = Post::find()
+            .filter(Post::scores.array_any_eq(10i32))
+            .build();
+        assert_eq!(sql, "SELECT * FROM \"posts\" WHERE ? = ANY(\"scores\")");
+        assert_eq!(params, vec![Value::I32(10)]);
+    }
+
+    #[test]
+    fn filter_array_all_eq() {
+        let (sql, params) = Post::find().filter(Post::scores.array_all_eq(0i32)).build();
+        assert_eq!(sql, "SELECT * FROM \"posts\" WHERE ? = ALL(\"scores\")");
+        assert_eq!(params, vec![Value::I32(0)]);
+    }
+
+    #[test]
+    fn filter_array_any_eq_string() {
+        let (sql, params) = Post::find()
+            .filter(Post::tags.array_any_eq("rust".to_string()))
+            .build();
+        assert_eq!(sql, "SELECT * FROM \"posts\" WHERE ? = ANY(\"tags\")");
+        assert_eq!(params, vec![Value::String("rust".into())]);
+    }
+
+    // ── array_append / array_prepend ──────────────────────────────────
+
+    #[test]
+    fn update_array_append() {
+        let (sql, params) = Post::update()
+            .set_array_append(Post::tags, "new_tag".to_string())
+            .filter(Post::id.eq(1i64))
+            .build();
+        assert_eq!(
+            sql,
+            "UPDATE \"posts\" SET \"tags\" = \"tags\" || ? WHERE \"id\" = ?"
+        );
+        assert_eq!(params, vec![Value::String("new_tag".into()), Value::I64(1)]);
+    }
+
+    #[test]
+    fn update_array_prepend() {
+        let (sql, params) = Post::update()
+            .set_array_prepend(Post::tags, "first_tag".to_string())
+            .filter(Post::id.eq(1i64))
+            .build();
+        assert_eq!(
+            sql,
+            "UPDATE \"posts\" SET \"tags\" = ? || \"tags\" WHERE \"id\" = ?"
+        );
+        assert_eq!(
+            params,
+            vec![Value::String("first_tag".into()), Value::I64(1)]
+        );
+    }
+
+    #[test]
+    fn update_array_append_i32() {
+        let (sql, params) = Post::update()
+            .set_array_append(Post::scores, 99i32)
+            .filter(Post::id.eq(2i64))
+            .build();
+        assert_eq!(
+            sql,
+            "UPDATE \"posts\" SET \"scores\" = \"scores\" || ? WHERE \"id\" = ?"
+        );
+        assert_eq!(params, vec![Value::I32(99), Value::I64(2)]);
+    }
 }

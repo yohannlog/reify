@@ -419,9 +419,45 @@ impl ToSql for PgCondition {
                 params.push(val.clone());
                 let _ = write!(buf, "{} @> ?", qi(col));
             }
+            PgCondition::JsonContainedBy(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} <@ ?", qi(col));
+            }
             PgCondition::JsonHasKey(col, key) => {
                 params.push(Value::String(key.clone()));
-                let _ = write!(buf, "jsonb_exists({}, ?)", qi(col));
+                let _ = write!(buf, "{} ? ?", qi(col));
+            }
+            PgCondition::JsonHasAnyKey(col, keys) => {
+                params.push(Value::ArrayString(keys.clone()));
+                let _ = write!(buf, "{} ?| ?", qi(col));
+            }
+            PgCondition::JsonHasAllKeys(col, keys) => {
+                params.push(Value::ArrayString(keys.clone()));
+                let _ = write!(buf, "{} ?& ?", qi(col));
+            }
+            PgCondition::JsonConcat(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} || ?", qi(col));
+            }
+            PgCondition::JsonDeleteKey(col, key) => {
+                params.push(Value::String(key.clone()));
+                let _ = write!(buf, "{} - ?", qi(col));
+            }
+            PgCondition::JsonPathGetText(col, path) => {
+                params.push(Value::ArrayString(path.clone()));
+                let _ = write!(buf, "{} #>> ?", qi(col));
+            }
+            PgCondition::JsonPathGet(col, path) => {
+                params.push(Value::ArrayString(path.clone()));
+                let _ = write!(buf, "{} #> ?", qi(col));
+            }
+            PgCondition::JsonPathMatch(col, path) => {
+                params.push(Value::String(path.clone()));
+                let _ = write!(buf, "{} @? ?", qi(col));
+            }
+            PgCondition::JsonPathTest(col, path) => {
+                params.push(Value::String(path.clone()));
+                let _ = write!(buf, "{} @@ ?", qi(col));
             }
             PgCondition::ArrayContains(col, val) => {
                 params.push(val.clone());
@@ -434,6 +470,14 @@ impl ToSql for PgCondition {
             PgCondition::ArrayOverlaps(col, val) => {
                 params.push(val.clone());
                 let _ = write!(buf, "{} && ?", qi(col));
+            }
+            PgCondition::ArrayAnyEq(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "? = ANY({})", qi(col));
+            }
+            PgCondition::ArrayAllEq(col, val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "? = ALL({})", qi(col));
             }
         }
     }

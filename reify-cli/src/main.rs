@@ -1,12 +1,14 @@
 //! reify-cli — migration lifecycle management for Reify ORM.
 //!
 //! Commands:
-//!   reify migrate          — apply all pending migrations
-//!   reify migrate --dry-run — preview without applying
-//!   reify status           — list applied/pending migrations
-//!   reify new <name>       — generate a migration file
-//!   reify rollback         — roll back the last migration
-//!   reify rollback --to <version> — roll back to a specific version
+//!   reify migrate                        — apply all pending migrations
+//!   reify migrate --dry-run              — preview without applying
+//!   reify migrate --since <date>         — (re-)apply migrations applied at or after <date>
+//!   reify status                         — list applied/pending migrations
+//!   reify new <name>                     — generate a migration file
+//!   reify rollback                       — roll back the last migration
+//!   reify rollback --to <version>        — roll back to a specific version
+//!   reify rollback --since <date>        — roll back all migrations applied at or after <date>
 //!
 //! All commands that connect to the database require a connection URL, provided
 //! via `--database-url` or the `DATABASE_URL` environment variable.
@@ -18,7 +20,7 @@
 
 use clap::{Parser, Subcommand};
 use reify_core::migration::{
-    MigrationRunner, generate_migration_file, generate_view_migration_file,
+    MigrationRunner, SchemaDiff, generate_migration_file, generate_view_migration_file,
 };
 
 // ── CLI definition ───────────────────────────────────────────────────
@@ -47,6 +49,10 @@ enum Commands {
         /// Preview SQL without applying it.
         #[arg(long)]
         dry_run: bool,
+        /// Only (re-)apply migrations whose applied_at is at or after this date.
+        /// Format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Show the status of all migrations (applied / pending).
     Status,
@@ -61,11 +67,15 @@ enum Commands {
         #[arg(long)]
         view: bool,
     },
-    /// Roll back the last applied migration (or to a specific version).
+    /// Roll back the last applied migration, to a specific version, or since a date.
     Rollback {
         /// Roll back to this version (inclusive).
         #[arg(long)]
         to: Option<String>,
+        /// Roll back all migrations applied at or after this date (newest first).
+        /// Format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
@@ -76,9 +86,9 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match &cli.command {
-        Commands::Migrate { dry_run } => {
+        Commands::Migrate { dry_run, since } => {
             let url = require_database_url(&cli.database_url);
-            cmd_migrate(&url, *dry_run).await
+            cmd_migrate(&url, *dry_run, since.as_deref()).await
         }
         Commands::Status => {
             let url = require_database_url(&cli.database_url);
@@ -88,9 +98,9 @@ async fn main() {
             cmd_new(name, dir, *view);
             return;
         }
-        Commands::Rollback { to } => {
+        Commands::Rollback { to, since } => {
             let url = require_database_url(&cli.database_url);
-            cmd_rollback(&url, to.as_deref()).await
+            cmd_rollback(&url, to.as_deref(), since.as_deref()).await
         }
     };
 
@@ -237,21 +247,32 @@ where
 
 // ── Command implementations ──────────────────────────────────────────
 
-/// `reify migrate [--dry-run]`
-async fn cmd_migrate(url: &str, dry_run: bool) -> Result<(), String> {
+/// `reify migrate [--dry-run] [--since <date>]`
+async fn cmd_migrate(url: &str, dry_run: bool, since: Option<&str>) -> Result<(), String> {
     with_db(url, |db: Box<dyn reify_core::db::DynDatabase>| async move {
         let runner = MigrationRunner::new();
         if dry_run {
             let plans = runner.dry_run(&db).await.map_err(|e| e.to_string())?;
-
             if plans.is_empty() {
                 println!("✓ No pending migrations.");
             } else {
                 println!("DRY RUN — nothing will be written\n");
+                // Display the global schema diff summary in the header.
+                let global_diff = runner.diff(&db).await.map_err(|e| e.to_string())?;
+                if !global_diff.is_empty() {
+                    print!("{}", global_diff.display());
+                    println!();
+                }
                 for plan in &plans {
                     print!("{}", plan.display());
                 }
             }
+        } else if let Some(since) = since {
+            runner
+                .run_since(&db, since)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("✓ Migrations applied (since {since}).");
         } else {
             runner.run(&db).await.map_err(|e| e.to_string())?;
             println!("✓ Migrations applied.");
@@ -324,16 +345,25 @@ fn cmd_new(name: &str, dir: &str, view: bool) {
     }
 }
 
-/// `reify rollback [--to <version>]`
-async fn cmd_rollback(url: &str, to: Option<&str>) -> Result<(), String> {
+/// `reify rollback [--to <version>] [--since <date>]`
+async fn cmd_rollback(url: &str, to: Option<&str>, since: Option<&str>) -> Result<(), String> {
+    if to.is_some() && since.is_some() {
+        return Err("--to and --since are mutually exclusive".into());
+    }
     with_db(url, |db: Box<dyn reify_core::db::DynDatabase>| async move {
         let runner = MigrationRunner::new();
-        match to {
-            Some(version) => runner
+        if let Some(version) = to {
+            runner
                 .rollback_to(&db, version)
                 .await
-                .map_err(|e| e.to_string())?,
-            None => runner.rollback(&db).await.map_err(|e| e.to_string())?,
+                .map_err(|e| e.to_string())?;
+        } else if let Some(since) = since {
+            runner
+                .rollback_since(&db, since)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            runner.rollback(&db).await.map_err(|e| e.to_string())?;
         }
         println!("✓ Rollback complete.");
         Ok(())

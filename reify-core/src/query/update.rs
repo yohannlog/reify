@@ -3,10 +3,25 @@ use crate::condition::Condition;
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};
 use crate::table::Table;
-use crate::value::Value;
+use crate::value::{IntoValue, Value};
 use std::fmt::Write;
 use std::marker::PhantomData;
 use tracing::debug;
+
+// ── SetExpr — assignment RHS ─────────────────────────────────────────
+
+/// The right-hand side of a `SET col = <expr>` assignment.
+#[derive(Clone)]
+enum SetExpr {
+    /// Plain value: `col = ?`
+    Value(Value),
+    /// Array append: `col = col || ?`  (PostgreSQL only)
+    #[cfg(feature = "postgres")]
+    ArrayAppend(Value),
+    /// Array prepend: `col = ? || col`  (PostgreSQL only)
+    #[cfg(feature = "postgres")]
+    ArrayPrepend(Value),
+}
 
 // ── UpdateBuilder ───────────────────────────────────────────────────
 
@@ -25,7 +40,7 @@ use tracing::debug;
 /// ```
 #[derive(Clone)]
 pub struct UpdateBuilder<M: Table> {
-    sets: Vec<(&'static str, Value)>,
+    sets: Vec<(&'static str, SetExpr)>,
     conditions: Vec<Condition>,
     unfiltered: bool,
     #[cfg(feature = "postgres")]
@@ -56,12 +71,52 @@ impl<M: Table> UpdateBuilder<M> {
     }
 
     /// Append a `SET col = val` assignment.
-    pub fn set<T: crate::value::IntoValue>(
+    pub fn set<T: IntoValue>(
         mut self,
         col: crate::column::Column<M, T>,
-        val: impl crate::value::IntoValue,
+        val: impl IntoValue,
     ) -> Self {
-        self.sets.push((col.name, val.into_value()));
+        self.sets.push((col.name, SetExpr::Value(val.into_value())));
+        self
+    }
+
+    /// `SET col = col || ARRAY[val]` — append an element to a PostgreSQL array column.
+    ///
+    /// ```ignore
+    /// Post::update()
+    ///     .set_array_append(Post::tags, "new_tag".to_string())
+    ///     .filter(Post::id.eq(1i64))
+    ///     .build();
+    /// // → UPDATE "posts" SET "tags" = "tags" || ? WHERE "id" = ?
+    /// ```
+    #[cfg(feature = "postgres")]
+    pub fn set_array_append<T: IntoValue + Clone + 'static>(
+        mut self,
+        col: crate::column::Column<M, Vec<T>>,
+        val: impl IntoValue,
+    ) -> Self {
+        self.sets
+            .push((col.name, SetExpr::ArrayAppend(val.into_value())));
+        self
+    }
+
+    /// `SET col = ARRAY[val] || col` — prepend an element to a PostgreSQL array column.
+    ///
+    /// ```ignore
+    /// Post::update()
+    ///     .set_array_prepend(Post::tags, "first_tag".to_string())
+    ///     .filter(Post::id.eq(1i64))
+    ///     .build();
+    /// // → UPDATE "posts" SET "tags" = ? || "tags" WHERE "id" = ?
+    /// ```
+    #[cfg(feature = "postgres")]
+    pub fn set_array_prepend<T: IntoValue + Clone + 'static>(
+        mut self,
+        col: crate::column::Column<M, Vec<T>>,
+        val: impl IntoValue,
+    ) -> Self {
+        self.sets
+            .push((col.name, SetExpr::ArrayPrepend(val.into_value())));
         self
     }
 
@@ -138,7 +193,7 @@ impl<M: Table> UpdateBuilder<M> {
                     let now_val = Value::Timestamptz(chrono::Utc::now());
                     #[cfg(all(feature = "mysql", not(feature = "postgres")))]
                     let now_val = Value::Timestamp(chrono::Utc::now().naive_utc());
-                    all_sets.push((col_name, now_val));
+                    all_sets.push((col_name, SetExpr::Value(now_val)));
                 }
             }
         }
@@ -147,9 +202,21 @@ impl<M: Table> UpdateBuilder<M> {
         let mut sql = String::with_capacity(64 + all_sets.len() * 16);
         let _ = write!(sql, "UPDATE {} SET ", qi(M::table_name()));
 
-        write_joined(&mut sql, &all_sets, ", ", |buf, (col, val)| {
-            params.push(val.clone());
-            let _ = write!(buf, "{} = ?", qi(col));
+        write_joined(&mut sql, &all_sets, ", ", |buf, (col, expr)| match expr {
+            SetExpr::Value(val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} = ?", qi(col));
+            }
+            #[cfg(feature = "postgres")]
+            SetExpr::ArrayAppend(val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} = {} || ?", qi(col), qi(col));
+            }
+            #[cfg(feature = "postgres")]
+            SetExpr::ArrayPrepend(val) => {
+                params.push(val.clone());
+                let _ = write!(buf, "{} = ? || {}", qi(col), qi(col));
+            }
         });
 
         if !self.conditions.is_empty() {

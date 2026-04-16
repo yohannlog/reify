@@ -78,14 +78,36 @@ pub enum PgCondition {
     RangeIsEmpty(&'static str),
     /// JSONB contains: `column @> value`.
     JsonContains(&'static str, Value),
+    /// JSONB is contained by: `column <@ value`.
+    JsonContainedBy(&'static str, Value),
     /// JSONB key exists: `column ? key`.
     JsonHasKey(&'static str, String),
+    /// JSONB any key exists: `column ?| keys`.
+    JsonHasAnyKey(&'static str, Vec<String>),
+    /// JSONB all keys exist: `column ?& keys`.
+    JsonHasAllKeys(&'static str, Vec<String>),
+    /// JSONB concatenation: `column || value`.
+    JsonConcat(&'static str, Value),
+    /// JSONB key deletion: `column - key`.
+    JsonDeleteKey(&'static str, String),
+    /// JSONB path access as text: `column #>> path`.
+    JsonPathGetText(&'static str, Vec<String>),
+    /// JSONB path access as jsonb: `column #> path`.
+    JsonPathGet(&'static str, Vec<String>),
+    /// JSONB path match: `column @? path`.
+    JsonPathMatch(&'static str, String),
+    /// JSONB path predicate: `column @@ path`.
+    JsonPathTest(&'static str, String),
     /// Array contains element: `column @> ARRAY[value]`.
     ArrayContains(&'static str, Value),
     /// Array is contained by: `column <@ ARRAY[...]`.
     ArrayContainedBy(&'static str, Value),
     /// Arrays overlap: `column && ARRAY[...]`.
     ArrayOverlaps(&'static str, Value),
+    /// Scalar equals any array element: `? = ANY(column)`.
+    ArrayAnyEq(&'static str, Value),
+    /// Scalar equals all array elements: `? = ALL(column)`.
+    ArrayAllEq(&'static str, Value),
 }
 
 #[derive(Debug, Clone)]

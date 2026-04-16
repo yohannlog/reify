@@ -51,6 +51,15 @@ impl Row {
     pub fn values(&self) -> &[Value] {
         &self.values
     }
+
+    /// Convenience: get a column value as an owned `String`, returning `None`
+    /// if the column is absent or not a `Value::String`.
+    pub fn get_string(&self, column: &str) -> Option<String> {
+        match self.get(column)? {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
 }
 
 // ── FromRow trait ───────────────────────────────────────────────────

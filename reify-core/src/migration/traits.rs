@@ -14,6 +14,10 @@ use super::context::MigrationContext;
 ///     fn version(&self) -> &'static str { "20240320_000001_add_user_city" }
 ///     fn description(&self) -> &'static str { "Add city column to users" }
 ///
+///     fn comment(&self) -> Option<&'static str> {
+///         Some("Needed for the regional billing feature (JIRA-42).")
+///     }
+///
 ///     fn up(&self, ctx: &mut MigrationContext) {
 ///         ctx.add_column("users", "city", "TEXT NOT NULL DEFAULT ''");
 ///     }
@@ -31,6 +35,15 @@ pub trait Migration: Send + Sync {
 
     /// Human-readable description shown in `reify status` output.
     fn description(&self) -> &'static str;
+
+    /// Optional free-text comment stored in the changelog.
+    ///
+    /// Use this to record the business reason, ticket reference, or any
+    /// context that doesn't fit in the short `description`.
+    /// Defaults to `None` (no comment).
+    fn comment(&self) -> Option<&'static str> {
+        None
+    }
 
     /// Apply the migration (forward direction).
     fn up(&self, ctx: &mut MigrationContext);

@@ -23,7 +23,7 @@ pub use tracing;
 
 pub use column::Column;
 #[cfg(feature = "postgres")]
-pub use column::JsonExpr;
+pub use column::{JsonExpr, JsonPathExpr};
 #[cfg(feature = "postgres")]
 pub use condition::PgCondition;
 pub use condition::{AggregateCondition, Condition, LogicalOp};
@@ -65,8 +65,8 @@ pub use db::{delete_returning, insert_many_returning, insert_returning, update_r
 pub use migration::{
     ColumnDiff, DbColumnInfo, Migration, MigrationContext, MigrationError, MigrationPlan,
     MigrationRunner, MigrationStatus, SchemaDiff, TableDiff, create_table_sql,
-    create_table_sql_with_checks, generate_migration_file, generate_view_migration_file,
-    normalize_sql_type,
+    create_table_sql_with_checks, generate_materialized_view_migration_file,
+    generate_migration_file, generate_view_migration_file, normalize_sql_type,
 };
 
 pub use rls::{
@@ -85,6 +85,7 @@ pub use enumeration::{DbEnum, enum_from_value};
 pub use range::{Bound, Range, RangeElement};
 
 pub use view::{
-    View, ViewDef, ViewQuery, ViewSchema, ViewSchemaDef, create_view_sql, drop_view_sql,
+    View, ViewDef, ViewQuery, ViewSchema, ViewSchemaDef, create_materialized_view_sql,
+    create_view_sql, drop_materialized_view_sql, drop_view_sql, refresh_materialized_view_sql,
     view as view_schema,
 };

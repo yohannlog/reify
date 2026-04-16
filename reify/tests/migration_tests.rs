@@ -8,7 +8,7 @@ use reify::{
     Database, DbError, Row, TransactionFn, Value,
     migration::{
         Migration, MigrationContext, MigrationError, MigrationPlan, MigrationRunner,
-        generate_migration_file,
+        compute_checksum, generate_migration_file,
     },
 };
 
@@ -18,6 +18,9 @@ use reify::{
 struct MockDb {
     executed: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
     query_results: Arc<Mutex<Vec<Vec<Row>>>>,
+    /// Pre-loaded return values for `execute()`. When non-empty, the front
+    /// value is popped and returned; otherwise defaults to `Ok(1)`.
+    execute_results: Arc<Mutex<Vec<u64>>>,
 }
 
 impl MockDb {
@@ -25,11 +28,17 @@ impl MockDb {
         Self {
             executed: Arc::new(Mutex::new(Vec::new())),
             query_results: Arc::new(Mutex::new(Vec::new())),
+            execute_results: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn push_rows(&self, rows: Vec<Row>) {
         self.query_results.lock().unwrap().push(rows);
+    }
+
+    /// Pre-load a rows_affected value to be returned by the next `execute()` call.
+    fn push_execute_result(&self, n: u64) {
+        self.execute_results.lock().unwrap().push(n);
     }
 
     fn executed_sql(&self) -> Vec<String> {
@@ -48,7 +57,11 @@ impl Database for MockDb {
             .lock()
             .unwrap()
             .push((sql.to_string(), params.to_vec()));
-        Ok(1)
+        let rows_affected = {
+            let mut q = self.execute_results.lock().unwrap();
+            if q.is_empty() { 1 } else { q.remove(0) }
+        };
+        Ok(rows_affected)
     }
 
     async fn query(&self, _sql: &str, _params: &[Value]) -> Result<Vec<Row>, DbError> {
@@ -146,10 +159,21 @@ impl Migration for IrreversibleDrop {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Build a Row with version + checksum columns (for applied_checksums mock).
+fn applied_row_with_checksum(version: &str, checksum: &str) -> Row {
+    Row::new(
+        vec!["version".into(), "checksum".into()],
+        vec![
+            Value::String(version.into()),
+            Value::String(checksum.into()),
+        ],
+    )
+}
+
 #[tokio::test]
 async fn runner_creates_tracking_table_on_first_run() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions → empty
+    db.push_rows(vec![]); // applied_checksums → empty
     db.push_rows(vec![]); // existing_columns users → absent
     db.push_rows(vec![]); // existing_columns posts → absent
 
@@ -170,7 +194,7 @@ async fn runner_creates_tracking_table_on_first_run() {
 #[tokio::test]
 async fn runner_emits_create_table_for_new_tables() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // applied_checksums → empty
     db.push_rows(vec![]); // users columns → absent
 
     MigrationRunner::new()
@@ -190,7 +214,7 @@ async fn runner_emits_create_table_for_new_tables() {
 #[tokio::test]
 async fn runner_emits_add_column_for_new_fields() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // applied_checksums → empty
     // users table exists but missing "role"
     db.push_rows(vec![
         Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
@@ -216,7 +240,7 @@ async fn runner_emits_add_column_for_new_fields() {
 #[tokio::test]
 async fn runner_skips_table_when_all_columns_present() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // applied_checksums → empty
     db.push_rows(vec![
         Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
         Row::new(
@@ -251,7 +275,7 @@ async fn runner_skips_table_when_all_columns_present() {
 #[tokio::test]
 async fn dry_run_returns_plans_without_executing_ddl() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // applied versions (dry_run reads version only)
     db.push_rows(vec![]); // users columns → absent
 
     let plans = MigrationRunner::new()
@@ -275,7 +299,7 @@ async fn dry_run_returns_plans_without_executing_ddl() {
 #[tokio::test]
 async fn dry_run_includes_manual_migration_statements() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // applied versions
 
     let plans = MigrationRunner::new()
         .add(AddUserCity)
@@ -291,7 +315,7 @@ async fn dry_run_includes_manual_migration_statements() {
 #[tokio::test]
 async fn dry_run_skips_already_applied_migrations() {
     let db = MockDb::new();
-    // Both migrations already applied
+    // Both migrations already applied (dry_run queries version only)
     db.push_rows(vec![
         Row::new(
             vec!["version".into()],
@@ -319,7 +343,7 @@ async fn dry_run_skips_already_applied_migrations() {
 #[tokio::test]
 async fn manual_migration_up_executes_all_statements() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // applied_checksums → empty
 
     MigrationRunner::new()
         .add(AddPostSlug)
@@ -383,8 +407,11 @@ async fn status_lists_applied_and_pending() {
     let db = MockDb::new();
     // AddUserCity is applied, AddPostSlug is pending
     db.push_rows(vec![Row::new(
-        vec!["version".into()],
-        vec![Value::String("20240320_000001_add_user_city".into())],
+        vec!["version".into(), "applied_at".into()],
+        vec![
+            Value::String("20240320_000001_add_user_city".into()),
+            Value::String("2024-03-20T00:00:00Z".into()),
+        ],
     )]);
 
     let statuses = MigrationRunner::new()
@@ -417,11 +444,15 @@ fn generate_migration_file_produces_correct_struct_name() {
 
 #[test]
 fn migration_plan_display_shows_version_and_sql() {
+    let stmts = vec!["ALTER TABLE users ADD COLUMN city TEXT NOT NULL;".to_string()];
+    let checksum = compute_checksum(&stmts);
     let plan = MigrationPlan {
         version: "20240320_000001_add_user_city".into(),
         description: "Add city column to users".into(),
-        statements: vec!["ALTER TABLE users ADD COLUMN city TEXT NOT NULL;".into()],
+        comment: None,
+        statements: stmts,
         is_up: true,
+        checksum,
     };
     let d = plan.display();
     assert!(d.contains("Would apply (up)"));
@@ -555,7 +586,7 @@ fn column_defs_from_derive_macro_have_correct_types() {
 #[tokio::test]
 async fn auto_migration_uses_metadata_types_in_create_table() {
     let db = MockDb::new();
-    db.push_rows(vec![]); // applied_versions
+    db.push_rows(vec![]); // applied_checksums → empty
     db.push_rows(vec![]); // existing_columns users → absent
     db.push_rows(vec![]); // existing_columns posts → absent
 
@@ -757,4 +788,96 @@ fn create_table_with_no_checks_matches_base() {
     let base = create_table_sql::<User>(&defs, Dialect::Generic);
     let with_empty = create_table_sql_with_checks::<User>(&defs, &[], Dialect::Generic);
     assert_eq!(base, with_empty);
+}
+
+// ── Checksum + Lock tests ────────────────────────────────────────────
+
+#[tokio::test]
+async fn checksum_mismatch_returns_error() {
+    let db = MockDb::new();
+    // applied_checksums returns AddUserCity with a wrong checksum
+    db.push_rows(vec![applied_row_with_checksum(
+        "20240320_000001_add_user_city",
+        "deadbeef_wrong_hash_that_will_never_match",
+    )]);
+    // lock acquire → 1 row affected (success) — default execute returns Ok(1)
+
+    let result = MigrationRunner::new().add(AddUserCity).run(&db).await;
+
+    assert!(
+        matches!(result, Err(MigrationError::ChecksumMismatch { .. })),
+        "expected ChecksumMismatch, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn checksum_match_does_not_rerun_migration() {
+    // Compute the real checksum for AddUserCity so the stored value matches.
+    let mut ctx = reify::migration::MigrationContext::new();
+    AddUserCity.up(&mut ctx);
+    let real_checksum = compute_checksum(ctx.statements());
+
+    let db = MockDb::new();
+    // applied_checksums returns AddUserCity with the correct checksum
+    db.push_rows(vec![applied_row_with_checksum(
+        "20240320_000001_add_user_city",
+        &real_checksum,
+    )]);
+    // lock acquire → 1 row affected (default)
+
+    MigrationRunner::new()
+        .add(AddUserCity)
+        .run(&db)
+        .await
+        .unwrap();
+
+    let sql = db.executed_sql();
+    // The migration was already applied with matching checksum — no ADD COLUMN
+    assert!(
+        !sql.iter().any(|s| s.contains("ADD COLUMN \"city\"")),
+        "migration should not re-run when checksum matches: {sql:?}"
+    );
+}
+
+#[tokio::test]
+async fn lock_already_acquired_returns_error() {
+    let db = MockDb::new();
+    // acquire lock → 0 rows affected (lock already held)
+    db.push_execute_result(0); // CREATE tracking table → ok (default would be 1, but we need to
+    // place this result for the acquire UPDATE specifically)
+    // We need to skip the CREATE tracking + CREATE lock + INSERT sentinel calls first.
+    // Those are execute() calls that consume from the queue if present.
+    // Strategy: pre-fill the queue so the acquire UPDATE gets 0.
+    // CREATE tracking table → 1 (default, queue empty at that point)
+    // CREATE lock table     → 1 (default)
+    // INSERT sentinel       → 1 (default)
+    // UPDATE acquire        → 0 (our pre-loaded value)
+    // But execute_results is consumed in order, so we push 0 and let the first
+    // three calls consume the default (queue empty → 1).
+    // Reset: push_execute_result(0) was already called above — that will be
+    // consumed by the FIRST execute call (CREATE tracking table), not acquire.
+    // We need to push 3 × 1 then 1 × 0.
+
+    // Re-create db cleanly:
+    let db = MockDb::new();
+    db.push_execute_result(1); // CREATE tracking table
+    db.push_execute_result(1); // CREATE lock table
+    db.push_execute_result(1); // INSERT sentinel (ignored error path, but execute is called)
+    db.push_execute_result(0); // UPDATE acquire → lock held
+
+    // SELECT to fetch locked_by/locked_at after failed acquire
+    db.push_rows(vec![Row::new(
+        vec!["locked_by".into(), "locked_at".into()],
+        vec![
+            Value::String("reify".into()),
+            Value::String("2024-01-01T00:00:00Z".into()),
+        ],
+    )]);
+
+    let result = MigrationRunner::new().add(AddUserCity).run(&db).await;
+
+    assert!(
+        matches!(result, Err(MigrationError::Locked { .. })),
+        "expected Locked error, got: {result:?}"
+    );
 }

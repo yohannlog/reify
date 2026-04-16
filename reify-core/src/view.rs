@@ -162,6 +162,63 @@ pub fn drop_view_sql(name: &str) -> String {
     format!("DROP VIEW IF EXISTS {quoted};")
 }
 
+// ── Materialized view DDL (PostgreSQL) ──────────────────────────────
+
+/// Generate a `CREATE MATERIALIZED VIEW` statement (PostgreSQL).
+///
+/// Pass `with_data = true` to populate the view immediately (default behaviour).
+/// Pass `with_data = false` to create the view structure without loading data
+/// (`WITH NO DATA`) — useful when you want to create indexes before the first
+/// `REFRESH MATERIALIZED VIEW`.
+///
+/// ```ignore
+/// // Populate immediately (most common)
+/// create_materialized_view_sql("sales_summary", "SELECT ...", true);
+///
+/// // Create empty, add indexes, then refresh
+/// create_materialized_view_sql("sales_summary", "SELECT ...", false);
+/// ```
+pub fn create_materialized_view_sql(name: &str, query: &str, with_data: bool) -> String {
+    let quoted = crate::ident::qi(name);
+    let data_clause = if with_data {
+        "WITH DATA"
+    } else {
+        "WITH NO DATA"
+    };
+    format!("CREATE MATERIALIZED VIEW IF NOT EXISTS {quoted} AS {query} {data_clause};")
+}
+
+/// Generate a `DROP MATERIALIZED VIEW IF EXISTS` statement (PostgreSQL).
+pub fn drop_materialized_view_sql(name: &str) -> String {
+    let quoted = crate::ident::qi(name);
+    format!("DROP MATERIALIZED VIEW IF EXISTS {quoted};")
+}
+
+/// Generate a `REFRESH MATERIALIZED VIEW` statement (PostgreSQL).
+///
+/// Pass `concurrently = true` to use `REFRESH MATERIALIZED VIEW CONCURRENTLY`,
+/// which allows reads to continue during the refresh. Requires at least one
+/// unique index on the materialized view.
+///
+/// Pass `concurrently = false` for a plain refresh that locks the view for
+/// the duration of the operation.
+///
+/// ```ignore
+/// // Non-blocking refresh (requires a unique index)
+/// refresh_materialized_view_sql("sales_summary", true);
+///
+/// // Blocking refresh (no index required)
+/// refresh_materialized_view_sql("sales_summary", false);
+/// ```
+pub fn refresh_materialized_view_sql(name: &str, concurrently: bool) -> String {
+    let quoted = crate::ident::qi(name);
+    if concurrently {
+        format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {quoted};")
+    } else {
+        format!("REFRESH MATERIALIZED VIEW {quoted};")
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

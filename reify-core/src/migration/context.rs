@@ -5,7 +5,7 @@ use crate::ident::qi;
 /// Collects SQL statements to be executed (or previewed in dry-run mode).
 pub struct MigrationContext {
     /// Accumulated SQL statements in execution order.
-    pub(crate) statements: Vec<String>,
+    statements: Vec<String>,
 }
 
 impl MigrationContext {
@@ -19,6 +19,11 @@ impl MigrationContext {
     /// Return the accumulated SQL statements.
     pub fn statements(&self) -> &[String] {
         &self.statements
+    }
+
+    /// Consume the context and return the accumulated SQL statements.
+    pub(crate) fn into_statements(self) -> Vec<String> {
+        self.statements
     }
 
     /// Add a column to an existing table.
@@ -77,5 +82,74 @@ impl MigrationContext {
     /// ```
     pub fn drop_view(&mut self, name: &str) {
         self.statements.push(crate::view::drop_view_sql(name));
+    }
+
+    // ── Materialized views (PostgreSQL) ──────────────────────────────
+
+    /// Create a materialized view (PostgreSQL).
+    ///
+    /// The view is populated immediately (`WITH DATA`). To create it empty
+    /// first (e.g. to add indexes before the initial refresh), use
+    /// [`create_materialized_view_no_data`](Self::create_materialized_view_no_data).
+    ///
+    /// ```ignore
+    /// ctx.create_materialized_view(
+    ///     "sales_summary",
+    ///     "SELECT seller_no, invoice_date, sum(invoice_amt) FROM invoice GROUP BY 1, 2",
+    /// );
+    /// ```
+    pub fn create_materialized_view(&mut self, name: &str, query: &str) {
+        self.statements
+            .push(crate::view::create_materialized_view_sql(name, query, true));
+    }
+
+    /// Create a materialized view without loading data (`WITH NO DATA`, PostgreSQL).
+    ///
+    /// Use this when you need to create indexes on the view before the first
+    /// `REFRESH MATERIALIZED VIEW CONCURRENTLY`. Follow up with
+    /// [`refresh_materialized_view`](Self::refresh_materialized_view) once
+    /// indexes are in place.
+    ///
+    /// ```ignore
+    /// ctx.create_materialized_view_no_data("sales_summary", "SELECT ...");
+    /// ctx.execute("CREATE UNIQUE INDEX sales_summary_seller ON sales_summary (seller_no, invoice_date);");
+    /// ctx.refresh_materialized_view("sales_summary", false);
+    /// ```
+    pub fn create_materialized_view_no_data(&mut self, name: &str, query: &str) {
+        self.statements
+            .push(crate::view::create_materialized_view_sql(
+                name, query, false,
+            ));
+    }
+
+    /// Drop a materialized view if it exists (PostgreSQL).
+    ///
+    /// ```ignore
+    /// ctx.drop_materialized_view("sales_summary");
+    /// ```
+    pub fn drop_materialized_view(&mut self, name: &str) {
+        self.statements
+            .push(crate::view::drop_materialized_view_sql(name));
+    }
+
+    /// Refresh a materialized view (PostgreSQL).
+    ///
+    /// Set `concurrently = true` for a non-blocking refresh that allows reads
+    /// during the operation — requires at least one unique index on the view.
+    /// Set `concurrently = false` for a plain blocking refresh.
+    ///
+    /// ```ignore
+    /// // Non-blocking (unique index required)
+    /// ctx.refresh_materialized_view("sales_summary", true);
+    ///
+    /// // Blocking
+    /// ctx.refresh_materialized_view("sales_summary", false);
+    /// ```
+    pub fn refresh_materialized_view(&mut self, name: &str, concurrently: bool) {
+        self.statements
+            .push(crate::view::refresh_materialized_view_sql(
+                name,
+                concurrently,
+            ));
     }
 }
