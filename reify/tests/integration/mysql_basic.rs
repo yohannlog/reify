@@ -192,3 +192,124 @@ async fn mysql_unique_constraint_error() {
 
     teardown(&db).await;
 }
+
+#[tokio::test]
+async fn mysql_nested_transaction_savepoint() {
+    let Some(db) = connect().await else { return };
+    setup(&db).await;
+
+    // Outer transaction inserts id=10, inner (savepoint) inserts id=11 then rolls back.
+    // After commit: id=10 must exist, id=11 must be absent.
+    db.transaction(Box::new(|outer| {
+        Box::pin(async move {
+            outer
+                .execute(
+                    "INSERT INTO users (id, email, role) VALUES (?, ?, ?)",
+                    &[
+                        Value::I64(10),
+                        Value::String("outer@example.com".into()),
+                        Value::Null,
+                    ],
+                )
+                .await?;
+
+            // Nested savepoint — should roll back only the inner insert.
+            let _ = outer
+                .transaction(Box::new(|inner| {
+                    Box::pin(async move {
+                        inner
+                            .execute(
+                                "INSERT INTO users (id, email, role) VALUES (?, ?, ?)",
+                                &[
+                                    Value::I64(11),
+                                    Value::String("inner@example.com".into()),
+                                    Value::Null,
+                                ],
+                            )
+                            .await?;
+                        Err::<(), DbError>(DbError::Other("inner rollback".into()))
+                    })
+                }))
+                .await;
+
+            Ok(())
+        })
+    }))
+    .await
+    .expect("outer transaction");
+
+    let rows = fetch::<User>(&db, &User::find().filter(User::id.eq(10i64)))
+        .await
+        .expect("fetch outer");
+    assert_eq!(rows.len(), 1, "outer insert must be committed");
+
+    let rows = fetch::<User>(&db, &User::find().filter(User::id.eq(11i64)))
+        .await
+        .expect("fetch inner");
+    assert!(rows.is_empty(), "inner insert must be rolled back");
+
+    teardown(&db).await;
+}
+
+#[tokio::test]
+async fn mysql_temporal_round_trip() {
+    let Some(db) = connect().await else { return };
+
+    raw_execute(
+        &db,
+        "CREATE TABLE IF NOT EXISTS temporal_test (\
+            id   INT PRIMARY KEY,\
+            dt   DATETIME,\
+            d    DATE,\
+            t    TIME\
+        )",
+        &[],
+    )
+    .await
+    .expect("create temporal_test");
+
+    raw_execute(
+        &db,
+        "INSERT INTO temporal_test (id, dt, d, t) VALUES (?, ?, ?, ?)",
+        &[
+            Value::I64(1),
+            Value::Timestamp(
+                chrono::NaiveDateTime::parse_from_str("2024-06-15 12:30:45", "%Y-%m-%d %H:%M:%S")
+                    .unwrap(),
+            ),
+            Value::Date(chrono::NaiveDate::parse_from_str("2024-06-15", "%Y-%m-%d").unwrap()),
+            Value::Time(chrono::NaiveTime::parse_from_str("12:30:45", "%H:%M:%S").unwrap()),
+        ],
+    )
+    .await
+    .expect("insert temporal");
+
+    let rows = reify::raw_query(
+        &db,
+        "SELECT dt, d, t FROM temporal_test WHERE id = ?",
+        &[Value::I64(1)],
+    )
+    .await
+    .expect("select temporal");
+
+    assert_eq!(rows.len(), 1);
+    assert!(
+        matches!(rows[0].get_idx(0), Some(Value::Timestamp(_))),
+        "dt must deserialize as Value::Timestamp, got: {:?}",
+        rows[0].get_idx(0)
+    );
+    assert!(
+        matches!(rows[0].get_idx(1), Some(Value::Date(_))),
+        "d must deserialize as Value::Date, got: {:?}",
+        rows[0].get_idx(1)
+    );
+    assert!(
+        matches!(rows[0].get_idx(2), Some(Value::Time(_))),
+        "t must deserialize as Value::Time, got: {:?}",
+        rows[0].get_idx(2)
+    );
+
+    raw_execute(&db, "DROP TABLE IF EXISTS temporal_test", &[])
+        .await
+        .expect("drop temporal_test");
+}

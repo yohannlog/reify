@@ -1,11 +1,10 @@
 #![cfg(feature = "integration-tests")]
 
 use reify::{
-    Database, DbError, NoTls, PostgresDb, Table, Value, deadpool_postgres::Config as DpConfig,
-    delete, fetch, insert, raw_execute, update,
+    Database, DbError, NoTls, PostgresDb, Table, Value, delete, fetch, insert, raw_execute, update,
 };
 
-use crate::pg_url;
+use crate::{pg_config_from_url, pg_url};
 
 #[derive(Table, Debug, Clone, PartialEq)]
 #[table(name = "users")]
@@ -18,36 +17,9 @@ pub struct User {
     pub role: Option<String>,
 }
 
-fn config_from_url(url: &str) -> DpConfig {
-    let url = url
-        .trim_start_matches("postgres://")
-        .trim_start_matches("postgresql://");
-    let mut cfg = DpConfig::new();
-    let (userinfo, rest) = url.split_once('@').unwrap_or(("", url));
-    let (host_port, dbname) = rest.split_once('/').unwrap_or((rest, ""));
-    if !userinfo.is_empty() {
-        if let Some((user, pass)) = userinfo.split_once(':') {
-            cfg.user = Some(user.to_string());
-            cfg.password = Some(pass.to_string());
-        } else {
-            cfg.user = Some(userinfo.to_string());
-        }
-    }
-    if let Some((host, port)) = host_port.split_once(':') {
-        cfg.host = Some(host.to_string());
-        cfg.port = port.parse().ok();
-    } else {
-        cfg.host = Some(host_port.to_string());
-    }
-    if !dbname.is_empty() {
-        cfg.dbname = Some(dbname.to_string());
-    }
-    cfg
-}
-
 async fn connect() -> Option<PostgresDb> {
     let url = pg_url()?;
-    let cfg = config_from_url(&url);
+    let cfg = pg_config_from_url(&url);
     Some(PostgresDb::connect(cfg, NoTls).await.expect("pg connect"))
 }
 

@@ -23,6 +23,7 @@
 pub use mysql_async::{self, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 use mysql_async::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error};
 
 use reify_core::db::{Database, DbError, Row, TransactionFn};
@@ -53,15 +54,21 @@ impl MysqlDb {
     /// ```
     pub async fn connect(opts: impl Into<Opts>) -> Result<Self, DbError> {
         let mysql_opts: Opts = opts.into();
-        debug!(target: "reify::mysql", "Connecting to MySQL/MariaDB");
+        debug!(
+            target: "reify::mysql",
+            host = mysql_opts.ip_or_hostname(),
+            port = mysql_opts.tcp_port(),
+            db   = mysql_opts.db_name().unwrap_or("<none>"),
+            "Connecting to MySQL/MariaDB"
+        );
         let pool = Pool::new(mysql_opts);
-        // Eagerly verify connectivity.
-        pool.get_conn()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?
-            .disconnect()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+        // Eagerly verify connectivity — drop the connection back to the pool
+        // rather than calling disconnect() which would destroy it.
+        drop(
+            pool.get_conn()
+                .await
+                .map_err(|e| DbError::Connection(e.to_string()))?,
+        );
         Ok(Self { pool })
     }
 
@@ -171,7 +178,15 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
         }
         Some(MV::Float(v)) => Value::F32(*v),
         Some(MV::Double(v)) => Value::F64(*v),
-        Some(MV::Date(year, month, day, hour, min, sec, _micro)) => {
+        Some(MV::Date(year, month, day, hour, min, sec, micro)) => {
+            if *micro != 0 {
+                tracing::warn!(
+                    target: "reify::mysql",
+                    micro,
+                    "DATETIME sub-second precision (microseconds) is not supported \
+                     and will be truncated"
+                );
+            }
             if *hour == 0 && *min == 0 && *sec == 0 {
                 if let Some(d) =
                     chrono::NaiveDate::from_ymd_opt(*year as i32, *month as u32, *day as u32)
@@ -190,7 +205,22 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
             }
             Value::Null
         }
-        Some(MV::Time(_, _, hours, mins, secs, _micro)) => {
+        Some(MV::Time(is_negative, _, hours, mins, secs, micro)) => {
+            if *is_negative {
+                tracing::warn!(
+                    target: "reify::mysql",
+                    "Negative TIME value is not representable as NaiveTime; returning Null"
+                );
+                return Value::Null;
+            }
+            if *micro != 0 {
+                tracing::warn!(
+                    target: "reify::mysql",
+                    micro,
+                    "TIME sub-second precision (microseconds) is not supported \
+                     and will be truncated"
+                );
+            }
             chrono::NaiveTime::from_hms_opt(*hours as u32, *mins as u32, *secs as u32)
                 .map(Value::Time)
                 .unwrap_or(Value::Null)
@@ -212,15 +242,23 @@ const MYSQL_CONSTRAINT_CODES: &[u16] = &[
 /// Map a `mysql_async::Error` to a `DbError`, promoting constraint
 /// violations to `DbError::Constraint` with a standardised SQLSTATE.
 fn mysql_err(e: mysql_async::Error) -> DbError {
-    if let mysql_async::Error::Server(ref server_err) = e {
-        if MYSQL_CONSTRAINT_CODES.contains(&server_err.code) {
-            return DbError::Constraint {
-                message: server_err.message.clone(),
-                sqlstate: Some(server_err.state.clone()),
-            };
+    match &e {
+        mysql_async::Error::Server(server_err) => {
+            if MYSQL_CONSTRAINT_CODES.contains(&server_err.code) {
+                return DbError::Constraint {
+                    message: server_err.message.clone(),
+                    sqlstate: Some(server_err.state.clone()),
+                };
+            }
+            DbError::Query(e.to_string())
         }
+        // Driver-level protocol errors and I/O errors are connection failures,
+        // not query failures — classify them accordingly.
+        mysql_async::Error::Driver(_) | mysql_async::Error::Io(_) => {
+            DbError::Connection(e.to_string())
+        }
+        _ => DbError::Query(e.to_string()),
     }
-    DbError::Query(e.to_string())
 }
 
 // ── SQL identifier rewriting ─────────────────────────────────────────
@@ -346,6 +384,7 @@ impl Database for MysqlDb {
 
         let txn = MysqlTransaction {
             conn: tokio::sync::Mutex::new(conn),
+            savepoint_counter: AtomicU64::new(0),
         };
 
         match f(&txn).await {
@@ -376,6 +415,10 @@ impl Database for MysqlDb {
 /// is `Send`-safe across await points.
 struct MysqlTransaction {
     conn: tokio::sync::Mutex<mysql_async::Conn>,
+    /// Monotonically-increasing counter for generating unique SAVEPOINT names.
+    /// Mirrors the same pattern used in `PgTransaction` to guarantee uniqueness
+    /// across recursive nested transactions on the same connection.
+    savepoint_counter: AtomicU64,
 }
 
 impl Database for MysqlTransaction {
@@ -410,27 +453,34 @@ impl Database for MysqlTransaction {
     }
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
-        // Nested transaction via SAVEPOINT
-        debug!(target: "reify::mysql", "SAVEPOINT nested_txn");
+        // Nested transaction via SAVEPOINT. The counter is incremented atomically
+        // so every nested call on this connection gets a distinct name, preventing
+        // collisions when transactions are recursively nested.
+        let n = self.savepoint_counter.fetch_add(1, Ordering::Relaxed);
+        let sp_name = format!("sp_{n}");
+        debug!(target: "reify::mysql", savepoint = %sp_name, "SAVEPOINT (nested)");
         {
             let mut conn = self.conn.lock().await;
-            conn.exec_drop("SAVEPOINT nested_txn", mysql_async::Params::Empty)
+            conn.exec_drop(format!("SAVEPOINT {sp_name}"), mysql_async::Params::Empty)
                 .await
                 .map_err(mysql_err)?;
         }
         match f(self).await {
             Ok(()) => {
                 let mut conn = self.conn.lock().await;
-                conn.exec_drop("RELEASE SAVEPOINT nested_txn", mysql_async::Params::Empty)
-                    .await
-                    .map_err(mysql_err)?;
+                conn.exec_drop(
+                    format!("RELEASE SAVEPOINT {sp_name}"),
+                    mysql_async::Params::Empty,
+                )
+                .await
+                .map_err(mysql_err)?;
                 Ok(())
             }
             Err(e) => {
                 let mut conn = self.conn.lock().await;
                 let _ = conn
                     .exec_drop(
-                        "ROLLBACK TO SAVEPOINT nested_txn",
+                        format!("ROLLBACK TO SAVEPOINT {sp_name}"),
                         mysql_async::Params::Empty,
                     )
                     .await;

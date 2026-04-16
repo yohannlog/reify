@@ -214,3 +214,105 @@ async fn sqlite_unique_constraint_error() {
 
     teardown(&db).await;
 }
+
+#[tokio::test]
+async fn sqlite_nested_transaction_savepoint() {
+    let db = SqliteDb::open_in_memory().expect("open db");
+    setup(&db).await;
+
+    // Outer transaction inserts id=10, inner (savepoint) inserts id=11 then rolls back.
+    // After commit: id=10 must exist, id=11 must be absent.
+    db.transaction(Box::new(|outer| {
+        Box::pin(async move {
+            outer
+                .execute(
+                    "INSERT INTO users (id, email, role) VALUES (?, ?, ?)",
+                    &[
+                        Value::I64(10),
+                        Value::String("outer@example.com".into()),
+                        Value::Null,
+                    ],
+                )
+                .await?;
+
+            // Nested savepoint — should roll back only the inner insert.
+            let _ = outer
+                .transaction(Box::new(|inner| {
+                    Box::pin(async move {
+                        inner
+                            .execute(
+                                "INSERT INTO users (id, email, role) VALUES (?, ?, ?)",
+                                &[
+                                    Value::I64(11),
+                                    Value::String("inner@example.com".into()),
+                                    Value::Null,
+                                ],
+                            )
+                            .await?;
+                        Err::<(), DbError>(DbError::Other("inner rollback".into()))
+                    })
+                }))
+                .await;
+
+            Ok(())
+        })
+    }))
+    .await
+    .expect("outer transaction");
+
+    let rows = fetch::<User>(&db, &User::find().filter(User::id.eq(10i64)))
+        .await
+        .expect("fetch outer");
+    assert_eq!(rows.len(), 1, "outer insert must be committed");
+
+    let rows = fetch::<User>(&db, &User::find().filter(User::id.eq(11i64)))
+        .await
+        .expect("fetch inner");
+    assert!(rows.is_empty(), "inner insert must be rolled back");
+
+    teardown(&db).await;
+}
+
+#[tokio::test]
+async fn sqlite_foreign_key_enforcement() {
+    let db = SqliteDb::open_in_memory().expect("open db");
+
+    // Create parent and child tables with a FK constraint.
+    raw_execute(&db, "CREATE TABLE parents (id INTEGER PRIMARY KEY)", &[])
+        .await
+        .expect("create parents");
+
+    raw_execute(
+        &db,
+        "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parents(id))",
+        &[],
+    )
+    .await
+    .expect("create children");
+
+    // Inserting a child with a non-existent parent must fail with a Constraint error.
+    let result = raw_execute(
+        &db,
+        "INSERT INTO children (id, parent_id) VALUES (?, ?)",
+        &[Value::I64(1), Value::I64(999)],
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(DbError::Constraint { .. })),
+        "expected FK Constraint error, got: {result:?}"
+    );
+
+    // Inserting a valid parent then a child must succeed.
+    raw_execute(&db, "INSERT INTO parents (id) VALUES (?)", &[Value::I64(1)])
+        .await
+        .expect("insert parent");
+
+    raw_execute(
+        &db,
+        "INSERT INTO children (id, parent_id) VALUES (?, ?)",
+        &[Value::I64(1), Value::I64(1)],
+    )
+    .await
+    .expect("insert child with valid FK");
+}

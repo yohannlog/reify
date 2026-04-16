@@ -869,6 +869,14 @@ pub async fn delete_with_hooks<M: Table + crate::hooks::ModelHooks>(
     builder: &crate::query::DeleteBuilder<M>,
 ) -> Result<u64, DbError> {
     model.before_delete();
-    let (sql, params) = builder.build();
-    db.execute(&sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return db.execute(&q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        db.execute(&sql, &params).await
+    }
 }

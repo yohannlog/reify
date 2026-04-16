@@ -94,7 +94,14 @@ impl PgToSql for PgValue<'_> {
             Value::I16(v) => v.to_sql(ty, out),
             Value::I32(v) => v.to_sql(ty, out),
             Value::I64(v) => v.to_sql(ty, out),
-            Value::F32(v) => (*v as f64).to_sql(ty, out),
+            Value::F32(v) => {
+                use tokio_postgres::types::Type;
+                if *ty == Type::FLOAT4 {
+                    v.to_sql(ty, out)
+                } else {
+                    (*v as f64).to_sql(ty, out)
+                }
+            }
             Value::F64(v) => v.to_sql(ty, out),
             Value::String(v) => v.to_sql(ty, out),
             Value::Bytes(v) => v.as_slice().to_sql(ty, out),
@@ -137,8 +144,41 @@ impl PgToSql for PgValue<'_> {
         }
     }
 
-    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
-        true
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        use tokio_postgres::types::Type;
+        matches!(
+            *ty,
+            Type::BOOL
+                | Type::INT2
+                | Type::INT4
+                | Type::INT8
+                | Type::FLOAT4
+                | Type::FLOAT8
+                | Type::TEXT
+                | Type::VARCHAR
+                | Type::BYTEA
+                | Type::UUID
+                | Type::TIMESTAMPTZ
+                | Type::TIMESTAMP
+                | Type::DATE
+                | Type::TIME
+                | Type::JSON
+                | Type::JSONB
+                | Type::INT4_RANGE
+                | Type::INT8_RANGE
+                | Type::TS_RANGE
+                | Type::TSTZ_RANGE
+                | Type::DATE_RANGE
+                | Type::BOOL_ARRAY
+                | Type::INT2_ARRAY
+                | Type::INT4_ARRAY
+                | Type::INT8_ARRAY
+                | Type::FLOAT4_ARRAY
+                | Type::FLOAT8_ARRAY
+                | Type::TEXT_ARRAY
+                | Type::VARCHAR_ARRAY
+                | Type::UUID_ARRAY
+        )
     }
 
     tokio_postgres::types::to_sql_checked!();
@@ -211,7 +251,14 @@ where
 
     let parsed = match range_from_sql(raw) {
         Ok(r) => r,
-        Err(_) => return Range::Empty,
+        Err(e) => {
+            tracing::warn!(
+                target: "reify::postgres",
+                error = %e,
+                "Failed to deserialize PostgreSQL range — returning Empty"
+            );
+            return Range::Empty;
+        }
     };
 
     match parsed {
@@ -565,8 +612,16 @@ impl Database for PostgresDb {
     /// and returned to the pool only when the stream is **dropped**. If the stream
     /// is never fully consumed (e.g. via `take(n)` or an early `break`), the
     /// connection is still returned to the pool once the stream value is dropped —
-    /// but it will remain checked out until that point. Avoid holding streams
-    /// across long-running operations to prevent pool exhaustion.
+    /// but it will remain checked out until that point.
+    ///
+    /// # Pool exhaustion warning
+    ///
+    /// Avoid holding streams across long-running operations or storing them in
+    /// long-lived data structures. Each live stream holds one connection from the
+    /// pool. If `pool.max_size` streams are held simultaneously, all subsequent
+    /// `get_conn` calls will block until a stream is dropped. Always drop the
+    /// stream as soon as you are done consuming it, or wrap it in a
+    /// `tokio::time::timeout` to bound the maximum hold time.
     async fn query_stream<'a>(
         &'a self,
         sql: String,
