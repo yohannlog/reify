@@ -8,7 +8,10 @@ mod plan;
 mod runner;
 mod traits;
 
-pub use codegen::{generate_migration_file, generate_materialized_view_migration_file, generate_view_migration_file};
+pub use codegen::{
+    generate_materialized_view_migration_file, generate_migration_file,
+    generate_view_migration_file,
+};
 pub use context::MigrationContext;
 pub(crate) use ddl::create_table_sql_named;
 pub use ddl::{add_column_sql, create_table_sql, create_table_sql_with_checks};
@@ -390,7 +393,9 @@ mod tests {
     #[test]
     fn migration_plan_display_includes_schema_diff_when_present() {
         use super::plan::compute_checksum;
-        let stmts = vec!["CREATE TABLE IF NOT EXISTS \"users\" (\"id\" BIGSERIAL PRIMARY KEY);".to_string()];
+        let stmts = vec![
+            "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" BIGSERIAL PRIMARY KEY);".to_string(),
+        ];
         let checksum = compute_checksum(&stmts);
         let plan = MigrationPlan {
             version: "auto__users".into(),
@@ -403,20 +408,36 @@ mod tests {
                     table_name: "users".into(),
                     is_new_table: true,
                     column_diffs: vec![
-                        ColumnDiff::Added { column: "id".into() },
-                        ColumnDiff::Added { column: "email".into() },
+                        ColumnDiff::Added {
+                            column: "id".into(),
+                        },
+                        ColumnDiff::Added {
+                            column: "email".into(),
+                        },
                     ],
                 }],
             }),
         };
         let display = plan.display();
         assert!(display.contains("Would apply (up)"));
-        assert!(display.contains("Schema diff:"), "missing Schema diff header: {display}");
-        assert!(display.contains("✚ table `users`"), "missing table symbol: {display}");
+        assert!(
+            display.contains("Schema diff:"),
+            "missing Schema diff header: {display}"
+        );
+        assert!(
+            display.contains("✚ table `users`"),
+            "missing table symbol: {display}"
+        );
         assert!(display.contains("✚ `id`"), "missing id column: {display}");
-        assert!(display.contains("✚ `email`"), "missing email column: {display}");
+        assert!(
+            display.contains("✚ `email`"),
+            "missing email column: {display}"
+        );
         assert!(display.contains("SQL:"), "missing SQL: label: {display}");
-        assert!(display.contains("CREATE TABLE"), "missing SQL body: {display}");
+        assert!(
+            display.contains("CREATE TABLE"),
+            "missing SQL body: {display}"
+        );
     }
 
     #[test]
@@ -1050,7 +1071,10 @@ mod tests {
             "SELECT seller_no, invoice_date, sum(invoice_amt) FROM invoice GROUP BY 1, 2",
         );
         assert_eq!(ctx.statements().len(), 1);
-        assert!(ctx.statements()[0].contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"sales_summary\""));
+        assert!(
+            ctx.statements()[0]
+                .contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"sales_summary\"")
+        );
         assert!(ctx.statements()[0].contains("WITH DATA"));
     }
 
@@ -1075,7 +1099,10 @@ mod tests {
         let mut ctx = MigrationContext::new();
         ctx.refresh_materialized_view("sales_summary", false);
         assert_eq!(ctx.statements().len(), 1);
-        assert_eq!(ctx.statements()[0], "REFRESH MATERIALIZED VIEW \"sales_summary\";");
+        assert_eq!(
+            ctx.statements()[0],
+            "REFRESH MATERIALIZED VIEW \"sales_summary\";"
+        );
     }
 
     #[test]
@@ -1083,18 +1110,29 @@ mod tests {
         let mut ctx = MigrationContext::new();
         ctx.refresh_materialized_view("sales_summary", true);
         assert_eq!(ctx.statements().len(), 1);
-        assert_eq!(ctx.statements()[0], "REFRESH MATERIALIZED VIEW CONCURRENTLY \"sales_summary\";");
+        assert_eq!(
+            ctx.statements()[0],
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY \"sales_summary\";"
+        );
     }
 
     // Minimal View impl for materialized view tests
     struct TestMatView;
     impl Table for TestMatView {
-        fn table_name() -> &'static str { "sales_summary" }
-        fn column_names() -> &'static [&'static str] { &["seller_no", "sales_amt"] }
-        fn into_values(&self) -> Vec<Value> { vec![] }
+        fn table_name() -> &'static str {
+            "sales_summary"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["seller_no", "sales_amt"]
+        }
+        fn into_values(&self) -> Vec<Value> {
+            vec![]
+        }
     }
     impl crate::view::View for TestMatView {
-        fn view_name() -> &'static str { "sales_summary" }
+        fn view_name() -> &'static str {
+            "sales_summary"
+        }
         fn view_query() -> crate::view::ViewQuery {
             crate::view::ViewQuery::Raw(
                 "SELECT seller_no, sum(invoice_amt) FROM invoice GROUP BY seller_no".into(),
@@ -1112,7 +1150,10 @@ mod tests {
 
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].version, "auto_matview__sales_summary");
-        assert!(plans[0].statements[0].contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"sales_summary\""));
+        assert!(
+            plans[0].statements[0]
+                .contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"sales_summary\"")
+        );
         assert!(plans[0].statements[0].contains("WITH DATA"));
     }
 
@@ -1148,7 +1189,10 @@ mod tests {
 
     #[test]
     fn generate_materialized_view_migration_file_produces_valid_template() {
-        let content = generate_materialized_view_migration_file("sales_summary", "20240320_000001_sales_summary");
+        let content = generate_materialized_view_migration_file(
+            "sales_summary",
+            "20240320_000001_sales_summary",
+        );
         assert!(content.contains("struct SalesSummary"));
         assert!(content.contains("impl Migration for SalesSummary"));
         assert!(content.contains("ctx.create_materialized_view(\"sales_summary\""));
@@ -1159,8 +1203,8 @@ mod tests {
 
     #[tokio::test]
     async fn hooks_before_each_called() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let db = MockDb::new();
         db.push_query_result(vec![]); // applied_versions → empty
@@ -1180,13 +1224,17 @@ mod tests {
             });
 
         runner.run(&db).await.unwrap();
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "before_each should be called once");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "before_each should be called once"
+        );
     }
 
     #[tokio::test]
     async fn hooks_after_each_called() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let db = MockDb::new();
         db.push_query_result(vec![]); // applied_versions → empty
@@ -1206,7 +1254,11 @@ mod tests {
             });
 
         runner.run(&db).await.unwrap();
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "after_each should be called once after success");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "after_each should be called once after success"
+        );
     }
 
     #[tokio::test]
@@ -1218,9 +1270,7 @@ mod tests {
         let runner = MigrationRunner::new()
             .add_table::<Users>()
             .on_before_each(|_plan| {
-                Box::pin(async move {
-                    Err(MigrationError::Other("aborted by hook".into()))
-                })
+                Box::pin(async move { Err(MigrationError::Other("aborted by hook".into())) })
             });
 
         let result = runner.run(&db).await;
@@ -1231,7 +1281,8 @@ mod tests {
         // The user table DDL should NOT have been executed (tracking table setup runs before hooks).
         let sql = db.executed_sql();
         assert!(
-            !sql.iter().any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
+            !sql.iter()
+                .any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
             "CREATE TABLE users should not run when before_each aborts: {sql:?}"
         );
     }

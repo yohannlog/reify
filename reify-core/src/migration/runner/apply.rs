@@ -1,5 +1,5 @@
-use super::entries::TRACKING_TABLE;
 use super::MigrationRunner;
+use super::entries::TRACKING_TABLE;
 use crate::db::Database;
 use crate::migration::context::MigrationContext;
 use crate::migration::error::MigrationError;
@@ -136,11 +136,7 @@ impl MigrationRunner {
         result
     }
 
-    async fn run_since_inner(
-        &self,
-        db: &impl Database,
-        since: &str,
-    ) -> Result<(), MigrationError> {
+    async fn run_since_inner(&self, db: &impl Database, since: &str) -> Result<(), MigrationError> {
         let applied = self.applied_checksums(db).await?;
         let timestamps = self.applied_timestamps(db).await?;
 

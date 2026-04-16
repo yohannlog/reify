@@ -47,5 +47,8 @@ mod pg_basic;
 #[path = "integration/pg_migrations.rs"]
 mod pg_migrations;
 
+#[path = "integration/pg_dto.rs"]
+mod pg_dto;
+
 #[path = "integration/mysql_basic.rs"]
 mod mysql_basic;

@@ -6,11 +6,13 @@ mod plans;
 mod queries;
 mod rollback;
 
-pub use hooks::MigrationHooks;
 use entries::{MatViewEntry, TableEntry, ViewEntry};
+pub use hooks::MigrationHooks;
 use hooks::{MigrationErrorHookFn, MigrationHookFn};
 
-use super::ddl::{add_column_sql, create_table_sql, create_table_sql_named, create_table_sql_with_checks};
+use super::ddl::{
+    add_column_sql, create_table_sql, create_table_sql_named, create_table_sql_with_checks,
+};
 use super::traits::Migration;
 use crate::migration::plan::MigrationPlan;
 use crate::query::Dialect;
@@ -125,11 +127,8 @@ impl MigrationRunner {
     where
         T: Table,
     {
-        let create_sql = create_table_sql_with_checks::<T>(
-            &schema.columns,
-            &schema.checks,
-            Dialect::Generic,
-        );
+        let create_sql =
+            create_table_sql_with_checks::<T>(&schema.columns, &schema.checks, Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: T::table_name(),
             column_names: T::column_names(),
@@ -166,10 +165,7 @@ impl MigrationRunner {
     /// Same as [`add_audited_table`](Self::add_audited_table) but delegates the main table
     /// registration to `add_table_with_schema(schema)` for users who define their schema via
     /// the builder API.
-    pub fn add_audited_table_with_schema<T>(
-        mut self,
-        schema: crate::schema::TableSchema<T>,
-    ) -> Self
+    pub fn add_audited_table_with_schema<T>(mut self, schema: crate::schema::TableSchema<T>) -> Self
     where
         T: Table + crate::audit::Auditable,
     {
@@ -227,10 +223,12 @@ impl MigrationRunner {
     /// ```
     pub fn on_before_each(
         mut self,
-        f: impl for<'a> Fn(&'a MigrationPlan) -> BoxFuture<'a, Result<(), crate::migration::MigrationError>>
-            + Send
-            + Sync
-            + 'static,
+        f: impl for<'a> Fn(
+            &'a MigrationPlan,
+        ) -> BoxFuture<'a, Result<(), crate::migration::MigrationError>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.hooks.before_each = Some(Box::new(f));
         self
@@ -243,10 +241,12 @@ impl MigrationRunner {
     /// cache invalidation, or audit logging.
     pub fn on_after_each(
         mut self,
-        f: impl for<'a> Fn(&'a MigrationPlan) -> BoxFuture<'a, Result<(), crate::migration::MigrationError>>
-            + Send
-            + Sync
-            + 'static,
+        f: impl for<'a> Fn(
+            &'a MigrationPlan,
+        ) -> BoxFuture<'a, Result<(), crate::migration::MigrationError>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.hooks.after_each = Some(Box::new(f));
         self
@@ -259,9 +259,9 @@ impl MigrationRunner {
     pub fn on_migration_error(
         mut self,
         f: impl for<'a> Fn(&'a MigrationPlan, &'a crate::migration::MigrationError) -> BoxFuture<'a, ()>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.hooks.on_error = Some(Box::new(f));
         self

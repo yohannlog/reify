@@ -1,5 +1,5 @@
-use super::entries::{TRACKING_TABLE, create_tracking_table_sql};
 use super::MigrationRunner;
+use super::entries::{TRACKING_TABLE, create_tracking_table_sql};
 use crate::db::Database;
 use crate::migration::diff::{DbColumnInfo, normalize_sql_type};
 use crate::migration::error::MigrationError;
@@ -15,7 +15,8 @@ impl MigrationRunner {
         &self,
         db: &impl Database,
     ) -> Result<(), MigrationError> {
-        db.execute(create_tracking_table_sql(self.dialect), &[]).await?;
+        db.execute(create_tracking_table_sql(self.dialect), &[])
+            .await?;
         Ok(())
     }
 
@@ -37,7 +38,10 @@ impl MigrationRunner {
         let rows = db
             .query(&format!("SELECT \"version\" FROM {TRACKING_TABLE}"), &[])
             .await?;
-        let versions = rows.into_iter().filter_map(|r| r.get_string("version")).collect();
+        let versions = rows
+            .into_iter()
+            .filter_map(|r| r.get_string("version"))
+            .collect();
         Ok(versions)
     }
 
@@ -142,8 +146,10 @@ impl MigrationRunner {
             .await
             .unwrap_or_default();
 
-        let unique_cols: std::collections::HashSet<String> =
-            unique_rows.into_iter().filter_map(|r| r.get_string("column_name")).collect();
+        let unique_cols: std::collections::HashSet<String> = unique_rows
+            .into_iter()
+            .filter_map(|r| r.get_string("column_name"))
+            .collect();
 
         // ── 3. Build DbColumnInfo list ────────────────────────────────
         let infos = col_rows
@@ -197,7 +203,10 @@ impl MigrationRunner {
             return Ok(None); // table absent
         }
 
-        let cols = rows.into_iter().filter_map(|r| r.get_string("column_name")).collect();
+        let cols = rows
+            .into_iter()
+            .filter_map(|r| r.get_string("column_name"))
+            .collect();
         Ok(Some(cols))
     }
 }

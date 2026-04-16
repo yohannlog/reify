@@ -35,14 +35,12 @@ impl MigrationRunner {
                         // Sort for a stable, deterministic version key.
                         new_cols.sort_unstable();
                         let cols_key = new_cols.join("_");
-                        let add_version =
-                            format!("auto__{}_add_{}", entry.table_name, cols_key);
+                        let add_version = format!("auto__{}_add_{}", entry.table_name, cols_key);
                         if !applied.contains(&add_version) {
                             let stmts: Vec<String> = new_cols
                                 .iter()
                                 .map(|col| {
-                                    let def =
-                                        entry.column_defs.iter().find(|d| d.name == *col);
+                                    let def = entry.column_defs.iter().find(|d| d.name == *col);
                                     add_column_sql(
                                         entry.table_name,
                                         col,

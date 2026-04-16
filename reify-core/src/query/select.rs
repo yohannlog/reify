@@ -1,9 +1,10 @@
 use super::join::{JoinClause, JoinKind};
 use super::with::WithBuilder;
 use super::{
-    BuildError, Dialect, Expr, OnConflict, Order, OrderExpr, rewrite_placeholders_pg, trace_query,
-    write_on_conflict, write_returning,
+    BuildError, Dialect, Expr, OnConflict, Order, OrderExpr, trace_query, write_on_conflict,
 };
+#[cfg(feature = "postgres")]
+use super::{rewrite_placeholders_pg, write_returning};
 use crate::condition::{AggregateCondition, Condition};
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};

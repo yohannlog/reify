@@ -1,5 +1,5 @@
-use super::entries::TRACKING_TABLE;
 use super::MigrationRunner;
+use super::entries::TRACKING_TABLE;
 use crate::db::Database;
 use crate::migration::diff::{ColumnDiff, SchemaDiff, TableDiff, normalize_sql_type};
 use crate::migration::error::MigrationError;
@@ -59,8 +59,7 @@ impl MigrationRunner {
                                 });
                             }
                             Some(db_col) => {
-                                let def =
-                                    entry.column_defs.iter().find(|d| d.name == *col_name);
+                                let def = entry.column_defs.iter().find(|d| d.name == *col_name);
 
                                 // Type check: use metadata sql_type, falling back to TEXT.
                                 let raw_type = def
@@ -76,8 +75,7 @@ impl MigrationRunner {
                                 }
 
                                 // Nullability
-                                let struct_nullable =
-                                    def.map(|d| d.nullable).unwrap_or(false);
+                                let struct_nullable = def.map(|d| d.nullable).unwrap_or(false);
                                 if struct_nullable != db_col.is_nullable {
                                     diffs.push(ColumnDiff::NullableChanged {
                                         column: col_name.to_string(),
@@ -97,8 +95,8 @@ impl MigrationRunner {
                                 }
 
                                 // Default
-                                let struct_default = def
-                                    .and_then(|d| d.default.as_deref().map(str::to_string));
+                                let struct_default =
+                                    def.and_then(|d| d.default.as_deref().map(str::to_string));
                                 if struct_default != db_col.column_default {
                                     diffs.push(ColumnDiff::DefaultChanged {
                                         column: col_name.to_string(),
@@ -138,10 +136,7 @@ impl MigrationRunner {
     }
 
     /// Return the status of all registered migrations.
-    pub async fn status(
-        &self,
-        db: &impl Database,
-    ) -> Result<Vec<MigrationStatus>, MigrationError> {
+    pub async fn status(&self, db: &impl Database) -> Result<Vec<MigrationStatus>, MigrationError> {
         self.ensure_tracking_table(db).await?;
         let applied = self.applied_timestamps(db).await?;
 
@@ -211,10 +206,7 @@ impl MigrationRunner {
     /// verify checksums, and does not write anything to the database.
     /// If the tracking table does not exist yet, it is treated as empty
     /// (all migrations are pending).
-    pub async fn dry_run(
-        &self,
-        db: &impl Database,
-    ) -> Result<Vec<MigrationPlan>, MigrationError> {
+    pub async fn dry_run(&self, db: &impl Database) -> Result<Vec<MigrationPlan>, MigrationError> {
         // Read applied versions without creating the tracking table.
         // If the table doesn't exist the query will fail — treat that as "no
         // migrations applied yet" rather than a hard error.
@@ -242,7 +234,11 @@ impl MigrationRunner {
             } else {
                 continue;
             };
-            if let Some(td) = schema_diff.tables.iter().find(|t| t.table_name == table_name) {
+            if let Some(td) = schema_diff
+                .tables
+                .iter()
+                .find(|t| t.table_name == table_name)
+            {
                 plan.schema_diff = Some(SchemaDiff {
                     tables: vec![td.clone()],
                 });

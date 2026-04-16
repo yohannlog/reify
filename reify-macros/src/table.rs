@@ -27,6 +27,9 @@ pub(crate) struct TableAttr {
     pub indexes: Vec<ParsedIndex>,
     pub audit: bool,
     pub dto_skip: Vec<String>,
+    /// Extra derives requested via `#[table(dto(derives(Serialize, Deserialize)))]`.
+    #[allow(dead_code)]
+    pub dto_extra_derives: Vec<syn::Path>,
 }
 
 pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -53,6 +56,23 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         }
     };
 
+    let all_field_names: Vec<String> = fields
+        .iter()
+        .map(|f| f.ident.as_ref().unwrap().to_string())
+        .collect();
+
+    // M2: validate dto_skip names against actual fields at macro-expansion time
+    for skipped in &table_attr.dto_skip {
+        if !all_field_names.contains(skipped) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "dto(skip = \"{skipped}\"): field `{skipped}` does not exist on `{struct_name}`"
+                ),
+            ));
+        }
+    }
+
     let mut col_names = Vec::new();
     let mut col_idents = Vec::new();
     let mut col_types = Vec::new();
@@ -62,8 +82,9 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
+    // dto_fields: (ident, type, validate TokenStream, is_copy_type)
     #[cfg(feature = "dto")]
-    let mut dto_fields: Vec<(syn::Ident, syn::Type, Option<String>)> = Vec::new();
+    let mut dto_fields: Vec<(syn::Ident, syn::Type, Option<proc_macro2::TokenStream>)> = Vec::new();
 
     for field in fields.iter() {
         let ident = field.ident.as_ref().unwrap();
@@ -75,6 +96,16 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         col_types.push(ty.clone());
 
         let col_attrs = parse_column_attrs(&field.attrs)?;
+
+        // H4: validate attribute without dto feature is a compile error
+        #[cfg(not(feature = "dto"))]
+        if col_attrs.validate.is_some() {
+            return Err(syn::Error::new_spanned(
+                field,
+                "`#[column(validate(...))]` requires the `dto` feature to be enabled",
+            ));
+        }
+
         if col_attrs.index {
             single_col_indexes.push(name_str.clone());
         }
@@ -373,11 +404,40 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     #[cfg(feature = "dto")]
     let dto_impl = {
         let dto_name = syn::Ident::new(&format!("{}Dto", struct_name), struct_name.span());
+        let model_name_str = struct_name.to_string();
+        let dto_doc = format!(
+            "Auto-generated DTO for `{model_name_str}`. \
+             Excludes auto-increment primary keys, timestamp columns, \
+             and any fields listed in `#[table(dto(skip = \"...\"))]`."
+        );
 
-        let dto_field_defs: Vec<proc_macro2::TokenStream> = dto_fields
+        // M3: use IntoValue directly — no explicit .clone() on Copy types; the
+        // trait impl handles owned vs. borrowed correctly.
+        let dto_value_conversions: Vec<proc_macro2::TokenStream> = dto_fields
             .iter()
-            .map(|(ident, ty, _validate)| {
-                quote! { pub #ident: #ty }
+            .map(|(ident, ty, _)| {
+                let (is_option, inner) = unwrap_option_type(ty);
+                let inner_str = quote!(#inner).to_string().replace(' ', "");
+                let is_copy = matches!(
+                    inner_str.as_str(),
+                    "i16"
+                        | "i32"
+                        | "i64"
+                        | "f32"
+                        | "f64"
+                        | "bool"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "usize"
+                        | "isize"
+                );
+                if is_copy && !is_option {
+                    quote! { reify_core::value::IntoValue::into_value(self.#ident) }
+                } else {
+                    quote! { reify_core::value::IntoValue::into_value(self.#ident.clone()) }
+                }
             })
             .collect();
 
@@ -386,23 +446,13 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         let dto_col_name_strs: Vec<&str> = dto_col_names.iter().map(|s| s.as_str()).collect();
         let dto_num_cols = dto_col_names.len();
 
-        let dto_value_conversions: Vec<proc_macro2::TokenStream> = dto_fields
-            .iter()
-            .map(|(ident, _, _)| {
-                quote! { reify_core::value::IntoValue::into_value(self.#ident.clone()) }
-            })
-            .collect();
-
+        // C1+C2: validate is already a TokenStream — no round-trip parse needed
         #[cfg(feature = "dto-validation")]
         let dto_field_attrs: Vec<proc_macro2::TokenStream> = dto_fields
             .iter()
-            .map(|(_, _, validate)| {
-                if let Some(rule) = validate {
-                    let tokens: proc_macro2::TokenStream = rule.parse().unwrap_or_default();
-                    quote! { #[validate(#tokens)] }
-                } else {
-                    quote! {}
-                }
+            .map(|(_, _, validate)| match validate {
+                Some(tokens) => quote! { #[validate(#tokens)] },
+                None => quote! {},
             })
             .collect();
 
@@ -410,26 +460,111 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         let dto_field_attrs: Vec<proc_macro2::TokenStream> =
             dto_fields.iter().map(|_| quote! {}).collect();
 
+        // M1: configurable derives — always Debug + Clone, plus user extras,
+        // plus validator::Validate when dto-validation is active
+        let extra_derives = &table_attr.dto_extra_derives;
+
         #[cfg(feature = "dto-validation")]
-        let dto_derives = quote! { #[derive(Debug, Clone, validator::Validate)] };
+        let dto_derives = quote! {
+            #[derive(Debug, Clone, validator::Validate #(, #extra_derives)*)]
+        };
 
         #[cfg(not(feature = "dto-validation"))]
-        let dto_derives = quote! { #[derive(Debug, Clone)] };
+        let dto_derives = quote! {
+            #[derive(Debug, Clone #(, #extra_derives)*)]
+        };
 
+        let dto_field_defs: Vec<proc_macro2::TokenStream> = dto_fields
+            .iter()
+            .map(|(ident, ty, _)| quote! { pub #ident: #ty })
+            .collect();
+
+        // H3: From<Model> for ModelDto and From<ModelDto> for Model
+        let from_model_fields: Vec<proc_macro2::TokenStream> = dto_fields
+            .iter()
+            .map(|(ident, _, _)| quote! { #ident: model.#ident.clone() })
+            .collect();
+
+        // Collect which fields are in the DTO to build the reverse mapping.
+        // Fields absent from the DTO (auto-PK, timestamps, skipped) get
+        // Default::default() in the reverse conversion.
+        let dto_field_idents: std::collections::HashSet<String> =
+            dto_fields.iter().map(|(id, _, _)| id.to_string()).collect();
+
+        let into_model_fields: Vec<proc_macro2::TokenStream> = col_idents
+            .iter()
+            .map(|ident| {
+                if dto_field_idents.contains(&ident.to_string()) {
+                    quote! { #ident: dto.#ident.clone() }
+                } else {
+                    quote! { #ident: Default::default() }
+                }
+            })
+            .collect();
+
+        // H2: impl Table for the DTO so it can be used with InsertBuilder etc.
+        // table_name() delegates to the parent model — DTOs share the same table.
         quote! {
+            #[doc = #dto_doc]
             #dto_derives
             pub struct #dto_name {
-                #(#dto_field_attrs #dto_field_defs,)*
+                #(
+                    #dto_field_attrs
+                    #dto_field_defs,
+                )*
             }
 
-            impl #dto_name {
-                pub fn column_names() -> &'static [&'static str] {
+            impl reify_core::Table for #dto_name {
+                fn table_name() -> &'static str {
+                    #table_name
+                }
+
+                fn column_names() -> &'static [&'static str] {
                     static COLS: [&str; #dto_num_cols] = [#(#dto_col_name_strs),*];
                     &COLS
                 }
 
-                pub fn into_values(&self) -> Vec<reify_core::Value> {
+                fn into_values(&self) -> Vec<reify_core::Value> {
                     vec![#(#dto_value_conversions),*]
+                }
+            }
+
+            impl #dto_name {
+                /// Returns the ordered list of column names this DTO maps to.
+                pub fn column_names() -> &'static [&'static str] {
+                    <Self as reify_core::Table>::column_names()
+                }
+
+                /// Converts this DTO into an ordered list of [`reify_core::Value`]s.
+                pub fn into_values(&self) -> Vec<reify_core::Value> {
+                    <Self as reify_core::Table>::into_values(self)
+                }
+            }
+
+            impl From<&#struct_name> for #dto_name {
+                fn from(model: &#struct_name) -> Self {
+                    Self { #(#from_model_fields),* }
+                }
+            }
+
+            impl From<#struct_name> for #dto_name {
+                fn from(model: #struct_name) -> Self {
+                    Self::from(&model)
+                }
+            }
+
+            impl From<&#dto_name> for #struct_name {
+                /// Reconstructs the full model from a DTO reference.
+                /// Fields absent from the DTO (auto-PK, timestamps, skipped fields)
+                /// are set to [`Default::default()`].
+                fn from(dto: &#dto_name) -> Self {
+                    Self { #(#into_model_fields),* }
+                }
+            }
+
+            impl From<#dto_name> for #struct_name {
+                fn from(dto: #dto_name) -> Self {
+                    Self::from(&dto)
                 }
             }
         }
@@ -451,6 +586,7 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
         let mut indexes = Vec::new();
         let mut audit = false;
         let mut dto_skip = Vec::new();
+        let mut dto_extra_derives: Vec<syn::Path> = Vec::new();
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
@@ -462,16 +598,22 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
             } else if meta.path.is_ident("audit") {
                 audit = true;
             } else if meta.path.is_ident("dto") {
-                let _ = meta.parse_nested_meta(|inner| {
+                meta.parse_nested_meta(|inner| {
                     if inner.path.is_ident("skip") {
                         let value = inner.value()?;
                         let lit: Lit = value.parse()?;
                         if let Lit::Str(s) = lit {
                             dto_skip.extend(s.value().split(',').map(|s| s.trim().to_string()));
                         }
+                    } else if inner.path.is_ident("derives") {
+                        // M1: parse `derives(Serialize, Deserialize, PartialEq, ...)`
+                        let content;
+                        syn::parenthesized!(content in inner.input);
+                        let paths = content.parse_terminated(syn::Path::parse, syn::Token![,])?;
+                        dto_extra_derives.extend(paths);
                     }
                     Ok(())
-                });
+                })?;
             } else if meta.path.is_ident("index") {
                 let mut columns = Vec::new();
                 let mut unique = false;
@@ -536,6 +678,7 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                 indexes,
                 audit,
                 dto_skip,
+                dto_extra_derives,
             });
         }
     }

@@ -34,3 +34,5 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 trybuild = { version = "1", features = ["diff"] }
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"

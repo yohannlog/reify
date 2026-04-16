@@ -143,7 +143,7 @@ impl Database for MockDb {
     fn transaction<'a>(
         &'a self,
         f: TransactionFn<'a>,
-    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+    ) -> impl Future<Output = Result<(), DbError>> + Send {
         async move { f(self).await }
     }
 }

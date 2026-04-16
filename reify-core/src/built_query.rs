@@ -22,6 +22,7 @@ impl BuiltQuery {
     }
 
     /// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …`.
+    #[cfg(feature = "postgres")]
     pub fn rewrite_pg(&self) -> BuiltQuery {
         let sql = crate::query::rewrite_placeholders_pg(&self.sql);
         BuiltQuery {

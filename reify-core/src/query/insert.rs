@@ -1,7 +1,6 @@
-use super::{
-    BuildError, Dialect, OnConflict, rewrite_placeholders_pg, trace_query, write_on_conflict,
-    write_returning,
-};
+use super::{BuildError, Dialect, OnConflict, trace_query, write_on_conflict};
+#[cfg(feature = "postgres")]
+use super::{rewrite_placeholders_pg, write_returning};
 use crate::condition::Condition;
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};

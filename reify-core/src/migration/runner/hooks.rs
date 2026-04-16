@@ -7,18 +7,15 @@ use futures_core::future::BoxFuture;
 /// Receives a shared reference to the plan. Return `Err` from `before_each`
 /// to abort the migration immediately (the plan will not be executed).
 pub type MigrationHookFn = Box<
-    dyn for<'a> Fn(&'a MigrationPlan) -> BoxFuture<'a, Result<(), MigrationError>>
-        + Send
-        + Sync,
+    dyn for<'a> Fn(&'a MigrationPlan) -> BoxFuture<'a, Result<(), MigrationError>> + Send + Sync,
 >;
 
 /// Async hook called when a migration plan fails.
 ///
 /// Cannot cancel or modify the error — use it for logging, alerting, or
 /// cleanup. The original error is propagated after the hook returns.
-pub type MigrationErrorHookFn = Box<
-    dyn for<'a> Fn(&'a MigrationPlan, &'a MigrationError) -> BoxFuture<'a, ()> + Send + Sync,
->;
+pub type MigrationErrorHookFn =
+    Box<dyn for<'a> Fn(&'a MigrationPlan, &'a MigrationError) -> BoxFuture<'a, ()> + Send + Sync>;
 
 /// Collection of lifecycle hooks for the migration runner.
 ///

@@ -1,5 +1,5 @@
-use super::entries::TRACKING_TABLE;
 use super::MigrationRunner;
+use super::entries::TRACKING_TABLE;
 use crate::db::Database;
 use crate::migration::context::MigrationContext;
 use crate::migration::error::MigrationError;
@@ -120,8 +120,10 @@ impl MigrationRunner {
             )
             .await?;
 
-        let versions: Vec<String> =
-            rows.into_iter().filter_map(|r| r.get_string("version")).collect();
+        let versions: Vec<String> = rows
+            .into_iter()
+            .filter_map(|r| r.get_string("version"))
+            .collect();
 
         // Guard: ensure target_version is actually in the applied list before
         // starting any rollback — prevents silent no-ops on typos.
@@ -224,8 +226,10 @@ impl MigrationRunner {
             )
             .await?;
 
-        let versions: Vec<String> =
-            rows.into_iter().filter_map(|r| r.get_string("version")).collect();
+        let versions: Vec<String> = rows
+            .into_iter()
+            .filter_map(|r| r.get_string("version"))
+            .collect();
 
         if versions.is_empty() {
             return Err(MigrationError::Other(format!(

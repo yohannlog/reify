@@ -19,7 +19,7 @@ pub(crate) struct ColumnAttrs {
     pub references: Option<String>,
     pub on_delete: Option<String>,
     pub on_update: Option<String>,
-    pub validate: Option<String>,
+    pub validate: Option<proc_macro2::TokenStream>,
 }
 
 pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs> {
@@ -97,7 +97,7 @@ pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs
                 let content;
                 syn::parenthesized!(content in meta.input);
                 let tokens: proc_macro2::TokenStream = content.parse()?;
-                result.validate = Some(tokens.to_string());
+                result.validate = Some(tokens);
             } else {
                 return Err(meta.error(format!(
                     "unknown `column` attribute `{}`; expected one of: \

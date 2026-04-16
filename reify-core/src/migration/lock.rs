@@ -75,8 +75,12 @@ impl MigrationLock {
         // Insert the sentinel row if it doesn't exist yet.
         // Ignore errors — the row may already exist on any DB.
         let insert = match dialect {
-            Dialect::Mysql => "INSERT IGNORE INTO `_reify_migrations_lock` (`id`, `locked`) VALUES (1, 0);",
-            _ => "INSERT INTO \"_reify_migrations_lock\" (\"id\", \"locked\") VALUES (1, false) ON CONFLICT DO NOTHING;",
+            Dialect::Mysql => {
+                "INSERT IGNORE INTO `_reify_migrations_lock` (`id`, `locked`) VALUES (1, 0);"
+            }
+            _ => {
+                "INSERT INTO \"_reify_migrations_lock\" (\"id\", \"locked\") VALUES (1, false) ON CONFLICT DO NOTHING;"
+            }
         };
         let _ = db.execute(insert, &[]).await;
         Ok(())
@@ -93,9 +97,7 @@ impl MigrationLock {
     pub async fn acquire(db: &impl Database, dialect: Dialect) -> Result<(), MigrationError> {
         let holder = lock_holder_id();
         let sql = acquire_sql(dialect);
-        let rows_affected = db
-            .execute(&sql, &[Value::String(holder)])
-            .await?;
+        let rows_affected = db.execute(&sql, &[Value::String(holder)]).await?;
 
         if rows_affected == 0 {
             // Lock is actively held — fetch holder info for the error message.
