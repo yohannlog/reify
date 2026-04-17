@@ -1,7 +1,10 @@
 #![cfg(feature = "integration-tests")]
 
 use reify::mysql_async::Opts;
-use reify::{Database, DbError, MysqlDb, Table, Value, delete, fetch, insert, raw_execute, update};
+use reify::{
+    Database, DbError, MysqlDb, Table, Value, delete, fetch, insert, insert_many, raw_execute,
+    update,
+};
 
 use crate::mysql_url;
 
@@ -312,4 +315,104 @@ async fn mysql_temporal_round_trip() {
     raw_execute(&db, "DROP TABLE IF EXISTS temporal_test", &[])
         .await
         .expect("drop temporal_test");
+}
+
+#[tokio::test]
+async fn mysql_insert_many() {
+    let Some(db) = connect().await else { return };
+    setup(&db).await;
+
+    let users = vec![
+        User {
+            id: 20,
+            email: "u20@example.com".into(),
+            role: None,
+        },
+        User {
+            id: 21,
+            email: "u21@example.com".into(),
+            role: Some("editor".into()),
+        },
+        User {
+            id: 22,
+            email: "u22@example.com".into(),
+            role: None,
+        },
+    ];
+
+    let affected = insert_many(&db, &User::insert_many(&users))
+        .await
+        .expect("insert_many");
+    assert_eq!(affected, 3, "expected 3 rows inserted");
+
+    let rows = fetch::<User>(&db, &User::find().filter(User::id.gte(20i64).and(User::id.lte(22i64))))
+        .await
+        .expect("fetch");
+    assert_eq!(rows.len(), 3);
+
+    teardown(&db).await;
+}
+
+#[tokio::test]
+async fn mysql_upsert_do_nothing() {
+    let Some(db) = connect().await else { return };
+    setup(&db).await;
+
+    let user = User {
+        id: 30,
+        email: "upsert_ignore@example.com".into(),
+        role: None,
+    };
+    insert(&db, &User::insert(&user)).await.expect("first insert");
+
+    // INSERT IGNORE — duplicate must be silently skipped
+    let affected = insert(
+        &db,
+        &User::insert(&user).on_conflict_do_nothing(),
+    )
+    .await
+    .expect("upsert do nothing");
+    assert_eq!(affected, 0, "INSERT IGNORE on duplicate must affect 0 rows");
+
+    // Only one row must exist
+    let rows = fetch::<User>(&db, &User::find().filter(User::id.eq(30i64)))
+        .await
+        .expect("fetch");
+    assert_eq!(rows.len(), 1);
+
+    teardown(&db).await;
+}
+
+#[tokio::test]
+async fn mysql_upsert_do_update() {
+    let Some(db) = connect().await else { return };
+    setup(&db).await;
+
+    let user = User {
+        id: 31,
+        email: "upsert_update@example.com".into(),
+        role: None,
+    };
+    insert(&db, &User::insert(&user)).await.expect("first insert");
+
+    // ON DUPLICATE KEY UPDATE — role must be updated
+    let updated = User {
+        id: 31,
+        email: "upsert_update@example.com".into(),
+        role: Some("admin".into()),
+    };
+    insert(
+        &db,
+        &User::insert(&updated).on_conflict_do_update(&["email"], &["role"]),
+    )
+    .await
+    .expect("upsert do update");
+
+    let rows = fetch::<User>(&db, &User::find().filter(User::id.eq(31i64)))
+        .await
+        .expect("fetch");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].role, Some("admin".into()), "role must be updated by upsert");
+
+    teardown(&db).await;
 }

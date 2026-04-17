@@ -52,3 +52,9 @@ mod pg_dto;
 
 #[path = "integration/mysql_basic.rs"]
 mod mysql_basic;
+
+#[path = "integration/mysql_dto.rs"]
+mod mysql_dto;
+
+#[path = "integration/mysql_migrations.rs"]
+mod mysql_migrations;
