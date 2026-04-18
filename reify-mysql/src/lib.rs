@@ -23,9 +23,12 @@
 pub use mysql_async::{self, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 use mysql_async::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error};
 
+use reify_core::adapter::{
+    SavepointCounter, rewrite_double_quoted_idents_to_backticks,
+    rewrite_placeholders_to_question,
+};
 use reify_core::db::{Database, DbError, Row, TransactionFn};
 use reify_core::value::Value;
 
@@ -80,16 +83,19 @@ impl MysqlDb {
 
 // ── Value → mysql_async parameter conversion ────────────────────────
 
-fn values_to_mysql_params(params: &[Value]) -> mysql_async::Params {
+fn values_to_mysql_params(params: &[Value]) -> Result<mysql_async::Params, DbError> {
     if params.is_empty() {
-        return mysql_async::Params::Empty;
+        return Ok(mysql_async::Params::Empty);
     }
-    let vals: Vec<mysql_async::Value> = params.iter().map(value_to_mysql).collect();
-    mysql_async::Params::Positional(vals)
+    let vals: Vec<mysql_async::Value> = params
+        .iter()
+        .map(value_to_mysql)
+        .collect::<Result<_, _>>()?;
+    Ok(mysql_async::Params::Positional(vals))
 }
 
-fn value_to_mysql(val: &Value) -> mysql_async::Value {
-    match val {
+fn value_to_mysql(val: &Value) -> Result<mysql_async::Value, DbError> {
+    Ok(match val {
         Value::Null => mysql_async::Value::NULL,
         Value::Bool(v) => mysql_async::Value::from(*v),
         Value::I16(v) => mysql_async::Value::from(*v),
@@ -99,19 +105,24 @@ fn value_to_mysql(val: &Value) -> mysql_async::Value {
         Value::F64(v) => mysql_async::Value::from(*v),
         Value::String(v) => mysql_async::Value::from(v.as_str()),
         Value::Bytes(v) => mysql_async::Value::from(v.as_slice()),
+        // Use chrono's native Display, which emits sub-second precision when
+        // present. `mysql_async` then parses it back as a temporal value.
         Value::Timestamp(v) => mysql_async::Value::from(v.to_string()),
         Value::Date(v) => mysql_async::Value::from(v.to_string()),
         Value::Time(v) => mysql_async::Value::from(v.to_string()),
         // Any Value variant not handled above (e.g. PostgreSQL-only types
         // like Uuid, Timestamptz, Jsonb, range and array types) cannot be
-        // bound as a MySQL parameter. Panic immediately with a clear message
-        // rather than silently converting to NULL.
+        // bound as a MySQL parameter. Return a conversion error so a shared
+        // PostgreSQL model used against MySQL fails cleanly instead of
+        // panicking at runtime.
         #[allow(unreachable_patterns)]
-        other => unreachable!(
-            "{other:?} cannot be bound as a MySQL parameter; \
-             use only Value variants supported by MySQL"
-        ),
-    }
+        other => {
+            return Err(DbError::Conversion(format!(
+                "{other:?} cannot be bound as a MySQL parameter; \
+                 use only Value variants supported by MySQL"
+            )));
+        }
+    })
 }
 
 // ── mysql_async row → reify Row conversion ──────────────────────────
@@ -163,15 +174,11 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
         }
         Some(MV::Int(v)) => Value::I64(*v),
         Some(MV::UInt(v)) => {
-            // MySQL UNSIGNED BIGINT can exceed i64::MAX. Values that do not
-            // fit are clamped to i64::MAX rather than wrapping silently.
+            // MySQL UNSIGNED BIGINT can exceed i64::MAX. Return such values
+            // as a decimal string (lossless) so callers can parse them as
+            // u64, BigDecimal, etc. without silent clamping.
             if *v > i64::MAX as u64 {
-                tracing::warn!(
-                    target: "reify::mysql",
-                    value = v,
-                    "UNSIGNED BIGINT value exceeds i64::MAX; clamping to i64::MAX"
-                );
-                Value::I64(i64::MAX)
+                Value::String(v.to_string())
             } else {
                 Value::I64(*v as i64)
             }
@@ -179,27 +186,22 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
         Some(MV::Float(v)) => Value::F32(*v),
         Some(MV::Double(v)) => Value::F64(*v),
         Some(MV::Date(year, month, day, hour, min, sec, micro)) => {
-            if *micro != 0 {
-                tracing::warn!(
-                    target: "reify::mysql",
-                    micro,
-                    "DATETIME sub-second precision (microseconds) is not supported \
-                     and will be truncated"
-                );
-            }
-            if *hour == 0 && *min == 0 && *sec == 0 {
-                if let Some(d) =
-                    chrono::NaiveDate::from_ymd_opt(*year as i32, *month as u32, *day as u32)
-                {
+            let date =
+                chrono::NaiveDate::from_ymd_opt(*year as i32, *month as u32, *day as u32);
+            // DATE (no time component and no fractional seconds).
+            if *hour == 0 && *min == 0 && *sec == 0 && *micro == 0 {
+                if let Some(d) = date {
                     return Value::Date(d);
                 }
             }
-            if let Some(d) =
-                chrono::NaiveDate::from_ymd_opt(*year as i32, *month as u32, *day as u32)
-            {
-                if let Some(t) =
-                    chrono::NaiveTime::from_hms_opt(*hour as u32, *min as u32, *sec as u32)
-                {
+            // DATETIME(0..6) — preserve full microsecond precision.
+            if let Some(d) = date {
+                if let Some(t) = chrono::NaiveTime::from_hms_micro_opt(
+                    *hour as u32,
+                    *min as u32,
+                    *sec as u32,
+                    *micro,
+                ) {
                     return Value::Timestamp(chrono::NaiveDateTime::new(d, t));
                 }
             }
@@ -213,17 +215,15 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
                 );
                 return Value::Null;
             }
-            if *micro != 0 {
-                tracing::warn!(
-                    target: "reify::mysql",
-                    micro,
-                    "TIME sub-second precision (microseconds) is not supported \
-                     and will be truncated"
-                );
-            }
-            chrono::NaiveTime::from_hms_opt(*hours as u32, *mins as u32, *secs as u32)
-                .map(Value::Time)
-                .unwrap_or(Value::Null)
+            // TIME(0..6) — preserve full microsecond precision.
+            chrono::NaiveTime::from_hms_micro_opt(
+                *hours as u32,
+                *mins as u32,
+                *secs as u32,
+                *micro,
+            )
+            .map(Value::Time)
+            .unwrap_or(Value::Null)
         }
     }
 }
@@ -263,74 +263,23 @@ fn mysql_err(e: mysql_async::Error) -> DbError {
 
 // ── SQL identifier rewriting ─────────────────────────────────────────
 
-/// Rewrite PostgreSQL-style `$N` placeholders to MySQL `?` placeholders.
-///
-/// When the `postgres` feature is enabled alongside `mysql`, the shared query
-/// helpers (`insert`, `fetch`, `update`, `delete`) call `build_pg()` which
-/// emits `$1`, `$2`, … positional placeholders. MySQL requires `?` instead,
-/// so we rewrite them here at execution time.
-fn rewrite_placeholders_mysql(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek().map_or(false, |c| c.is_ascii_digit()) {
-            result.push('?');
-            // consume all digits of the placeholder number
-            while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
-                chars.next();
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
-/// Rewrite double-quoted identifiers (`"name"`) to MySQL backtick style (`` `name` ``).
-///
-/// The query builder always emits `"ident"` (ANSI SQL / Generic dialect).
-/// MySQL requires backtick quoting by default, so we rewrite at execution time.
-fn rewrite_quotes_mysql(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '"' {
-            result.push('`');
-            loop {
-                match chars.next() {
-                    None => break,
-                    Some('"') => {
-                        // A doubled quote `""` is an escaped quote inside the identifier.
-                        if chars.peek() == Some(&'"') {
-                            chars.next();
-                            result.push('"');
-                        } else {
-                            result.push('`');
-                            break;
-                        }
-                    }
-                    Some(inner) => result.push(inner),
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
 /// Rewrite SQL to MySQL dialect and marshal params in one step.
-fn prepare_mysql(sql: &str, params: &[Value]) -> (String, mysql_async::Params) {
-    let sql = rewrite_quotes_mysql(&rewrite_placeholders_mysql(sql));
-    let mysql_params = values_to_mysql_params(params);
-    (sql, mysql_params)
+///
+/// Both rewrites (`$N → ?` and `"ident" → `` `ident` ``) are string-literal
+/// aware via [`reify_core::adapter`], so constants like `'$1'` or `'"abc"'`
+/// survive intact.
+fn prepare_mysql(sql: &str, params: &[Value]) -> Result<(String, mysql_async::Params), DbError> {
+    let sql =
+        rewrite_double_quoted_idents_to_backticks(&rewrite_placeholders_to_question(sql));
+    let mysql_params = values_to_mysql_params(params)?;
+    Ok((sql, mysql_params))
 }
 
 // ── Database trait implementation ───────────────────────────────────
 
 impl Database for MysqlDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-        let (sql, mysql_params) = prepare_mysql(sql, params);
+        let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Executing");
         let mut conn = self
             .pool
@@ -342,7 +291,7 @@ impl Database for MysqlDb {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
-        let (sql, mysql_params) = prepare_mysql(sql, params);
+        let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Querying");
         let mut conn = self
             .pool
@@ -354,7 +303,7 @@ impl Database for MysqlDb {
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
-        let (sql, mysql_params) = prepare_mysql(sql, params);
+        let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Querying one");
         let mut conn = self
             .pool
@@ -371,6 +320,73 @@ impl Database for MysqlDb {
         }
     }
 
+    /// # Streaming cursor
+    ///
+    /// Uses `mysql_async::Queryable::exec_iter` to pull rows from the server on
+    /// demand via a background task that feeds a bounded channel. This avoids
+    /// loading the entire result set into memory — unlike the default
+    /// implementation, which delegates to `query` and buffers everything.
+    ///
+    /// # Connection lifecycle
+    ///
+    /// The producer task owns the pooled connection for the duration of the
+    /// stream and returns it to the pool when the stream (or channel) is
+    /// dropped. Dropping the stream early cancels the cursor cleanly.
+    ///
+    /// # Pool exhaustion warning
+    ///
+    /// Each live stream holds one connection. Drop it as soon as consumption
+    /// is complete, or wrap it in `tokio::time::timeout` to bound the hold
+    /// time. Never persist a stream in long-lived state.
+    async fn query_stream<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+    ) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
+        use futures_util::StreamExt;
+
+        let (sql, mysql_params) = prepare_mysql(&sql, &params)?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+        debug!(target: "reify::mysql", sql, "Querying (stream)");
+
+        // Small buffer keeps memory bounded while letting the producer stay
+        // one row ahead of the consumer for pipelining.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Row, DbError>>(16);
+        tokio::spawn(async move {
+            let mut result = match conn.exec_iter(sql, mysql_params).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(mysql_err(e))).await;
+                    return;
+                }
+            };
+            loop {
+                match result.next().await {
+                    Ok(Some(row)) => {
+                        if tx.send(Ok(mysql_row_to_row(&row))).await.is_err() {
+                            // Receiver dropped — abort the cursor.
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(mysql_err(e))).await;
+                        break;
+                    }
+                }
+            }
+            // `conn` drops here, returning it to the pool.
+            drop(conn);
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx).boxed();
+        Ok(stream)
+    }
+
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         debug!(target: "reify::mysql", "BEGIN transaction");
         let mut conn = self
@@ -384,7 +400,7 @@ impl Database for MysqlDb {
 
         let txn = MysqlTransaction {
             conn: tokio::sync::Mutex::new(conn),
-            savepoint_counter: AtomicU64::new(0),
+            savepoint_counter: SavepointCounter::new(),
         };
 
         match f(&txn).await {
@@ -416,14 +432,13 @@ impl Database for MysqlDb {
 struct MysqlTransaction {
     conn: tokio::sync::Mutex<mysql_async::Conn>,
     /// Monotonically-increasing counter for generating unique SAVEPOINT names.
-    /// Mirrors the same pattern used in `PgTransaction` to guarantee uniqueness
-    /// across recursive nested transactions on the same connection.
-    savepoint_counter: AtomicU64,
+    /// Shared implementation lives in [`reify_core::adapter::SavepointCounter`].
+    savepoint_counter: SavepointCounter,
 }
 
 impl Database for MysqlTransaction {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-        let (sql, mysql_params) = prepare_mysql(sql, params);
+        let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Executing (txn)");
         let mut conn = self.conn.lock().await;
         conn.exec_drop(sql, mysql_params).await.map_err(mysql_err)?;
@@ -431,7 +446,7 @@ impl Database for MysqlTransaction {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
-        let (sql, mysql_params) = prepare_mysql(sql, params);
+        let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Querying (txn)");
         let mut conn = self.conn.lock().await;
         let rows: Vec<mysql_async::Row> = conn.exec(sql, mysql_params).await.map_err(mysql_err)?;
@@ -439,7 +454,7 @@ impl Database for MysqlTransaction {
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
-        let (sql, mysql_params) = prepare_mysql(sql, params);
+        let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Querying one (txn)");
         let mut conn = self.conn.lock().await;
         let row: Option<mysql_async::Row> = conn
@@ -453,11 +468,9 @@ impl Database for MysqlTransaction {
     }
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
-        // Nested transaction via SAVEPOINT. The counter is incremented atomically
-        // so every nested call on this connection gets a distinct name, preventing
-        // collisions when transactions are recursively nested.
-        let n = self.savepoint_counter.fetch_add(1, Ordering::Relaxed);
-        let sp_name = format!("sp_{n}");
+        // Nested transaction via SAVEPOINT. `SavepointCounter` guarantees a
+        // distinct name for every call on this connection.
+        let sp_name = self.savepoint_counter.next_name();
         debug!(target: "reify::mysql", savepoint = %sp_name, "SAVEPOINT (nested)");
         {
             let mut conn = self.conn.lock().await;

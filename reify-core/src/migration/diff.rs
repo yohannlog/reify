@@ -22,6 +22,16 @@ pub enum ColumnDiff {
     /// Column exists in the database but not in the struct.
     Removed { column: String },
     /// The SQL data type differs between struct and database.
+    ///
+    /// **No DDL is generated automatically for this variant.** Type changes
+    /// can be lossy (narrowing, encoding changes, loss of precision) or
+    /// require a `USING` cast expression the migration engine cannot infer
+    /// (e.g. `text` → `int4`, `jsonb` → `text`, timezone conversions).
+    ///
+    /// The diff is reported for visibility; you must author the
+    /// `ALTER TABLE … ALTER COLUMN … TYPE … [USING …]` statement manually
+    /// (typically as a hand-written migration) and verify it against
+    /// production data.
     TypeChanged {
         column: String,
         from: String,

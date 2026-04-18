@@ -6,7 +6,7 @@ mod table;
 mod view;
 
 use proc_macro::TokenStream;
-use syn::{DeriveInput, parse_macro_input};
+use syn::{parse_macro_input, DeriveInput};
 
 /// Derive macro that implements `Table` and generates typed column constants + query builder helpers.
 ///
@@ -33,6 +33,53 @@ use syn::{DeriveInput, parse_macro_input};
 /// )]
 /// pub struct User { /* ... */ }
 /// ```
+///
+/// ## Validation rules (`dto-validation` feature)
+///
+/// `#[column(validate(...))]` forwards its rules to `validator::Validate`
+/// on the generated `{Model}Dto`. Every rule the `validator` crate
+/// supports is available — rules are parsed at macro-expansion time so
+/// typos are rejected with a span-anchored error instead of silently
+/// accepted.
+///
+/// **Built-in rules:** `email`, `url`, `length(min = …, max = …)`,
+/// `range(min = …, max = …)`, `regex(path = …)`, `contains(…)`,
+/// `does_not_contain(…)`, `must_match(…)`, `phone`, `credit_card`, `ip`,
+/// `ip_v4`, `ip_v6`, `non_control_character`, `required`,
+/// `required_nested`, `nested`, `skip_on_field_errors`, and
+/// `custom(function = "path::to::fn")` for arbitrary logic (including
+/// async, with `validator`'s `async` feature).
+///
+/// ```ignore
+/// use reify::Table;
+///
+/// #[derive(Table, Debug, Clone)]
+/// #[table(name = "users")]
+/// pub struct User {
+///     #[column(primary_key, auto_increment)]
+///     pub id: i64,
+///
+///     // multiple rules, comma-separated
+///     #[column(unique, validate(email, length(max = 254)))]
+///     pub email: String,
+///
+///     // custom validation function
+///     #[column(validate(custom(function = "crate::validators::check_slug")))]
+///     pub slug: String,
+///
+///     // nullable + value rule → MUST include `required` to reject `None`,
+///     // otherwise the macro refuses to compile (validator skips `None`
+///     // silently by default, which is a common footgun).
+///     #[column(nullable, validate(required, length(min = 1)))]
+///     pub bio: Option<String>,
+/// }
+/// ```
+///
+/// Use `{Model}Dto::validated_insert(&dto)` /
+/// `validated_insert_many(&[dto])` to run validation before the DB
+/// round-trip — these return `Result<InsertBuilder<Dto>,
+/// validator::ValidationErrors>` so forgetting to call `.validate()`
+/// stops being possible.
 #[proc_macro_derive(Table, attributes(table, column))]
 pub fn derive_table(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

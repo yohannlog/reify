@@ -17,6 +17,12 @@ use tracing::debug;
 enum SetExpr {
     /// Plain value: `col = ?`
     Value(Value),
+    /// Raw SQL fragment with no bound parameter: `col = <sql>`.
+    ///
+    /// Used for server-side expressions like `CURRENT_TIMESTAMP` that must
+    /// be evaluated by the database, not by the client. The fragment is
+    /// `&'static str` to prevent user input from reaching SQL verbatim.
+    RawExpr(&'static str),
     /// Array append: `col = col || ?`  (PostgreSQL only)
     #[cfg(feature = "postgres")]
     ArrayAppend(Value),
@@ -185,17 +191,21 @@ impl<M: Table> UpdateBuilder<M> {
         }
 
         // Auto-inject update_timestamp columns (Vm source) that the caller didn't set.
+        //
+        // We emit `CURRENT_TIMESTAMP` as a raw SQL expression rather than
+        // binding a client-computed `chrono::Utc::now()`. This avoids the
+        // MySQL pitfall where a bound `TIMESTAMP` parameter is interpreted in
+        // the session's `time_zone` — a client in UTC writing to a server
+        // configured with `time_zone = 'SYSTEM'` (non-UTC) would see silent
+        // offsets. Letting the server generate the timestamp keeps semantics
+        // consistent across backends.
         let mut all_sets = self.sets.clone();
         #[cfg(any(feature = "postgres", feature = "mysql"))]
         {
             let ts_cols = M::update_timestamp_columns();
             for col_name in ts_cols {
                 if !all_sets.iter().any(|(c, _)| *c == col_name) {
-                    #[cfg(feature = "postgres")]
-                    let now_val = Value::Timestamptz(chrono::Utc::now());
-                    #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-                    let now_val = Value::Timestamp(chrono::Utc::now().naive_utc());
-                    all_sets.push((col_name, SetExpr::Value(now_val)));
+                    all_sets.push((col_name, SetExpr::RawExpr("CURRENT_TIMESTAMP")));
                 }
             }
         }
@@ -208,6 +218,9 @@ impl<M: Table> UpdateBuilder<M> {
             SetExpr::Value(val) => {
                 params.push(val.clone());
                 let _ = write!(buf, "{} = ?", qi(col));
+            }
+            SetExpr::RawExpr(expr) => {
+                let _ = write!(buf, "{} = {}", qi(col), expr);
             }
             #[cfg(feature = "postgres")]
             SetExpr::ArrayAppend(val) => {

@@ -24,6 +24,7 @@ pub use tokio_postgres::{self, NoTls};
 use tokio_postgres::types::ToSql as PgToSql;
 use tracing::{debug, error};
 
+use reify_core::adapter::SavepointCounter;
 use reify_core::db::{Database, DbError, Row, TransactionFn};
 use reify_core::range::{Bound, Range};
 use reify_core::value::Value;
@@ -243,48 +244,65 @@ fn range_to_pg<T: PgToSql + Sync>(
 }
 
 /// Deserialize a PostgreSQL range from raw bytes into a `Range<T>`.
-fn range_from_pg<T, F>(raw: &[u8], parse_element: F) -> Range<T>
+///
+/// Returns `Err(DbError::Conversion)` if the wire-format envelope is invalid
+/// or any element fails to decode, so callers never silently observe an
+/// `Empty` range in place of corrupt data.
+fn range_from_pg<T, F>(raw: &[u8], parse_element: F) -> Result<Range<T>, DbError>
 where
     F: Fn(&[u8]) -> Option<T>,
 {
     use postgres_protocol::types::{RangeBound as PgBound, range_from_sql};
 
-    let parsed = match range_from_sql(raw) {
-        Ok(r) => r,
+    let parsed = range_from_sql(raw).map_err(|e| {
+        DbError::Conversion(format!("invalid PostgreSQL range wire format: {e}"))
+    })?;
+
+    fn decode<T, F>(b: PgBound<Option<&[u8]>>, parse: &F) -> Result<Bound<T>, DbError>
+    where
+        F: Fn(&[u8]) -> Option<T>,
+    {
+        Ok(match b {
+            PgBound::Inclusive(Some(bytes)) => Bound::Inclusive(parse(bytes).ok_or_else(
+                || DbError::Conversion("range element decode failed".to_string()),
+            )?),
+            PgBound::Exclusive(Some(bytes)) => Bound::Exclusive(parse(bytes).ok_or_else(
+                || DbError::Conversion("range element decode failed".to_string()),
+            )?),
+            PgBound::Inclusive(None)
+            | PgBound::Exclusive(None)
+            | PgBound::Unbounded => Bound::Unbounded,
+        })
+    }
+
+    Ok(match parsed {
+        postgres_protocol::types::Range::Empty => Range::Empty,
+        postgres_protocol::types::Range::Nonempty(lower, upper) => {
+            Range::Nonempty(decode(lower, &parse_element)?, decode(upper, &parse_element)?)
+        }
+    })
+}
+
+/// Convenience for column-level range decoding: map a `DbError` to a
+/// logged warning + `Value::Null` so one malformed row doesn't abort the
+/// entire result set, but the error is still visible in logs.
+fn range_value_or_null<T, F>(
+    raw: &[u8],
+    ctor: fn(Range<T>) -> Value,
+    parse_element: F,
+) -> Value
+where
+    F: Fn(&[u8]) -> Option<T>,
+{
+    match range_from_pg(raw, parse_element) {
+        Ok(r) => ctor(r),
         Err(e) => {
             tracing::warn!(
                 target: "reify::postgres",
                 error = %e,
-                "Failed to deserialize PostgreSQL range — returning Empty"
+                "Failed to deserialize PostgreSQL range column — returning Null"
             );
-            return Range::Empty;
-        }
-    };
-
-    match parsed {
-        postgres_protocol::types::Range::Empty => Range::Empty,
-        postgres_protocol::types::Range::Nonempty(lower, upper) => {
-            let lo = match lower {
-                PgBound::Inclusive(Some(bytes)) => parse_element(bytes)
-                    .map(Bound::Inclusive)
-                    .unwrap_or(Bound::Unbounded),
-                PgBound::Exclusive(Some(bytes)) => parse_element(bytes)
-                    .map(Bound::Exclusive)
-                    .unwrap_or(Bound::Unbounded),
-                PgBound::Inclusive(None) | PgBound::Exclusive(None) => Bound::Unbounded,
-                PgBound::Unbounded => Bound::Unbounded,
-            };
-            let hi = match upper {
-                PgBound::Inclusive(Some(bytes)) => parse_element(bytes)
-                    .map(Bound::Inclusive)
-                    .unwrap_or(Bound::Unbounded),
-                PgBound::Exclusive(Some(bytes)) => parse_element(bytes)
-                    .map(Bound::Exclusive)
-                    .unwrap_or(Bound::Unbounded),
-                PgBound::Inclusive(None) | PgBound::Exclusive(None) => Bound::Unbounded,
-                PgBound::Unbounded => Bound::Unbounded,
-            };
-            Range::Nonempty(lo, hi)
+            Value::Null
         }
     }
 }
@@ -389,43 +407,43 @@ fn pg_column_to_value(
             .map(Value::Jsonb)
             .unwrap_or(Value::Null),
         Type::INT4_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => Value::Int4Range(range_from_pg(raw, |b| {
+            Ok(Some(raw)) => range_value_or_null(raw, Value::Int4Range, |b| {
                 use bytes::Buf;
                 if b.len() == 4 {
                     Some((&b[..]).get_i32())
                 } else {
                     None
                 }
-            })),
+            }),
             _ => Value::Null,
         },
         Type::INT8_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => Value::Int8Range(range_from_pg(raw, |b| {
+            Ok(Some(raw)) => range_value_or_null(raw, Value::Int8Range, |b| {
                 use bytes::Buf;
                 if b.len() == 8 {
                     Some((&b[..]).get_i64())
                 } else {
                     None
                 }
-            })),
+            }),
             _ => Value::Null,
         },
         Type::TS_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => Value::TsRange(range_from_pg(raw, |b| {
+            Ok(Some(raw)) => range_value_or_null(raw, Value::TsRange, |b| {
                 postgres_types::FromSql::from_sql(&Type::TIMESTAMP, b).ok()
-            })),
+            }),
             _ => Value::Null,
         },
         Type::TSTZ_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => Value::TstzRange(range_from_pg(raw, |b| {
+            Ok(Some(raw)) => range_value_or_null(raw, Value::TstzRange, |b| {
                 postgres_types::FromSql::from_sql(&Type::TIMESTAMPTZ, b).ok()
-            })),
+            }),
             _ => Value::Null,
         },
         Type::DATE_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => Value::DateRange(range_from_pg(raw, |b| {
+            Ok(Some(raw)) => range_value_or_null(raw, Value::DateRange, |b| {
                 postgres_types::FromSql::from_sql(&Type::DATE, b).ok()
-            })),
+            }),
             _ => Value::Null,
         },
         Type::BOOL_ARRAY => row
@@ -665,7 +683,7 @@ impl Database for PostgresDb {
 
         let txn = PgTransaction {
             conn,
-            savepoint_counter: std::sync::atomic::AtomicU64::new(0),
+            savepoint_counter: SavepointCounter::new(),
         };
         match f(&txn).await {
             Ok(()) => {
@@ -692,10 +710,9 @@ impl Database for PostgresDb {
 struct PgTransaction {
     conn: deadpool_postgres::Object,
     /// Monotonically-increasing counter for generating unique SAVEPOINT names
-    /// within this connection. Using an atomic counter guarantees uniqueness
-    /// even when multiple nested transactions start in the same nanosecond
-    /// (which can happen on Windows or coarse-clock Linux kernels).
-    savepoint_counter: std::sync::atomic::AtomicU64,
+    /// within this connection. Shared implementation lives in
+    /// [`reify_core::adapter::SavepointCounter`].
+    savepoint_counter: SavepointCounter,
 }
 
 impl Database for PgTransaction {
@@ -712,13 +729,9 @@ impl Database for PgTransaction {
     }
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
-        // Nested transaction via SAVEPOINT. The counter is incremented atomically
-        // so every nested call on this connection gets a distinct name, regardless
-        // of clock resolution or concurrent usage.
-        let n = self
-            .savepoint_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let sp_name = format!("sp_{n}");
+        // Nested transaction via SAVEPOINT. `SavepointCounter` guarantees a
+        // distinct name for every call on this connection.
+        let sp_name = self.savepoint_counter.next_name();
         debug!(target: "reify::postgres", savepoint = %sp_name, "SAVEPOINT (nested)");
         self.conn
             .execute(&format!("SAVEPOINT {sp_name}"), &[])

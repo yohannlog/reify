@@ -193,26 +193,64 @@ pub(crate) fn create_table_sql_named(
     )
 }
 
+/// Error returned by [`try_add_column_sql`] when a NOT NULL column is added
+/// without a default the engine can safely synthesise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingDefaultError {
+    pub table: String,
+    pub column: String,
+    pub sql_type: String,
+}
+
+impl std::fmt::Display for MissingDefaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot ADD COLUMN {:?}.{:?} ({}) NOT NULL without an explicit `default` — no safe fallback exists for this type; set `default = \"…\"` on the column or make it nullable",
+            self.table, self.column, self.sql_type
+        )
+    }
+}
+
+impl std::error::Error for MissingDefaultError {}
+
 /// Generate `ALTER TABLE … ADD COLUMN` for columns present in the struct
 /// but missing from the database.
+///
+/// Panics if the column is NOT NULL and no default can be synthesised. Use
+/// [`try_add_column_sql`] for a recoverable variant — the CLI calls it so
+/// the error surfaces before anything is written.
 pub fn add_column_sql(
     table: &str,
     column: &str,
     def: Option<&crate::schema::ColumnDef>,
     dialect: crate::query::Dialect,
 ) -> String {
+    try_add_column_sql(table, column, def, dialect).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Fallible variant of [`add_column_sql`]. Returns [`MissingDefaultError`]
+/// when a NOT NULL column is added without an explicit default and the type
+/// has no safe fallback (UUID, JSONB, BYTEA, arrays, custom types), so the
+/// caller can surface a clear error before the DDL is executed.
+pub fn try_add_column_sql(
+    table: &str,
+    column: &str,
+    def: Option<&crate::schema::ColumnDef>,
+    dialect: crate::query::Dialect,
+) -> Result<String, MissingDefaultError> {
     use crate::schema::ComputedColumn;
 
     // DB-generated computed column
     if let Some(d) = def {
         if let Some(ComputedColumn::Stored(expr)) = &d.computed {
             let sql_type = d.sql_type.to_sql(dialect);
-            return format!(
+            return Ok(format!(
                 "ALTER TABLE {} ADD COLUMN {} {} GENERATED ALWAYS AS ({expr}) STORED;",
                 qi(table),
                 qi(column),
                 &*sql_type
-            );
+            ));
         }
     }
 
@@ -221,28 +259,36 @@ pub fn add_column_sql(
         .map(|d| d.sql_type.to_sql(dialect))
         .unwrap_or(std::borrow::Cow::Borrowed("TEXT"));
     let null_clause = if is_nullable { "" } else { " NOT NULL" };
-    // For NOT NULL columns, emit a DEFAULT so existing rows don't violate the constraint.
-    // If the ColumnDef carries an explicit default, prefer it; otherwise fall back to a
-    // type-inferred safe default. For types where no safe default exists (UUID, JSONB, …)
-    // we omit DEFAULT entirely and let the database reject the statement — the user must
-    // supply an explicit `default` in their ColumnDef.
-    let default_clause = if !is_nullable {
+    // For NOT NULL columns, emit a DEFAULT so existing rows don't violate the
+    // constraint. Prefer an explicit ColumnDef default; otherwise fall back
+    // to a type-inferred safe default. For types where no safe default exists
+    // (UUID, JSONB, BYTEA, …) we refuse to generate the DDL — silently
+    // emitting `ADD COLUMN … NOT NULL` with no default would have the
+    // database reject the migration at execution time with a less helpful
+    // error.
+    let default_clause = if is_nullable {
+        String::new()
+    } else {
         let explicit = def.and_then(|d| d.default.as_deref());
         match explicit {
             Some(dv) => format!(" DEFAULT {dv}"),
             None => match default_for_type(&sql_type) {
                 Some(dv) => format!(" DEFAULT {dv}"),
-                None => String::new(),
+                None => {
+                    return Err(MissingDefaultError {
+                        table: table.to_string(),
+                        column: column.to_string(),
+                        sql_type: sql_type.into_owned(),
+                    });
+                }
             },
         }
-    } else {
-        String::new()
     };
-    format!(
+    Ok(format!(
         "ALTER TABLE {} ADD COLUMN {} {sql_type}{null_clause}{default_clause};",
         qi(table),
         qi(column)
-    )
+    ))
 }
 
 /// Return a safe SQL literal to use as a `DEFAULT` when adding a NOT NULL column

@@ -1,4 +1,5 @@
 use quote::quote;
+use syn::parse::Parse;
 use syn::{Attribute, Lit};
 
 #[derive(Default)]
@@ -20,6 +21,10 @@ pub(crate) struct ColumnAttrs {
     pub on_delete: Option<String>,
     pub on_update: Option<String>,
     pub validate: Option<proc_macro2::TokenStream>,
+    /// Rule names parsed from `validate(...)` (e.g. `["email", "length"]`).
+    /// Kept alongside the raw token stream so consumers (rustdoc generation,
+    /// Option-nullability checks) don't have to re-parse the tokens.
+    pub validate_rule_names: Vec<String>,
 }
 
 pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs> {
@@ -96,8 +101,65 @@ pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs
             } else if meta.path.is_ident("validate") {
                 let content;
                 syn::parenthesized!(content in meta.input);
-                let tokens: proc_macro2::TokenStream = content.parse()?;
-                result.validate = Some(tokens);
+                // Parse into a comma-separated list of meta items so we can
+                // catch typos early (3.5). Each element must start with a
+                // known validator rule name — unknown names are rejected
+                // with a span-anchored error instead of being forwarded
+                // blindly to `#[validate(...)]` and only failing at the
+                // user's next build of their own crate.
+                let rules = content.parse_terminated(syn::Meta::parse, syn::Token![,])?;
+                for rule in &rules {
+                    let name = rule.path().get_ident().map(|i| i.to_string());
+                    let known = matches!(
+                        name.as_deref(),
+                        // Built-in rules as of validator 0.20.
+                        Some(
+                            "email"
+                                | "url"
+                                | "length"
+                                | "range"
+                                | "regex"
+                                | "contains"
+                                | "does_not_contain"
+                                | "must_match"
+                                | "required"
+                                | "required_nested"
+                                | "non_control_character"
+                                | "phone"
+                                | "credit_card"
+                                | "ip"
+                                | "ip_v4"
+                                | "ip_v6"
+                                | "custom"
+                                | "nested"
+                                | "skip_on_field_errors"
+                        )
+                    );
+                    if !known {
+                        return Err(syn::Error::new_spanned(
+                            rule.path(),
+                            format!(
+                                "unknown validator rule `{}`; expected one of: \
+email, url, length, range, regex, contains, does_not_contain, must_match, \
+required, required_nested, non_control_character, phone, credit_card, ip, \
+ip_v4, ip_v6, custom, nested, skip_on_field_errors",
+                                name.as_deref().unwrap_or("?")
+                            ),
+                        ));
+                    }
+                }
+                // Reconstruct the rule list as tokens so validator's
+                // `#[validate(...)]` derive receives the exact spelling the
+                // user wrote (including any `custom = "fn_path"` arguments).
+                let rules_tokens: Vec<proc_macro2::TokenStream> =
+                    rules.iter().map(|r| quote::quote!(#r)).collect();
+                result.validate = Some(quote::quote! { #(#rules_tokens),* });
+                // Parsed rule names are kept so per-field rustdoc and
+                // Option-nullability checks can inspect them.
+                result.validate_rule_names = rules
+                    .iter()
+                    .filter_map(|r| r.path().get_ident().map(|i| i.to_string()))
+                    .collect();
             } else {
                 return Err(meta.error(format!(
                     "unknown `column` attribute `{}`; expected one of: \
@@ -132,11 +194,31 @@ pub(crate) fn to_snake_case(s: &str) -> String {
 
 pub(crate) fn unwrap_option_type(ty: &syn::Type) -> (bool, &syn::Type) {
     if let syn::Type::Path(type_path) = ty {
-        if let Some(seg) = type_path.path.segments.last() {
-            if seg.ident == "Option" {
-                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                        return (true, inner);
+        // Only recognise the canonical `Option` paths — `Option<T>`,
+        // `std::option::Option<T>`, or `core::option::Option<T>`. A user
+        // alias `type Option<T> = Vec<T>` in some other path would not
+        // match and therefore cannot trick the macro into treating a
+        // non-Option as nullable.
+        if type_path.qself.is_none() {
+            let segs: Vec<String> = type_path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            let path_matches = matches!(
+                segs.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["Option"] | ["std", "option", "Option"] | ["core", "option", "Option"]
+            );
+            if path_matches {
+                if let Some(seg) = type_path.path.segments.last() {
+                    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                        if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                            return (true, inner);
+                        }
                     }
                 }
             }

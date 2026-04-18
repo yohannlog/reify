@@ -46,7 +46,6 @@ pub(crate) fn impl_partial_model(input: &DeriveInput) -> syn::Result<proc_macro2
     }
 
     let num_cols = col_names.len();
-    let col_name_strs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
 
     Ok(quote! {
         impl reify_core::db::FromRow for #struct_name {
@@ -58,8 +57,8 @@ pub(crate) fn impl_partial_model(input: &DeriveInput) -> syn::Result<proc_macro2
 
         impl #struct_name {
             pub fn select_columns() -> &'static [&'static str] {
-                static COLS: [&str; #num_cols] = [#(#col_name_strs),*];
-                &COLS
+                static __REIFY_COLS: [&str; #num_cols] = [#(#col_names),*];
+                &__REIFY_COLS
             }
         }
     })

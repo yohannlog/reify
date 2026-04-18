@@ -9,11 +9,17 @@ use crate::query::JoinKind;
 use crate::value::Value;
 
 /// Trait to render a type into a SQL fragment + bound parameters.
+///
+/// `write_sql` borrows `self` and clones each [`Value`] into `params`. When
+/// the caller owns the condition tree and does not need it afterwards,
+/// [`IntoSql::into_sql`] moves values in without cloning, which matters on
+/// large `Bytes`/`Jsonb` payloads.
 pub trait ToSql {
     /// Write the SQL fragment directly into `buf`, appending bound params.
     ///
     /// This is the primary method — implement this to avoid per-call
-    /// `String` allocations.
+    /// `String` allocations. Note: each bound [`Value`] is cloned. Use
+    /// [`IntoSql`] when the caller owns the fragment.
     fn write_sql(&self, buf: &mut String, params: &mut Vec<Value>);
 
     /// Convenience wrapper that allocates and returns a `String`.
@@ -22,6 +28,13 @@ pub trait ToSql {
         self.write_sql(&mut buf, params);
         buf
     }
+}
+
+/// Consuming variant of [`ToSql`] — moves bound values into `params`
+/// instead of cloning. Implemented for types that own their parameter
+/// data (e.g. [`Condition`]).
+pub trait IntoSql {
+    fn into_sql(self, buf: &mut String, params: &mut Vec<Value>);
 }
 
 /// Write `items` into `buf` separated by `sep`, using `write_fn` for each item.
@@ -306,7 +319,13 @@ impl ToSql for Condition {
             }
             Condition::In(col, vals) => {
                 if vals.is_empty() {
-                    // Empty IN list is invalid SQL — emit a always-false condition.
+                    // Empty IN list is invalid SQL — emit an always-false condition.
+                    // Note: this differs from SQL's NULL-propagating semantics
+                    // on a non-empty list containing NULL (`x IN (NULL)` → NULL,
+                    // not FALSE). Reify does not introspect values for NULLs;
+                    // a user-supplied `Value::Null` inside the list is bound
+                    // verbatim and the database applies standard three-valued
+                    // logic. See `condition_in_with_null_propagates` test.
                     buf.push_str("1 = 0");
                 } else {
                     let _ = write!(buf, "{} IN (", qi(col));
@@ -338,16 +357,130 @@ impl ToSql for Condition {
                 buf.push_str(sql);
             }
             Condition::Logical(op) => match op {
-                LogicalOp::And(conds) => {
-                    buf.push('(');
-                    write_joined(buf, conds, " AND ", |b, c| c.write_sql(b, params));
+                LogicalOp::And(conds) => match conds.as_slice() {
+                    [] => buf.push_str("1 = 1"),
+                    [only] => only.write_sql(buf, params),
+                    many => {
+                        buf.push('(');
+                        write_joined(buf, many, " AND ", |b, c| c.write_sql(b, params));
+                        buf.push(')');
+                    }
+                },
+                LogicalOp::Or(conds) => match conds.as_slice() {
+                    [] => buf.push_str("1 = 0"),
+                    [only] => only.write_sql(buf, params),
+                    many => {
+                        buf.push('(');
+                        write_joined(buf, many, " OR ", |b, c| c.write_sql(b, params));
+                        buf.push(')');
+                    }
+                },
+            },
+        }
+    }
+}
+
+impl IntoSql for Condition {
+    fn into_sql(self, buf: &mut String, params: &mut Vec<Value>) {
+        match self {
+            Condition::Eq(col, val) => {
+                params.push(val);
+                let _ = write!(buf, "{} = ?", qi(col));
+            }
+            Condition::Neq(col, val) => {
+                params.push(val);
+                let _ = write!(buf, "{} != ?", qi(col));
+            }
+            Condition::Gt(col, val) => {
+                params.push(val);
+                let _ = write!(buf, "{} > ?", qi(col));
+            }
+            Condition::Lt(col, val) => {
+                params.push(val);
+                let _ = write!(buf, "{} < ?", qi(col));
+            }
+            Condition::Gte(col, val) => {
+                params.push(val);
+                let _ = write!(buf, "{} >= ?", qi(col));
+            }
+            Condition::Lte(col, val) => {
+                params.push(val);
+                let _ = write!(buf, "{} <= ?", qi(col));
+            }
+            Condition::Between(col, a, b) => {
+                params.push(a);
+                params.push(b);
+                let _ = write!(buf, "{} BETWEEN ? AND ?", qi(col));
+            }
+            Condition::Like(col, pattern) => {
+                params.push(Value::String(pattern));
+                let _ = write!(buf, "{} LIKE ? ESCAPE '\\'", qi(col));
+            }
+            Condition::In(col, vals) => {
+                if vals.is_empty() {
+                    buf.push_str("1 = 0");
+                } else {
+                    let _ = write!(buf, "{} IN (", qi(col));
+                    for (i, v) in vals.into_iter().enumerate() {
+                        if i > 0 {
+                            buf.push_str(", ");
+                        }
+                        buf.push('?');
+                        params.push(v);
+                    }
                     buf.push(')');
                 }
-                LogicalOp::Or(conds) => {
-                    buf.push('(');
-                    write_joined(buf, conds, " OR ", |b, c| c.write_sql(b, params));
-                    buf.push(')');
-                }
+            }
+            Condition::IsNull(col) => {
+                let _ = write!(buf, "{} IS NULL", qi(col));
+            }
+            Condition::IsNotNull(col) => {
+                let _ = write!(buf, "{} IS NOT NULL", qi(col));
+            }
+            #[cfg(feature = "postgres")]
+            Condition::Postgres(pg) => pg.write_sql(buf, params),
+            Condition::Aggregate(agg) => agg.write_sql(buf, params),
+            Condition::InSubquery(col, sub_sql, sub_params) => {
+                params.extend(sub_params);
+                let _ = write!(buf, "{} IN ({sub_sql})", qi(col));
+            }
+            Condition::Raw(sql, raw_params) => {
+                params.extend(raw_params);
+                buf.push_str(&sql);
+            }
+            Condition::Logical(op) => match op {
+                LogicalOp::And(mut conds) => match conds.len() {
+                    0 => buf.push_str("1 = 1"),
+                    1 => conds.pop().unwrap().into_sql(buf, params),
+                    _ => {
+                        buf.push('(');
+                        let mut first = true;
+                        for c in conds {
+                            if !first {
+                                buf.push_str(" AND ");
+                            }
+                            first = false;
+                            c.into_sql(buf, params);
+                        }
+                        buf.push(')');
+                    }
+                },
+                LogicalOp::Or(mut conds) => match conds.len() {
+                    0 => buf.push_str("1 = 0"),
+                    1 => conds.pop().unwrap().into_sql(buf, params),
+                    _ => {
+                        buf.push('(');
+                        let mut first = true;
+                        for c in conds {
+                            if !first {
+                                buf.push_str(" OR ");
+                            }
+                            first = false;
+                            c.into_sql(buf, params);
+                        }
+                        buf.push(')');
+                    }
+                },
             },
         }
     }
@@ -518,5 +651,32 @@ mod tests {
         cond.write_sql(&mut buf, &mut params);
         assert!(buf.contains("OR"), "expected OR in: {buf}");
         assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn condition_in_with_null_propagates() {
+        // Per SQL three-valued logic, `x IN (NULL)` evaluates to NULL (not
+        // FALSE), so rows where `x IS NULL` are still excluded by the outer
+        // WHERE clause. Reify emits the list verbatim; NULL handling is left
+        // to the database. This test pins the rendered SQL so the behaviour
+        // is documented and regression-detected.
+        let cond = Condition::In("id", vec![Value::I64(1), Value::Null]);
+        let mut params = Vec::new();
+        let mut buf = String::new();
+        cond.write_sql(&mut buf, &mut params);
+        assert_eq!(buf, "\"id\" IN (?, ?)");
+        assert_eq!(params, vec![Value::I64(1), Value::Null]);
+    }
+
+    #[test]
+    fn into_sql_moves_values_without_clone() {
+        // Large payload: ensure IntoSql does not clone it.
+        let big = vec![0u8; 1024];
+        let cond = Condition::Eq("blob", Value::Bytes(big.clone()));
+        let mut params = Vec::new();
+        let mut buf = String::new();
+        cond.into_sql(&mut buf, &mut params);
+        assert_eq!(buf, "\"blob\" = ?");
+        assert_eq!(params, vec![Value::Bytes(big)]);
     }
 }

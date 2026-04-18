@@ -33,7 +33,9 @@ cargo test
 
 - Add tests for new functionality
 - Ensure all existing tests pass: `cargo test`
-- For database-specific features, add integration tests in `reify/tests/integration/`
+- For database-specific features, add integration tests in `reify/tests/` (all
+  integration tests live at the top level — there is no `integration/`
+  subdirectory).
 - Use `trybuild` for compile-time error tests when adding new macro features
 
 ## Pull Request Process

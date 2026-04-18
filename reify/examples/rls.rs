@@ -4,7 +4,7 @@
 //! which rows a user can see, update, or delete — without any
 //! database-specific RLS support. Works on PostgreSQL, MariaDB, etc.
 
-use reify::{Condition, Policy, RlsContext, Table};
+use reify::{Policy, PolicyDecision, RlsContext, RlsError, Table};
 
 // ── Models ─────────────────────────────────────────────────────────
 
@@ -24,9 +24,9 @@ pub struct Post {
 // A user can only see/modify rows where `tenant_id` matches their own.
 
 impl Policy for Post {
-    fn policy(ctx: &RlsContext) -> Option<Condition> {
-        let tenant_id = ctx.get::<i64>("tenant_id")?;
-        Some(Post::tenant_id.eq(*tenant_id))
+    fn policy(ctx: &RlsContext) -> Result<PolicyDecision, RlsError> {
+        let tenant_id = ctx.require::<i64>("tenant_id")?;
+        Ok(PolicyDecision::Restrict(Post::tenant_id.eq(*tenant_id)))
     }
 }
 
@@ -42,9 +42,9 @@ fn main() {
     let builder = Post::find().filter(Post::title.contains("Rust"));
 
     // Manually apply the policy to show the SQL output
-    let builder = match Post::policy(&ctx) {
-        Some(cond) => builder.filter(cond),
-        None => builder,
+    let builder = match Post::policy(&ctx).unwrap() {
+        PolicyDecision::Restrict(cond) => builder.filter(cond),
+        PolicyDecision::Unrestricted => builder,
     };
     let (sql, params) = builder.build();
     println!("SELECT with RLS:\n  {sql}\n  params: {params:?}\n");
@@ -56,9 +56,9 @@ fn main() {
         .set(Post::title, "Updated title")
         .filter(Post::id.eq(1i64));
 
-    let builder = match Post::policy(&ctx) {
-        Some(cond) => builder.filter(cond),
-        None => builder,
+    let builder = match Post::policy(&ctx).unwrap() {
+        PolicyDecision::Restrict(cond) => builder.filter(cond),
+        PolicyDecision::Unrestricted => builder,
     };
     let (sql, params) = builder.build();
     println!("UPDATE with RLS:\n  {sql}\n  params: {params:?}\n");
@@ -66,23 +66,24 @@ fn main() {
     // ── DELETE with RLS ────────────────────────────────────────────
     let builder = Post::delete().filter(Post::id.eq(99i64));
 
-    let builder = match Post::policy(&ctx) {
-        Some(cond) => builder.filter(cond),
-        None => builder,
+    let builder = match Post::policy(&ctx).unwrap() {
+        PolicyDecision::Restrict(cond) => builder.filter(cond),
+        PolicyDecision::Unrestricted => builder,
     };
     let (sql, params) = builder.build();
     println!("DELETE with RLS:\n  {sql}\n  params: {params:?}\n");
 
     // ── Admin bypass ───────────────────────────────────────────────
-    // If the policy returns None, no restriction is applied.
-    // You can implement this by checking a role in the context:
+    // Return PolicyDecision::Unrestricted *explicitly* to allow full
+    // access — there is no implicit default, a missing context key is
+    // an error, not a bypass.
     //
-    //   fn policy(ctx: &RlsContext) -> Option<Condition> {
+    //   fn policy(ctx: &RlsContext) -> Result<PolicyDecision, RlsError> {
     //       if ctx.get::<String>("role").map(|r| r == "admin") == Some(true) {
-    //           return None; // admin sees everything
+    //           return Ok(PolicyDecision::Unrestricted); // admin sees everything
     //       }
-    //       let tenant_id = ctx.get::<i64>("tenant_id")?;
-    //       Some(Post::tenant_id.eq(*tenant_id))
+    //       let tenant_id = ctx.require::<i64>("tenant_id")?;
+    //       Ok(PolicyDecision::Restrict(Post::tenant_id.eq(*tenant_id)))
     //   }
 
     println!("── With scoped_* helpers (async) ──────────────────────");

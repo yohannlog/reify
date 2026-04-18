@@ -14,7 +14,10 @@ pub use codegen::{
 };
 pub use context::MigrationContext;
 pub(crate) use ddl::create_table_sql_named;
-pub use ddl::{add_column_sql, create_table_sql, create_table_sql_with_checks};
+pub use ddl::{
+    MissingDefaultError, add_column_sql, create_table_sql, create_table_sql_with_checks,
+    try_add_column_sql,
+};
 pub use diff::{ColumnDiff, DbColumnInfo, SchemaDiff, TableDiff, normalize_sql_type};
 pub use error::MigrationError;
 pub use lock::MigrationLock;

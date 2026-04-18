@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,6 +7,53 @@ use crate::db::{BoxFuture, Database, DbError, DynDatabase, Row, TransactionFn};
 use crate::value::Value;
 
 // ── Policy context ─────────────────────────────────────────────────
+
+/// Error returned when an RLS context lookup fails.
+///
+/// Used by [`RlsContext::require`] to distinguish a missing key from a
+/// type mismatch — a silent `None` on mismatch would let a policy that
+/// expects (e.g.) `i64` but receives `i32` bypass row-level security
+/// entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RlsError {
+    /// The key is not present in the context.
+    Missing { key: &'static str },
+    /// The key exists but the stored value has a different type than
+    /// the one requested. Contains the requested and stored type names.
+    TypeMismatch {
+        key: &'static str,
+        expected: &'static str,
+        found: &'static str,
+    },
+}
+
+impl std::fmt::Display for RlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RlsError::Missing { key } => {
+                write!(f, "RLS context key `{key}` is missing")
+            }
+            RlsError::TypeMismatch {
+                key,
+                expected,
+                found,
+            } => write!(
+                f,
+                "RLS context key `{key}` has type `{found}`, expected `{expected}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RlsError {}
+
+/// Internal record for a context entry — keeps the original type name so
+/// that [`RlsContext::require`] can surface precise mismatch diagnostics.
+struct Entry {
+    value: Arc<dyn Any + Send + Sync>,
+    type_id: TypeId,
+    type_name: &'static str,
+}
 
 /// Holds the current session context (user id, tenant id, role, …).
 ///
@@ -19,7 +66,7 @@ use crate::value::Value;
 /// ```
 #[derive(Clone)]
 pub struct RlsContext {
-    values: HashMap<&'static str, Arc<dyn Any + Send + Sync>>,
+    values: HashMap<&'static str, Arc<Entry>>,
 }
 
 impl RlsContext {
@@ -31,13 +78,68 @@ impl RlsContext {
 
     /// Store a value in the context.
     pub fn set<T: Send + Sync + 'static>(mut self, key: &'static str, val: T) -> Self {
-        self.values.insert(key, Arc::new(val));
+        self.values.insert(
+            key,
+            Arc::new(Entry {
+                value: Arc::new(val),
+                type_id: TypeId::of::<T>(),
+                type_name: type_name::<T>(),
+            }),
+        );
         self
     }
 
     /// Retrieve a value from the context.
+    ///
+    /// Returns `None` if the key is missing **or** the stored value has a
+    /// different type than `T`. Prefer [`RlsContext::require`] in policies
+    /// — a silent `None` on type mismatch would cause the policy to
+    /// return no restriction and bypass RLS.
     pub fn get<T: Send + Sync + 'static>(&self, key: &'static str) -> Option<&T> {
-        self.values.get(key).and_then(|v| v.downcast_ref::<T>())
+        self.values
+            .get(key)
+            .and_then(|e| e.value.downcast_ref::<T>())
+    }
+
+    /// Retrieve a value from the context, failing loudly on type mismatch.
+    ///
+    /// Returns [`RlsError::Missing`] if the key is absent, or
+    /// [`RlsError::TypeMismatch`] if the stored value has a different
+    /// type than `T`. Use this in policies to guarantee that a mismatch
+    /// (e.g. storing `i32` where the policy expects `i64`) is an error,
+    /// not a silent bypass.
+    ///
+    /// ```ignore
+    /// impl Policy for Post {
+    ///     fn policy(ctx: &RlsContext) -> Option<Condition> {
+    ///         let tenant_id = ctx.require::<i64>("tenant_id").ok()?;
+    ///         Some(Post::tenant_id.eq(*tenant_id))
+    ///     }
+    /// }
+    /// ```
+    pub fn require<T: Send + Sync + 'static>(
+        &self,
+        key: &'static str,
+    ) -> Result<&T, RlsError> {
+        let entry = self.values.get(key).ok_or(RlsError::Missing { key })?;
+        if entry.type_id != TypeId::of::<T>() {
+            return Err(RlsError::TypeMismatch {
+                key,
+                expected: type_name::<T>(),
+                found: entry.type_name,
+            });
+        }
+        // SAFETY of downcast: TypeId equality guarantees the concrete type
+        // matches `T`. `expect` is unreachable but kept as a defensive
+        // assertion rather than `unwrap_unchecked`.
+        entry
+            .value
+            .downcast_ref::<T>()
+            .ok_or(RlsError::TypeMismatch {
+                key,
+                expected: type_name::<T>(),
+                found: entry.type_name,
+            })
     }
 }
 
@@ -64,8 +166,40 @@ impl Default for RlsContext {
 /// ```
 pub trait Policy: crate::table::Table {
     /// Return a `Condition` that will be injected into every SELECT, UPDATE,
-    /// and DELETE query. Return `None` to allow unrestricted access (e.g. for admins).
-    fn policy(ctx: &RlsContext) -> Option<Condition>;
+    /// and DELETE query.
+    ///
+    /// Return [`PolicyDecision::Restrict`] to scope access, or
+    /// [`PolicyDecision::Unrestricted`] to allow full access (e.g. for
+    /// admins). There is **no implicit default** — you must choose
+    /// explicitly. Forgetting to read a context key must not collapse
+    /// into unrestricted access: return a [`PolicyDecision::Deny`] via
+    /// `?` on [`RlsContext::require`] instead.
+    ///
+    /// ```ignore
+    /// impl Policy for Post {
+    ///     fn policy(ctx: &RlsContext) -> Result<PolicyDecision, RlsError> {
+    ///         let tenant_id = ctx.require::<i64>("tenant_id")?;
+    ///         Ok(PolicyDecision::Restrict(Post::tenant_id.eq(*tenant_id)))
+    ///     }
+    /// }
+    /// ```
+    fn policy(ctx: &RlsContext) -> Result<PolicyDecision, RlsError>;
+}
+
+/// The outcome of evaluating a [`Policy`] against an [`RlsContext`].
+///
+/// Every policy call must pick one explicitly — the previous
+/// `Option<Condition>` shape silently treated `None` as "no
+/// restriction", which meant a forgotten context key granted full
+/// access. `PolicyDecision` forces a conscious choice between
+/// restricting, opening, or refusing.
+#[derive(Debug, Clone)]
+pub enum PolicyDecision {
+    /// Inject `Condition` into the WHERE clause of every scoped query.
+    Restrict(Condition),
+    /// Allow full, unrestricted access — must be chosen explicitly
+    /// (e.g. an admin role) rather than reached by omission.
+    Unrestricted,
 }
 
 /// The closure accepted by [`Scoped::scoped_transaction`].
@@ -93,11 +227,36 @@ pub type ScopedTransactionFn<'a> =
 pub struct Scoped<'a> {
     inner: &'a dyn DynDatabase,
     ctx: RlsContext,
+    /// When `true`, a [`RlsError`] raised by a policy (e.g. missing
+    /// context key) causes the query to be rejected rather than
+    /// treated as unrestricted. Defaults to `true` — opting out
+    /// requires an explicit call to [`Scoped::allow_on_policy_error`].
+    deny_on_policy_error: bool,
 }
 
 impl<'a> Scoped<'a> {
+    /// Create a new `Scoped` wrapper.
+    ///
+    /// Policy errors ([`RlsError::Missing`] / [`RlsError::TypeMismatch`])
+    /// are treated as **deny** by default — a policy that cannot be
+    /// evaluated must never fall back to unrestricted access.
     pub fn new(db: &'a dyn DynDatabase, ctx: RlsContext) -> Self {
-        Self { inner: db, ctx }
+        Self {
+            inner: db,
+            ctx,
+            deny_on_policy_error: true,
+        }
+    }
+
+    /// Opt out of deny-by-default policy-error handling.
+    ///
+    /// When set, a policy returning [`RlsError`] is propagated to the
+    /// caller as a `DbError` instead of being silently treated as
+    /// deny. The default (`deny_on_policy_error = true`) is safer —
+    /// flip this only if the caller explicitly handles the error.
+    pub fn allow_on_policy_error(mut self) -> Self {
+        self.deny_on_policy_error = false;
+        self
     }
 
     /// Access the RLS context.
@@ -120,13 +279,47 @@ impl<'a> Scoped<'a> {
         f: ScopedTransactionFn<'s>,
     ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 's {
         let ctx = self.ctx.clone();
+        let deny = self.deny_on_policy_error;
         async move {
             self.inner
                 .transaction(Box::new(move |tx_db| {
-                    let scoped_tx = Scoped::new(tx_db, ctx);
+                    let mut scoped_tx = Scoped::new(tx_db, ctx);
+                    scoped_tx.deny_on_policy_error = deny;
                     f(scoped_tx)
                 }))
                 .await
+        }
+    }
+}
+
+/// Evaluate a policy and apply its decision to `builder.filter`.
+///
+/// Centralises the deny-by-default handling so that every scoped
+/// helper (`scoped_fetch_all`, `scoped_update`, `scoped_delete`)
+/// behaves identically in the face of [`RlsError`].
+fn apply_policy<M, B>(
+    scoped: &Scoped<'_>,
+    builder: B,
+    filter: impl FnOnce(B, Condition) -> B,
+) -> Result<B, DbError>
+where
+    M: crate::table::Table + Policy,
+{
+    match M::policy(scoped.context()) {
+        Ok(PolicyDecision::Restrict(cond)) => Ok(filter(builder, cond)),
+        Ok(PolicyDecision::Unrestricted) => Ok(builder),
+        Err(e) => {
+            if scoped.deny_on_policy_error {
+                Err(DbError::Other(format!(
+                    "RLS policy evaluation failed for {}: {e}; query denied (deny-by-default)",
+                    M::table_name()
+                )))
+            } else {
+                Err(DbError::Other(format!(
+                    "RLS policy evaluation failed for {}: {e}",
+                    M::table_name()
+                )))
+            }
         }
     }
 }
@@ -176,10 +369,7 @@ pub async fn scoped_fetch_all<M: crate::table::Table + Policy>(
     scoped: &Scoped<'_>,
     builder: crate::query::SelectBuilder<M>,
 ) -> Result<Vec<Row>, DbError> {
-    let builder = match M::policy(scoped.context()) {
-        Some(cond) => builder.filter(cond),
-        None => builder,
-    };
+    let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
     let (sql, params) = builder.build();
     Database::query(scoped, &sql, &params).await
 }
@@ -198,10 +388,7 @@ pub async fn scoped_update<M: crate::table::Table + Policy>(
     scoped: &Scoped<'_>,
     builder: crate::query::UpdateBuilder<M>,
 ) -> Result<u64, DbError> {
-    let builder = match M::policy(scoped.context()) {
-        Some(cond) => builder.filter(cond),
-        None => builder,
-    };
+    let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
     let (sql, params) = builder.build();
     Database::execute(scoped, &sql, &params).await
 }
@@ -211,10 +398,7 @@ pub async fn scoped_delete<M: crate::table::Table + Policy>(
     scoped: &Scoped<'_>,
     builder: crate::query::DeleteBuilder<M>,
 ) -> Result<u64, DbError> {
-    let builder = match M::policy(scoped.context()) {
-        Some(cond) => builder.filter(cond),
-        None => builder,
-    };
+    let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
     let (sql, params) = builder.build();
     Database::execute(scoped, &sql, &params).await
 }
@@ -281,9 +465,12 @@ mod tests {
     }
 
     impl Policy for TenantPost {
-        fn policy(ctx: &RlsContext) -> Option<Condition> {
-            let tenant_id = ctx.get::<i64>("tenant_id")?;
-            Some(Condition::Eq("tenant_id", Value::I64(*tenant_id)))
+        fn policy(ctx: &RlsContext) -> Result<PolicyDecision, RlsError> {
+            let tenant_id = ctx.require::<i64>("tenant_id")?;
+            Ok(PolicyDecision::Restrict(Condition::Eq(
+                "tenant_id",
+                Value::I64(*tenant_id),
+            )))
         }
     }
 

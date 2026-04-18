@@ -19,6 +19,7 @@ mysql = ["dep:chrono"]
 [dependencies]
 tracing = "0.1"
 sha2 = "0.10"
+hmac = "0.12"
 chrono = { version = "0.4", optional = true, features = ["serde"] }
 uuid = { version = "1", optional = true, features = ["v4"] }
 serde_json = { version = "1", optional = true }

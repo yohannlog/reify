@@ -136,12 +136,18 @@ fn update_builder_auto_injects_update_timestamp() {
         .filter(Article::id.eq(1i64))
         .build();
 
-    // Should contain both the explicit set AND the auto-injected updated_at
+    // The auto-injected `updated_at` is emitted as a raw SQL expression
+    // (`CURRENT_TIMESTAMP`) rather than a bound `?` parameter — letting
+    // the server generate the value sidesteps MySQL `time_zone` drift.
     assert!(sql.contains("\"title\" = ?"));
-    assert!(sql.contains("\"updated_at\" = ?"));
-    // params: title value, updated_at timestamp, id filter value
-    assert_eq!(params.len(), 3);
-    assert!(matches!(params[1], Value::Timestamptz(_)));
+    assert!(
+        sql.contains("\"updated_at\" = CURRENT_TIMESTAMP"),
+        "updated_at should bind to CURRENT_TIMESTAMP, got: {sql}"
+    );
+    // params: title value, id filter value (no timestamp parameter)
+    assert_eq!(params.len(), 2);
+    assert!(matches!(params[0], Value::String(ref s) if s == "New Title"));
+    assert!(matches!(params[1], Value::I64(1)));
 }
 
 #[cfg(feature = "postgres")]

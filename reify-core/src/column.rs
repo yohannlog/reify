@@ -313,121 +313,100 @@ fn validate_json_key(key: &str) -> &str {
 #[cfg(feature = "postgres")]
 pub struct JsonExpr {
     column: &'static str,
-    key: String,
+    /// Borrowed when the key is a `&'static str` literal, owned when built
+    /// from user input. Avoids a `String` clone per operator call.
+    key: std::borrow::Cow<'static, str>,
 }
 
 #[cfg(feature = "postgres")]
 impl JsonExpr {
-    /// Render `"column" ->> ?` and push the key as a bound param.
-    fn col_arrow_text(&self, params: &mut Vec<crate::value::Value>) -> String {
-        params.push(crate::value::Value::String(self.key.clone()));
-        format!("{} ->> ?", crate::ident::qi(self.column))
+    /// Build a `Raw` condition `"col" ->> ? <op> ?` with `[key, val]` params.
+    fn raw_binop(&self, op: &str, val: crate::value::Value) -> Condition {
+        Condition::Raw(
+            format!("{} ->> ? {op} ?", crate::ident::qi(self.column)),
+            vec![
+                crate::value::Value::String(self.key.as_ref().to_owned()),
+                val,
+            ],
+        )
+    }
+
+    /// Build a `Raw` condition `"col" ->> ? <suffix>` with `[key]` params only.
+    fn raw_unary(&self, suffix: &str) -> Condition {
+        Condition::Raw(
+            format!("{} ->> ? {suffix}", crate::ident::qi(self.column)),
+            vec![crate::value::Value::String(self.key.as_ref().to_owned())],
+        )
+    }
+
+    /// Build a `Raw` LIKE/ILIKE condition with escape clause + a pattern param.
+    fn raw_like(&self, op: &str, pattern: String, escape: bool) -> Condition {
+        let sql = if escape {
+            format!("{} ->> ? {op} ? ESCAPE '\\'", crate::ident::qi(self.column))
+        } else {
+            format!("{} ->> ? {op} ?", crate::ident::qi(self.column))
+        };
+        Condition::Raw(
+            sql,
+            vec![
+                crate::value::Value::String(self.key.as_ref().to_owned()),
+                crate::value::Value::String(pattern),
+            ],
+        )
     }
 
     /// `"column" ->> ? = ?`
     pub fn eq(&self, val: impl IntoValue) -> Condition {
-        let mut params = vec![crate::value::Value::String(self.key.clone())];
-        params.push(val.into_value());
-        Condition::Raw(
-            format!("{} ->> ? = ?", crate::ident::qi(self.column)),
-            params,
-        )
+        self.raw_binop("=", val.into_value())
     }
 
     /// `"column" ->> ? != ?`
     pub fn neq(&self, val: impl IntoValue) -> Condition {
-        let mut params = vec![crate::value::Value::String(self.key.clone())];
-        params.push(val.into_value());
-        Condition::Raw(
-            format!("{} ->> ? != ?", crate::ident::qi(self.column)),
-            params,
-        )
+        self.raw_binop("!=", val.into_value())
     }
 
     /// `"column" ->> ? IS NULL`
     pub fn is_null(&self) -> Condition {
-        Condition::Raw(
-            format!("{} ->> ? IS NULL", crate::ident::qi(self.column)),
-            vec![crate::value::Value::String(self.key.clone())],
-        )
+        self.raw_unary("IS NULL")
     }
 
     /// `"column" ->> ? IS NOT NULL`
     pub fn is_not_null(&self) -> Condition {
-        Condition::Raw(
-            format!("{} ->> ? IS NOT NULL", crate::ident::qi(self.column)),
-            vec![crate::value::Value::String(self.key.clone())],
-        )
+        self.raw_unary("IS NOT NULL")
     }
 
     /// `"column" ->> ? LIKE ?` — raw pattern, wildcards not escaped.
     pub fn like(&self, pattern: &str) -> Condition {
-        Condition::Raw(
-            format!("{} ->> ? LIKE ? ESCAPE '\\'", crate::ident::qi(self.column)),
-            vec![
-                crate::value::Value::String(self.key.clone()),
-                crate::value::Value::String(pattern.to_owned()),
-            ],
-        )
+        self.raw_like("LIKE", pattern.to_owned(), true)
     }
 
     /// `"column" ->> ? LIKE '%sub%'` — user input is escaped.
     pub fn contains(&self, sub: &str) -> Condition {
         let escaped = escape_like(sub);
-        Condition::Raw(
-            format!("{} ->> ? LIKE ? ESCAPE '\\'", crate::ident::qi(self.column)),
-            vec![
-                crate::value::Value::String(self.key.clone()),
-                crate::value::Value::String(format!("%{escaped}%")),
-            ],
-        )
+        self.raw_like("LIKE", format!("%{escaped}%"), true)
     }
 
     /// `"column" ->> ? ILIKE ?` — raw pattern, wildcards are **not** escaped.
     pub fn ilike(&self, pattern: &str) -> Condition {
-        Condition::Raw(
-            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
-            vec![
-                crate::value::Value::String(self.key.clone()),
-                crate::value::Value::String(pattern.to_owned()),
-            ],
-        )
+        self.raw_like("ILIKE", pattern.to_owned(), false)
     }
 
     /// `"column" ->> ? ILIKE '%sub%'` — case-insensitive contains, user input is escaped.
     pub fn icontains(&self, sub: &str) -> Condition {
         let escaped = escape_like(sub);
-        Condition::Raw(
-            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
-            vec![
-                crate::value::Value::String(self.key.clone()),
-                crate::value::Value::String(format!("%{escaped}%")),
-            ],
-        )
+        self.raw_like("ILIKE", format!("%{escaped}%"), false)
     }
 
     /// `"column" ->> ? ILIKE 'prefix%'` — case-insensitive starts-with, user input is escaped.
     pub fn istarts_with(&self, prefix: &str) -> Condition {
         let escaped = escape_like(prefix);
-        Condition::Raw(
-            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
-            vec![
-                crate::value::Value::String(self.key.clone()),
-                crate::value::Value::String(format!("{escaped}%")),
-            ],
-        )
+        self.raw_like("ILIKE", format!("{escaped}%"), false)
     }
 
     /// `"column" ->> ? ILIKE '%suffix'` — case-insensitive ends-with, user input is escaped.
     pub fn iends_with(&self, suffix: &str) -> Condition {
         let escaped = escape_like(suffix);
-        Condition::Raw(
-            format!("{} ->> ? ILIKE ?", crate::ident::qi(self.column)),
-            vec![
-                crate::value::Value::String(self.key.clone()),
-                crate::value::Value::String(format!("%{escaped}")),
-            ],
-        )
+        self.raw_like("ILIKE", format!("%{escaped}"), false)
     }
 }
 
@@ -445,7 +424,17 @@ impl<M: 'static> Column<M, serde_json::Value> {
     pub fn json_get(&self, key: &str) -> JsonExpr {
         JsonExpr {
             column: self.name,
-            key: validate_json_key(key).to_owned(),
+            key: std::borrow::Cow::Owned(validate_json_key(key).to_owned()),
+        }
+    }
+
+    /// Same as [`json_get`](Self::json_get) but takes a `&'static str`
+    /// literal, avoiding the key allocation entirely. Prefer this when
+    /// the key is known at compile time.
+    pub fn json_get_static(&self, key: &'static str) -> JsonExpr {
+        JsonExpr {
+            column: self.name,
+            key: std::borrow::Cow::Borrowed(validate_json_key(key)),
         }
     }
 

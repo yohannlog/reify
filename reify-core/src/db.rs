@@ -398,7 +398,10 @@ pub async fn fetch_one<M: Table + FromRow>(
 ) -> Result<M, DbError> {
     let rows = fetch(db, builder).await?;
     match rows.len() {
-        1 => Ok(rows.into_iter().next().unwrap()),
+        1 => Ok(rows
+            .into_iter()
+            .next()
+            .expect("len() == 1 guarantees one element")),
         0 => Err(DbError::RecordNotFound),
         _ => Err(DbError::TooManyRows),
     }
@@ -414,7 +417,9 @@ pub async fn fetch_optional<M: Table + FromRow>(
     let rows = fetch(db, builder).await?;
     match rows.len() {
         0 => Ok(None),
-        1 => Ok(Some(rows.into_iter().next().unwrap())),
+        1 => Ok(Some(rows.into_iter().next().expect(
+            "len() == 1 guarantees one element",
+        ))),
         _ => Err(DbError::TooManyRows),
     }
 }

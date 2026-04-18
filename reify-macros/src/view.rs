@@ -112,7 +112,6 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
         });
     }
 
-    let col_name_strs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
     let num_cols = col_names.len();
 
     let column_consts =
@@ -148,8 +147,8 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
             }
 
             fn column_names() -> &'static [&'static str] {
-                static COLS: [&str; #num_cols] = [#(#col_name_strs),*];
-                &COLS
+                static __REIFY_COLS: [&str; #num_cols] = [#(#col_names),*];
+                &__REIFY_COLS
             }
 
             fn into_values(&self) -> Vec<reify_core::Value> {

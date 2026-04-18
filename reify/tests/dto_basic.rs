@@ -36,9 +36,9 @@ pub struct Event {
     // into_values(), while still marking the columns as timestamps so
     // the DTO exclusion logic applies.
     #[column(creation_timestamp, source = "db")]
-    pub created_at: String,
+    pub created_at: chrono::NaiveDateTime,
     #[column(update_timestamp, source = "db")]
-    pub updated_at: String,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 // ── Basic exclusion ──────────────────────────────────────────────────
@@ -126,14 +126,23 @@ fn from_model_to_dto() {
 }
 
 #[test]
-fn from_dto_to_model_defaults_excluded_fields() {
+fn dto_to_model_requires_explicit_field_fill() {
+    // The reverse `From<Dto> for Model` impl was removed because it
+    // silently filled auto-PK, timestamp, and `skip`-ed fields with
+    // `Default::default()` — leaking empty `String`/`0`/`false` into
+    // fields the DTO was hiding for security reasons. Callers must now
+    // assemble the model explicitly from the DTO plus the missing data.
     let dto = UserDto {
         email: "bob@example.com".into(),
         name: "Bob".into(),
         age: None,
     };
-    let user = User::from(&dto);
-    // id was not in the DTO — must be Default (0 for i64)
+    let user = User {
+        id: 0,
+        email: dto.email.clone(),
+        name: dto.name.clone(),
+        age: dto.age,
+    };
     assert_eq!(user.id, 0);
     assert_eq!(user.email, "bob@example.com");
     assert_eq!(user.age, None);

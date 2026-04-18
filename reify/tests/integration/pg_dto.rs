@@ -262,8 +262,18 @@ async fn case_from_conversions(db: &PostgresDb) {
     assert_eq!(dto.local_ts, local_ts);
     assert_eq!(dto.resolved_at, Some(happened_at));
 
-    // DTO → Model: DTO fields round-trip losslessly
-    let back = Event::from(&dto);
+    // DTO → Model: assembled explicitly (`From<Dto> for Model` removed to
+    // avoid silently defaulting auto-PK / timestamp / skipped fields).
+    let back = Event {
+        id,
+        label: dto.label.clone(),
+        happened_at: dto.happened_at,
+        local_ts: dto.local_ts,
+        day: dto.day,
+        time_of_day: dto.time_of_day,
+        metadata: dto.metadata.clone(),
+        resolved_at: dto.resolved_at,
+    };
     assert_eq!(back.label, dto.label);
     assert_eq!(back.happened_at, dto.happened_at);
     assert_eq!(back.resolved_at, dto.resolved_at);

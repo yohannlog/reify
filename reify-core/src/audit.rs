@@ -4,136 +4,52 @@ use crate::query::{DeleteBuilder, InsertBuilder, UpdateBuilder};
 use crate::schema::{ColumnDef, SqlType, TimestampSource};
 use crate::table::Table;
 
-// ── SHA-256 / HMAC-SHA256 (pure std, zero deps) ──────────────────────
+// `changed_at` is generated app-side (RFC 3339 UTC) so the value is bound
+// as a parameter and signed by the HMAC at INSERT time — closes the
+// antedating window where the DB-side `NOW()` was unknown to the signer.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use chrono::SecondsFormat;
 
-/// SHA-256 constants: first 32 bits of the fractional parts of the cube
-/// roots of the first 64 primes.
-#[rustfmt::skip]
-const K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
+// ── SHA-256 / HMAC-SHA256 (audited crates) ───────────────────────────
+//
+// The hash and MAC primitives used to be hand-rolled. They are now thin
+// wrappers over the RustCrypto `sha2` and `hmac` crates, which are
+// audited, constant-time over secret inputs, and wipe their internal
+// buffers on drop. The wrappers preserve the crate-private signatures
+// so the rest of the module (and the RFC 4231 / NIST KAT tests) needs
+// no change.
 
-/// Initial hash values: first 32 bits of the fractional parts of the
-/// square roots of the first 8 primes.
-const H0: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
+use hmac::{Hmac, Mac};
+#[cfg(test)]
+use sha2::Digest;
+use sha2::Sha256;
 
 /// Compute SHA-256 over arbitrary bytes. Returns a 32-byte digest.
+///
+/// Kept test-only because the production code paths go through
+/// `hmac_sha256`; the standalone hash is retained for RFC KAT tests
+/// (`test_sha256_empty`, `test_sha256_abc`).
+#[inline]
+#[cfg(test)]
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h = H0;
-
-    // Pre-processing: pad to a multiple of 512 bits (64 bytes).
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg: Vec<u8> = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0x00);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    // Process each 512-bit (64-byte) block.
-    for block in msg.chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-
-    let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 /// HMAC-SHA256. Returns a 32-byte MAC.
 ///
-/// Implements RFC 2104: `HMAC(K, m) = H((K' ⊕ opad) ∥ H((K' ⊕ ipad) ∥ m))`
-/// where `K'` is the key zero-padded (or hashed) to the block size (64 bytes).
+/// Delegates to `hmac::Hmac<Sha256>` (RFC 2104). The crate handles key
+/// derivation (hash when longer than the block size, zero-pad otherwise)
+/// and zeroizes internal state on drop.
+///
+/// `pub(crate)` — shared with the `paginate` module for cursor signing.
+#[inline]
 pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    // Derive block-sized key.
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let hashed = sha256(key);
-        k[..32].copy_from_slice(&hashed);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
-
-    // inner = H(ipad ∥ message)
-    let mut inner_input = Vec::with_capacity(64 + message.len());
-    inner_input.extend_from_slice(&ipad);
-    inner_input.extend_from_slice(message);
-    let inner = sha256(&inner_input);
-
-    // outer = H(opad ∥ inner)
-    let mut outer_input = [0u8; 96]; // 64 + 32
-    outer_input[..64].copy_from_slice(&opad);
-    outer_input[64..].copy_from_slice(&inner);
-    sha256(&outer_input)
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .expect("Hmac<Sha256> accepts keys of any length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
 }
 
 /// Encode a byte slice as a lowercase hex string.
@@ -151,7 +67,21 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 
 /// RAII guard that zeroizes a `Vec<u8>` on drop via `write_volatile` +
 /// `compiler_fence(SeqCst)`, preventing the compiler from eliding the wipe.
+///
+/// `Clone` is implemented explicitly so that secret material handed off
+/// to transaction closures is never stored in a bare `Vec<u8>` — every
+/// copy carries its own drop-time wipe.
 pub(crate) struct ZeroOnDrop(pub Vec<u8>);
+
+impl Clone for ZeroOnDrop {
+    /// Deep-clone the secret into a fresh `ZeroOnDrop`. The clone owns
+    /// its own buffer and is wiped independently on drop, so passing
+    /// secret material into a transaction closure never leaves a
+    /// non-zeroized copy behind.
+    fn clone(&self) -> Self {
+        ZeroOnDrop(self.0.clone())
+    }
+}
 
 impl Drop for ZeroOnDrop {
     fn drop(&mut self) {
@@ -381,29 +311,71 @@ impl AuditContext {
         let secret = self.hmac_secret.as_ref().map(|z| z.0.as_slice())?;
         let actor = self.actor.as_hmac_str();
         let message = build_hmac_message(operation, &actor, changed_at, row_data);
-        Some(hex_encode(&hmac_sha256(secret, message.as_bytes())))
+        Some(hex_encode(&hmac_sha256(secret, &message)))
     }
 }
 
-/// Build an unambiguous, length-prefixed HMAC message from the audit fields.
+/// Return the current timestamp as an RFC 3339 UTC string, e.g.
+/// `"2024-01-15T10:30:00.123456789Z"`.
 ///
-/// Format: `"<op_len>:<op><actor_len>:<actor><ts_len>:<changed_at><data_len>:<row_data>"`
+/// Generated app-side so that `changed_at` can be bound as a parameter at
+/// INSERT time and therefore covered by the HMAC signature. A DB-side
+/// `NOW()` would only be known post-INSERT, leaving a window where an
+/// attacker with DB write access could backdate the row and recompute
+/// the hash over an empty timestamp field.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn current_changed_at() -> String {
+    chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+/// Fallback timestamp when neither `postgres` nor `mysql` features are
+/// enabled. Uses `SystemTime` since `UNIX_EPOCH` formatted as an
+/// RFC 3339-like UTC string so it can still be signed.
+#[cfg(not(any(feature = "postgres", feature = "mysql")))]
+fn current_changed_at() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // `secs.nanos` since epoch — deterministic and monotonic enough for
+    // signing purposes; callers that need a real timestamp should enable
+    // the `chrono`-backed features.
+    format!("{}.{:09}Z", d.as_secs(), d.subsec_nanos())
+}
+
+/// Build an unambiguous HMAC message from the audit fields.
 ///
-/// Length-prefixing prevents collision attacks where a field value contains
-/// the delimiter character. `changed_at` is included so that antedating a row
-/// is detectable even when `row_data` and `operation` are unchanged.
-fn build_hmac_message(operation: &str, actor: &str, changed_at: &str, row_data: &str) -> String {
-    format!(
-        "{}:{}{}:{}{}:{}{}:{}",
-        operation.len(),
-        operation,
-        actor.len(),
-        actor,
-        changed_at.len(),
-        changed_at,
-        row_data.len(),
-        row_data,
-    )
+/// Binary length-prefixed encoding: each field is serialised as a big-endian
+/// `u64` byte length followed by the raw UTF-8 bytes. There are no textual
+/// delimiters, so no field value can forge a field boundary regardless of the
+/// bytes it contains.
+///
+/// Layout (concatenated):
+///
+/// ```text
+///   op_len_be_u64    || op_bytes
+/// || actor_len_be_u64 || actor_bytes
+/// || ts_len_be_u64    || changed_at_bytes
+/// || data_len_be_u64  || row_data_bytes
+/// ```
+///
+/// `changed_at` is included so that antedating a row is detectable even when
+/// `row_data` and `operation` are unchanged.
+fn build_hmac_message(operation: &str, actor: &str, changed_at: &str, row_data: &str) -> Vec<u8> {
+    let op = operation.as_bytes();
+    let ac = actor.as_bytes();
+    let ts = changed_at.as_bytes();
+    let rd = row_data.as_bytes();
+    let mut out = Vec::with_capacity(32 + op.len() + ac.len() + ts.len() + rd.len());
+    out.extend_from_slice(&(op.len() as u64).to_be_bytes());
+    out.extend_from_slice(op);
+    out.extend_from_slice(&(ac.len() as u64).to_be_bytes());
+    out.extend_from_slice(ac);
+    out.extend_from_slice(&(ts.len() as u64).to_be_bytes());
+    out.extend_from_slice(ts);
+    out.extend_from_slice(&(rd.len() as u64).to_be_bytes());
+    out.extend_from_slice(rd);
+    out
 }
 
 // ── Auditable trait ──────────────────────────────────────────────────
@@ -481,6 +453,10 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             check: None,
             foreign_key: None,
         },
+        // `changed_at` is bound by the application (RFC 3339 UTC) so it is
+        // covered by the HMAC signature. The `NOW()` default remains so
+        // legacy rows inserted without an explicit value still get a
+        // server-side timestamp — but `audited_*` always passes one in.
         ColumnDef {
             name: "changed_at",
             sql_type: SqlType::Timestamptz,
@@ -573,7 +549,7 @@ pub fn verify_audit_row(
     match stored_hash {
         Some(stored) => {
             let message = build_hmac_message(operation, actor, changed_at, row_data);
-            let expected = hex_encode(&hmac_sha256(secret, message.as_bytes()));
+            let expected = hex_encode(&hmac_sha256(secret, &message));
             // Constant-time comparison to prevent timing attacks.
             Some(constant_time_eq(expected.as_bytes(), stored.as_bytes()))
         }
@@ -585,22 +561,23 @@ pub fn verify_audit_row(
 /// Constant-time byte-slice equality — prevents timing side-channels when
 /// comparing MAC values.
 ///
-/// Both inputs MUST have the same length. A debug assertion checks this
-/// invariant; the function returns `false` for unequal lengths in release
-/// builds without branching on the length difference.
+/// Length-agnostic: a mismatch in length is folded into the accumulator
+/// alongside the per-byte XOR so the running time depends only on
+/// `max(a.len(), b.len())`, not on *where* the inputs diverge. Safe to
+/// use with variable-length MACs (e.g. truncated HMAC, SHA-512) without
+/// leaking the length of the secret value.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    debug_assert_eq!(
-        a.len(),
-        b.len(),
-        "constant_time_eq requires equal-length inputs"
-    );
-    if a.len() != b.len() {
-        return false;
+    let len = a.len().max(b.len());
+    let mut diff: u8 = (a.len() ^ b.len()) as u8
+        | (((a.len() ^ b.len()) >> 8) as u8)
+        | (((a.len() ^ b.len()) >> 16) as u8)
+        | (((a.len() ^ b.len()) >> 24) as u8);
+    for i in 0..len {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        diff |= x ^ y;
     }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    diff == 0
 }
 
 // ── JSON serialisation helper ────────────────────────────────────────
@@ -655,18 +632,30 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::I16(n) => out.push_str(&n.to_string()),
             Value::I32(n) => out.push_str(&n.to_string()),
             Value::I64(n) => out.push_str(&n.to_string()),
+            // Non-finite floats (NaN, ±Infinity) are not representable in
+            // strict JSON — emit them as tagged string literals so no evidence
+            // is silently discarded from the audit log. Consumers can parse
+            // these back when integrity-verifying a row.
             Value::F32(f) => {
                 if f.is_finite() {
                     out.push_str(&f.to_string());
+                } else if f.is_nan() {
+                    out.push_str("\"NaN\"");
+                } else if *f > 0.0 {
+                    out.push_str("\"Infinity\"");
                 } else {
-                    out.push_str("null");
+                    out.push_str("\"-Infinity\"");
                 }
             }
             Value::F64(f) => {
                 if f.is_finite() {
                     out.push_str(&f.to_string());
+                } else if f.is_nan() {
+                    out.push_str("\"NaN\"");
+                } else if *f > 0.0 {
+                    out.push_str("\"Infinity\"");
                 } else {
-                    out.push_str("null");
+                    out.push_str("\"-Infinity\"");
                 }
             }
             Value::String(s) => {
@@ -859,15 +848,19 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
     let audit_table = M::audit_table_name();
     let col_names: Vec<&'static str> = M::writable_column_names().to_vec();
     let actor = ctx.actor.clone();
-    let secret_bytes = ctx.hmac_secret.as_ref().map(|z| z.0.clone());
+    // Clone the secret into a ZeroOnDrop *immediately* so every copy is
+    // wiped on drop — including the intermediate binding that lives
+    // between here and the closure body.
+    let secret_guard = ctx.hmac_secret.clone();
     let dialect = ctx.dialect;
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
 
     db.transaction(Box::new(move |tx| {
-        // Zeroize the cloned secret when this future drops.
-        let secret_guard = secret_bytes.map(ZeroOnDrop);
+        // Move the ZeroOnDrop-wrapped secret into the future; its Drop
+        // impl zeroizes on completion or panic.
+        let secret_guard = secret_guard.clone();
         Box::pin(async move {
             use crate::db::DynDatabase;
 
@@ -882,22 +875,32 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
                 &insert_params.iter().cloned().collect::<Vec<_>>(),
             );
 
-            // 3. Compute HMAC (changed_at is unknown at INSERT time — use empty string
-            //    as placeholder; the DB fills it with NOW()).
+            // 3. Generate changed_at app-side so it is covered by the HMAC.
+            //    A DB-side NOW() would only be known post-INSERT and therefore
+            //    unsignable — an attacker with DB access could backdate the
+            //    row and recompute the hash over an empty timestamp.
+            let changed_at = current_changed_at();
+
+            // 4. Compute HMAC over the bound changed_at value.
             let row_hash = if let Some(ref secret) = secret_guard {
                 let actor_str = actor.as_hmac_str();
-                let message =
-                    build_hmac_message(AuditOperation::Insert.as_str(), &actor_str, "", &row_data);
-                Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
+                let message = build_hmac_message(
+                    AuditOperation::Insert.as_str(),
+                    &actor_str,
+                    &changed_at,
+                    &row_data,
+                );
+                Some(hex_encode(&hmac_sha256(&secret.0, &message)))
             } else {
                 None
             };
 
-            // 4. Insert audit row.
+            // 5. Insert audit row with explicit changed_at parameter.
             let (audit_sql, audit_params) = build_audit_insert(
                 audit_table,
                 AuditOperation::Insert.as_str(),
                 actor.to_value(),
+                &changed_at,
                 row_data,
                 row_hash,
                 dialect,
@@ -937,15 +940,19 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
     let audit_table = M::audit_table_name();
     let col_names: Vec<&'static str> = M::column_names().to_vec();
     let actor = ctx.actor.clone();
-    let secret_bytes = ctx.hmac_secret.as_ref().map(|z| z.0.clone());
+    // Clone the secret into a ZeroOnDrop *immediately* so every copy is
+    // wiped on drop — including the intermediate binding that lives
+    // between here and the closure body.
+    let secret_guard = ctx.hmac_secret.clone();
     let dialect = ctx.dialect;
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
 
     db.transaction(Box::new(move |tx| {
-        // Zeroize the cloned secret when this future drops.
-        let secret_guard = secret_bytes.map(ZeroOnDrop);
+        // Move the ZeroOnDrop-wrapped secret into the future; its Drop
+        // impl zeroizes on completion or panic.
+        let secret_guard = secret_guard.clone();
         Box::pin(async move {
             use crate::db::DynDatabase;
 
@@ -971,7 +978,8 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
             let after_rows = DynDatabase::query(tx, &select_sql_base, &select_params).await?;
 
             // 5. Build combined row_data {"before":{...},"after":{...}} and compute HMACs.
-            let mut entries: Vec<(String, Option<String>)> =
+            //    changed_at is generated app-side so it is covered by the signature.
+            let mut entries: Vec<(String, String, Option<String>)> =
                 Vec::with_capacity(before_images.len());
             for (before, after_row) in before_images.iter().zip(after_rows.iter()) {
                 let after_vals: Vec<crate::value::Value> = col_names
@@ -985,28 +993,30 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
                     .collect();
                 let after = values_to_json_string(&col_refs, &after_vals);
                 let row_data = format!("{{\"before\":{before},\"after\":{after}}}");
+                let changed_at = current_changed_at();
 
                 let row_hash = if let Some(ref secret) = secret_guard {
                     let actor_str = actor.as_hmac_str();
                     let message = build_hmac_message(
                         AuditOperation::Update.as_str(),
                         &actor_str,
-                        "",
+                        &changed_at,
                         &row_data,
                     );
-                    Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
+                    Some(hex_encode(&hmac_sha256(&secret.0, &message)))
                 } else {
                     None
                 };
-                entries.push((row_data, row_hash));
+                entries.push((changed_at, row_data, row_hash));
             }
 
             // 6. Insert one audit row per before+after pair.
-            for (row_data, row_hash) in entries {
+            for (changed_at, row_data, row_hash) in entries {
                 let (audit_sql, audit_params) = build_audit_insert(
                     audit_table,
                     AuditOperation::Update.as_str(),
                     actor.to_value(),
+                    &changed_at,
                     row_data,
                     row_hash,
                     dialect,
@@ -1042,43 +1052,50 @@ pub async fn audited_delete<M: Auditable + FromRow>(
     let audit_table = M::audit_table_name();
     let col_names: Vec<&'static str> = M::column_names().to_vec();
     let actor = ctx.actor.clone();
-    let secret_bytes = ctx.hmac_secret.as_ref().map(|z| z.0.clone());
+    // Clone the secret into a ZeroOnDrop *immediately* so every copy is
+    // wiped on drop — including the intermediate binding that lives
+    // between here and the closure body.
+    let secret_guard = ctx.hmac_secret.clone();
     let dialect = ctx.dialect;
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
 
     db.transaction(Box::new(move |tx| {
-        // Zeroize the cloned secret when this future drops.
-        let secret_guard = secret_bytes.map(ZeroOnDrop);
+        // Move the ZeroOnDrop-wrapped secret into the future; its Drop
+        // impl zeroizes on completion or panic.
+        let secret_guard = secret_guard.clone();
         Box::pin(async move {
             use crate::db::DynDatabase;
 
             // 1. Read matching rows inside the transaction (locked FOR UPDATE).
             let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
 
-            // 2. Serialize rows and compute HMACs.
+            // 2. Serialize rows and compute HMACs. changed_at is generated
+            //    app-side so it is covered by the signature.
             let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
-            let mut entries: Vec<(String, Option<String>)> = Vec::with_capacity(old_rows.len());
+            let mut entries: Vec<(String, String, Option<String>)> =
+                Vec::with_capacity(old_rows.len());
             for row in &old_rows {
                 let vals: Vec<crate::value::Value> = col_names
                     .iter()
                     .map(|c| row.get(c).cloned().unwrap_or(crate::value::Value::Null))
                     .collect();
                 let row_data = values_to_json_string(&col_refs, &vals);
+                let changed_at = current_changed_at();
                 let row_hash = if let Some(ref secret) = secret_guard {
                     let actor_str = actor.as_hmac_str();
                     let message = build_hmac_message(
                         AuditOperation::Delete.as_str(),
                         &actor_str,
-                        "",
+                        &changed_at,
                         &row_data,
                     );
-                    Some(hex_encode(&hmac_sha256(&secret.0, message.as_bytes())))
+                    Some(hex_encode(&hmac_sha256(&secret.0, &message)))
                 } else {
                     None
                 };
-                entries.push((row_data, row_hash));
+                entries.push((changed_at, row_data, row_hash));
             }
 
             // 3. Delete the rows.
@@ -1086,11 +1103,12 @@ pub async fn audited_delete<M: Auditable + FromRow>(
             affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
 
             // 4. Insert audit rows.
-            for (row_data, row_hash) in entries {
+            for (changed_at, row_data, row_hash) in entries {
                 let (audit_sql, audit_params) = build_audit_insert(
                     audit_table,
                     AuditOperation::Delete.as_str(),
                     actor.to_value(),
+                    &changed_at,
                     row_data,
                     row_hash,
                     dialect,
@@ -1118,30 +1136,37 @@ fn build_audit_insert(
     audit_table: &str,
     operation: &str,
     actor_val: crate::value::Value,
+    changed_at: &str,
     row_data: String,
     row_hash: Option<String>,
     dialect: crate::query::Dialect,
 ) -> (String, Vec<crate::value::Value>) {
+    // `changed_at` is bound by the caller (RFC 3339 UTC) so it is covered
+    // by the HMAC signature at INSERT time. This closes the antedating
+    // window where the DB-side `NOW()` was only known post-INSERT and
+    // therefore not signed.
     let (sql, params) = if let Some(hash) = row_hash {
         let sql = format!(
-            "INSERT INTO {} (\"operation\", \"actor_id\", \"row_data\", \"row_hash\") VALUES (?, ?, ?, ?)",
+            "INSERT INTO {} (\"operation\", \"actor_id\", \"changed_at\", \"row_data\", \"row_hash\") VALUES (?, ?, ?, ?, ?)",
             qi(audit_table)
         );
         let params = vec![
             crate::value::Value::String(operation.into()),
             actor_val,
+            crate::value::Value::String(changed_at.to_owned()),
             crate::value::Value::String(row_data),
             crate::value::Value::String(hash),
         ];
         (sql, params)
     } else {
         let sql = format!(
-            "INSERT INTO {} (\"operation\", \"actor_id\", \"row_data\") VALUES (?, ?, ?)",
+            "INSERT INTO {} (\"operation\", \"actor_id\", \"changed_at\", \"row_data\") VALUES (?, ?, ?, ?)",
             qi(audit_table)
         );
         let params = vec![
             crate::value::Value::String(operation.into()),
             actor_val,
+            crate::value::Value::String(changed_at.to_owned()),
             crate::value::Value::String(row_data),
         ];
         (sql, params)
@@ -1212,8 +1237,9 @@ mod tests {
                 Value::F32(f32::NAN),
             ],
         );
-        // Non-finite floats must render as JSON null (not "inf" / "NaN" which are invalid JSON)
-        assert_eq!(json, r#"{"a":null,"b":null,"c":null}"#);
+        // Non-finite floats are tagged string literals so the audit log
+        // preserves the evidence instead of silently dropping it to `null`.
+        assert_eq!(json, r#"{"a":"Infinity","b":"-Infinity","c":"NaN"}"#);
     }
 
     #[test]
@@ -1222,7 +1248,7 @@ mod tests {
             &["x", "y"],
             &[Value::F64(f64::INFINITY), Value::F64(f64::NAN)],
         );
-        assert_eq!(json, r#"{"x":null,"y":null}"#);
+        assert_eq!(json, r#"{"x":"Infinity","y":"NaN"}"#);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod audit;
 pub mod built_query;
 pub mod column;
@@ -73,8 +74,8 @@ pub use migration::{
 };
 
 pub use rls::{
-    Policy, RlsContext, Scoped, ScopedTransactionFn, scoped_delete, scoped_fetch, scoped_fetch_all,
-    scoped_update,
+    Policy, PolicyDecision, RlsContext, RlsError, Scoped, ScopedTransactionFn, scoped_delete,
+    scoped_fetch, scoped_fetch_all, scoped_update,
 };
 
 pub use audit::{

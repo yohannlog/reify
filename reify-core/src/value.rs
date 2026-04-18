@@ -130,8 +130,32 @@ impl Value {
             Value::I16(v) => v.to_string(),
             Value::I32(v) => v.to_string(),
             Value::I64(v) => v.to_string(),
-            Value::F32(v) => v.to_string(),
-            Value::F64(v) => v.to_string(),
+            Value::F32(v) => {
+                if v.is_nan() {
+                    "'NaN'::float4".to_string()
+                } else if v.is_infinite() {
+                    if *v > 0.0 {
+                        "'Infinity'::float4".to_string()
+                    } else {
+                        "'-Infinity'::float4".to_string()
+                    }
+                } else {
+                    v.to_string()
+                }
+            }
+            Value::F64(v) => {
+                if v.is_nan() {
+                    "'NaN'::float8".to_string()
+                } else if v.is_infinite() {
+                    if *v > 0.0 {
+                        "'Infinity'::float8".to_string()
+                    } else {
+                        "'-Infinity'::float8".to_string()
+                    }
+                } else {
+                    v.to_string()
+                }
+            }
             Value::String(s) => format!("'{}'", s.replace('\'', "''")),
             Value::Bytes(_) => "NULL".to_string(),
             #[cfg(feature = "postgres")]
@@ -169,6 +193,101 @@ impl Value {
 /// Trait for types that can be converted into a `Value`.
 pub trait IntoValue {
     fn into_value(self) -> Value;
+}
+
+// ── Payload size caps ───────────────────────────────────────────────
+
+/// Default upper bound for a single `Value::String` (1 MiB).
+///
+/// Raised or lowered at runtime via [`set_value_string_limit`]. This is a
+/// defence-in-depth limit against unbounded client-supplied payloads — real
+/// per-column limits still come from the database schema.
+pub const DEFAULT_VALUE_STRING_LIMIT: usize = 1 << 20;
+
+/// Default upper bound for a single `Value::Bytes` (16 MiB).
+pub const DEFAULT_VALUE_BYTES_LIMIT: usize = 16 << 20;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static VALUE_STRING_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_VALUE_STRING_LIMIT);
+static VALUE_BYTES_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_VALUE_BYTES_LIMIT);
+
+/// Configure the maximum accepted length for `Value::String` payloads.
+///
+/// Set to `usize::MAX` to effectively disable the guard. Applies process-wide.
+pub fn set_value_string_limit(max_bytes: usize) {
+    VALUE_STRING_LIMIT.store(max_bytes, Ordering::Relaxed);
+}
+
+/// Configure the maximum accepted length for `Value::Bytes` payloads.
+pub fn set_value_bytes_limit(max_bytes: usize) {
+    VALUE_BYTES_LIMIT.store(max_bytes, Ordering::Relaxed);
+}
+
+/// Current maximum accepted length for `Value::String` payloads.
+pub fn value_string_limit() -> usize {
+    VALUE_STRING_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Current maximum accepted length for `Value::Bytes` payloads.
+pub fn value_bytes_limit() -> usize {
+    VALUE_BYTES_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Error returned by the checked constructors
+/// [`Value::string_checked`] / [`Value::bytes_checked`] when the payload
+/// exceeds the configured limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadTooLarge {
+    pub kind: &'static str,
+    pub size: usize,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for PayloadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} payload is {} bytes, exceeds configured limit of {} bytes",
+            self.kind, self.size, self.limit
+        )
+    }
+}
+
+impl std::error::Error for PayloadTooLarge {}
+
+impl Value {
+    /// Build a `Value::String` after checking the payload against the
+    /// process-wide [`value_string_limit`].
+    ///
+    /// The plain `Value::String(s)` variant constructor is unchanged \u2014
+    /// trusted internal callers can bypass the check. Adapters and public
+    /// APIs that bind untrusted client input should prefer this constructor.
+    pub fn string_checked(s: String) -> Result<Self, PayloadTooLarge> {
+        let limit = value_string_limit();
+        if s.len() > limit {
+            return Err(PayloadTooLarge {
+                kind: "Value::String",
+                size: s.len(),
+                limit,
+            });
+        }
+        Ok(Value::String(s))
+    }
+
+    /// Build a `Value::Bytes` after checking the payload against the
+    /// process-wide [`value_bytes_limit`].
+    pub fn bytes_checked(b: Vec<u8>) -> Result<Self, PayloadTooLarge> {
+        let limit = value_bytes_limit();
+        if b.len() > limit {
+            return Err(PayloadTooLarge {
+                kind: "Value::Bytes",
+                size: b.len(),
+                limit,
+            });
+        }
+        Ok(Value::Bytes(b))
+    }
 }
 
 /// Trait for types that can be extracted from a `Value`.

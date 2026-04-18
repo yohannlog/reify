@@ -36,9 +36,63 @@ pub enum Condition {
     // ── Escape hatch ────────────────────────────────────────────────
     /// Raw SQL condition with bound parameters.
     ///
+    /// **Do not construct this variant directly from user code** —
+    /// `#[non_exhaustive]` blocks external tuple construction, so an
+    /// attacker-controlled `String` cannot reach the SQL verbatim. The
+    /// safe public entry point is [`Condition::raw`], which only
+    /// accepts a [`RawFragment`] built from a `&'static str` literal.
+    ///
     /// Used internally for row-value comparisons in cursor pagination
-    /// (e.g. `(created_at, id) < (?, ?)`).
+    /// (e.g. `(created_at, id) < (?, ?)`) and for JSON path operators.
+    #[non_exhaustive]
     Raw(String, Vec<Value>),
+}
+
+/// Statically-known SQL fragment with runtime-bound parameters.
+///
+/// The only public path to [`Condition::raw`]. By forcing `sql:
+/// &'static str`, runtime SQL string interpolation becomes impossible
+/// at the type level — user input can only travel through `params`,
+/// which are bound as prepared-statement arguments, never spliced into
+/// the SQL text.
+///
+/// ```no_run
+/// use reify_core::condition::{Condition, RawFragment};
+/// use reify_core::value::Value;
+///
+/// // OK — SQL literal is &'static str.
+/// let frag = RawFragment::new("\"created_at\" < NOW() - INTERVAL '1 day'", vec![]);
+/// let cond = Condition::raw(frag);
+/// # let _ = cond;
+///
+/// // Compile error — runtime-built String does not coerce to &'static str.
+/// // let evil = format!("1=1; DROP TABLE users; --");
+/// // RawFragment::new(&evil, vec![]); // ❌
+/// ```
+#[derive(Debug, Clone)]
+pub struct RawFragment {
+    sql: &'static str,
+    params: Vec<Value>,
+}
+
+impl RawFragment {
+    /// Build a fragment from a compile-time SQL literal and runtime
+    /// parameters. `sql` is `&'static str`, so only string literals (or
+    /// explicit `Box::leak`ed statics chosen by the programmer) can be
+    /// passed — runtime-formatted strings do not coerce.
+    pub const fn new(sql: &'static str, params: Vec<Value>) -> Self {
+        Self { sql, params }
+    }
+
+    /// The static SQL template.
+    pub fn sql(&self) -> &'static str {
+        self.sql
+    }
+
+    /// The bound parameters.
+    pub fn params(&self) -> &[Value] {
+        &self.params
+    }
 }
 
 /// Aggregate comparison for HAVING clauses.
@@ -117,11 +171,61 @@ pub enum LogicalOp {
 }
 
 impl Condition {
+    /// Combine two conditions with `AND`, flattening nested `And` chains.
+    ///
+    /// `A.and(B).and(C)` produces `And([A, B, C])` (a single flat list),
+    /// not `And([And([A, B]), C])`. This keeps the rendered SQL shallow
+    /// (`(A AND B AND C)`) and avoids one `Vec` allocation per chained call.
     pub fn and(self, other: Condition) -> Condition {
-        Condition::Logical(LogicalOp::And(vec![self, other]))
+        match (self, other) {
+            (Condition::Logical(LogicalOp::And(mut a)), Condition::Logical(LogicalOp::And(b))) => {
+                a.extend(b);
+                Condition::Logical(LogicalOp::And(a))
+            }
+            (Condition::Logical(LogicalOp::And(mut a)), other) => {
+                a.push(other);
+                Condition::Logical(LogicalOp::And(a))
+            }
+            (lhs, Condition::Logical(LogicalOp::And(b))) => {
+                let mut v = Vec::with_capacity(b.len() + 1);
+                v.push(lhs);
+                v.extend(b);
+                Condition::Logical(LogicalOp::And(v))
+            }
+            (lhs, rhs) => Condition::Logical(LogicalOp::And(vec![lhs, rhs])),
+        }
     }
 
+    /// Combine two conditions with `OR`, flattening nested `Or` chains.
+    ///
+    /// Mirrors [`and`](Self::and): `A.or(B).or(C)` → `Or([A, B, C])`.
     pub fn or(self, other: Condition) -> Condition {
-        Condition::Logical(LogicalOp::Or(vec![self, other]))
+        match (self, other) {
+            (Condition::Logical(LogicalOp::Or(mut a)), Condition::Logical(LogicalOp::Or(b))) => {
+                a.extend(b);
+                Condition::Logical(LogicalOp::Or(a))
+            }
+            (Condition::Logical(LogicalOp::Or(mut a)), other) => {
+                a.push(other);
+                Condition::Logical(LogicalOp::Or(a))
+            }
+            (lhs, Condition::Logical(LogicalOp::Or(b))) => {
+                let mut v = Vec::with_capacity(b.len() + 1);
+                v.push(lhs);
+                v.extend(b);
+                Condition::Logical(LogicalOp::Or(v))
+            }
+            (lhs, rhs) => Condition::Logical(LogicalOp::Or(vec![lhs, rhs])),
+        }
+    }
+
+    /// Build a raw-SQL condition from a [`RawFragment`].
+    ///
+    /// The **only** safe public constructor for [`Condition::Raw`].
+    /// The fragment carries a `&'static str` SQL template, so no
+    /// runtime-built string can reach the variant — user input is
+    /// confined to the bound parameters.
+    pub fn raw(frag: RawFragment) -> Condition {
+        Condition::Raw(frag.sql.to_owned(), frag.params)
     }
 }

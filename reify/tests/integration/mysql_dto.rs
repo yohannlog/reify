@@ -243,8 +243,16 @@ async fn case_from_conversions(db: &MysqlDb) {
     assert_eq!(dto.happened_at, happened_at);
     assert_eq!(dto.resolved_at, Some(resolved));
 
-    // DTO → Model: DTO fields round-trip losslessly
-    let back = Event::from(&dto);
+    // DTO → Model: assembled explicitly (`From<Dto> for Model` removed to
+    // avoid silently defaulting auto-PK / timestamp / skipped fields).
+    let back = Event {
+        id: 4,
+        label: dto.label.clone(),
+        happened_at: dto.happened_at,
+        day: dto.day,
+        time_of_day: dto.time_of_day,
+        resolved_at: dto.resolved_at,
+    };
     assert_eq!(back.label, dto.label);
     assert_eq!(back.happened_at, dto.happened_at);
     assert_eq!(back.resolved_at, dto.resolved_at);

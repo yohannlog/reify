@@ -1,5 +1,5 @@
 use quote::quote;
-use syn::{Attribute, Data, DeriveInput, Fields, Lit, parse::Parse};
+use syn::{parse::Parse, Attribute, Data, DeriveInput, Fields, Lit};
 
 use crate::helpers::{
     parse_column_attrs, parse_sql_type_string, rust_type_to_sql_type, to_snake_case,
@@ -34,6 +34,16 @@ pub(crate) struct TableAttr {
 
 pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let struct_name = &input.ident;
+
+    // Reject generic/lifetime parameters early with a clear span-anchored
+    // error rather than emitting trait impls that fail to compile with
+    // confusing "use of undeclared lifetime" messages.
+    if !input.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &input.generics,
+            "`#[derive(Table)]` does not support generic or lifetime parameters; the generated trait impls are monomorphic",
+        ));
+    }
 
     let table_attr = parse_table_attr(&input.attrs)?;
     let table_name = &table_attr.name;
@@ -82,9 +92,14 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
-    // dto_fields: (ident, type, validate TokenStream, is_copy_type)
+    // dto_fields: (ident, type, validate TokenStream, validate rule names)
     #[cfg(feature = "dto")]
-    let mut dto_fields: Vec<(syn::Ident, syn::Type, Option<proc_macro2::TokenStream>)> = Vec::new();
+    let mut dto_fields: Vec<(
+        syn::Ident,
+        syn::Type,
+        Option<proc_macro2::TokenStream>,
+        Vec<String>,
+    )> = Vec::new();
 
     for field in fields.iter() {
         let ident = field.ident.as_ref().unwrap();
@@ -106,6 +121,72 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             ));
         }
 
+        // 3.1 fix: `dto` on, `dto-validation` off → silently-ignored validate
+        // rule. Refuse to compile rather than give a false sense of security.
+        #[cfg(all(feature = "dto", not(feature = "dto-validation")))]
+        if col_attrs.validate.is_some() {
+            return Err(syn::Error::new_spanned(
+                field,
+                "`#[column(validate(...))]` requires the `dto-validation` feature; \
+                 with only `dto` enabled the rule would be silently dropped. \
+                 Add `features = [\"dto-validation\"]` to the `reify` dependency.",
+            ));
+        }
+
+        // 3.8 fix: `Option<T>` + a value-shape rule (length / range / email
+        // / regex / url / contains / does_not_contain / must_match / phone
+        // / credit_card / ip / non_control_character) is a footgun: the
+        // `validator` crate skips `None` by default, so callers who write
+        // `#[column(nullable, validate(length(min=1)))]` think they've
+        // forbidden empty strings but `None` slips through silently.
+        // Require an explicit `required` rule (or the user removing the
+        // value rule) so the intent is unambiguous.
+        #[cfg(feature = "dto-validation")]
+        if !col_attrs.validate_rule_names.is_empty() {
+            let (is_option, _) = unwrap_option_type(ty);
+            let is_option_field = is_option || col_attrs.nullable;
+            let has_required = col_attrs
+                .validate_rule_names
+                .iter()
+                .any(|n| n == "required" || n == "required_nested");
+            let value_rules: Vec<&str> = col_attrs
+                .validate_rule_names
+                .iter()
+                .filter(|n| {
+                    matches!(
+                        n.as_str(),
+                        "email"
+                            | "url"
+                            | "length"
+                            | "range"
+                            | "regex"
+                            | "contains"
+                            | "does_not_contain"
+                            | "must_match"
+                            | "phone"
+                            | "credit_card"
+                            | "ip"
+                            | "ip_v4"
+                            | "ip_v6"
+                            | "non_control_character"
+                    )
+                })
+                .map(|s| s.as_str())
+                .collect();
+            if is_option_field && !has_required && !value_rules.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    format!(
+                        "`#[column(validate({rules}))]` on a nullable field is \
+                         silently skipped when the value is `None`. Add \
+                         `required` (e.g. `validate(required, {rules})`) to \
+                         reject `None`, or drop the rule if `None` is acceptable.",
+                        rules = value_rules.join(", "),
+                    ),
+                ));
+            }
+        }
+
         if col_attrs.index {
             single_col_indexes.push(name_str.clone());
         }
@@ -117,7 +198,12 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 || col_attrs.update_timestamp
                 || table_attr.dto_skip.contains(&name_str);
             if !skip {
-                dto_fields.push((ident.clone(), ty.clone(), col_attrs.validate.clone()));
+                dto_fields.push((
+                    ident.clone(),
+                    ty.clone(),
+                    col_attrs.validate.clone(),
+                    col_attrs.validate_rule_names.clone(),
+                ));
             }
         }
 
@@ -140,6 +226,39 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
         let (is_option, inner_ty) = unwrap_option_type(ty);
         let is_nullable = col_attrs.nullable || is_option;
+
+        // Validate that `creation_timestamp`/`update_timestamp` are only
+        // applied to temporal types. The macro can only inspect the
+        // textual form of the type; a type alias resolving to a non-temporal
+        // type will slip through, but the common mistake (annotating a
+        // `String` or `i64`) is caught here.
+        if col_attrs.creation_timestamp || col_attrs.update_timestamp {
+            let ty_str = quote!(#inner_ty).to_string().replace(' ', "");
+            let is_temporal = matches!(
+                ty_str.as_str(),
+                "chrono::DateTime<chrono::Utc>"
+                    | "DateTime<Utc>"
+                    | "chrono::NaiveDateTime"
+                    | "NaiveDateTime"
+                    | "chrono::NaiveDate"
+                    | "NaiveDate"
+                    | "chrono::NaiveTime"
+                    | "NaiveTime"
+            );
+            if !is_temporal {
+                let which = if col_attrs.creation_timestamp {
+                    "creation_timestamp"
+                } else {
+                    "update_timestamp"
+                };
+                return Err(syn::Error::new_spanned(
+                    field,
+                    format!(
+                        "`#[column({which})]` requires a temporal type (chrono::DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime); got `{ty_str}`"
+                    ),
+                ));
+            }
+        }
         let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
             parse_sql_type_string(custom)
         } else if col_attrs.primary_key && col_attrs.auto_increment {
@@ -200,6 +319,36 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             } else {
                 format!("{ref_table}s")
             };
+            // Validate `on_delete` / `on_update` at macro-expansion time so
+            // typos produce a clear span-anchored error instead of silently
+            // falling back to `NO ACTION` at runtime.
+            const VALID_FK_ACTIONS: &[&str] = &[
+                "NO ACTION",
+                "RESTRICT",
+                "CASCADE",
+                "SET NULL",
+                "SET DEFAULT",
+            ];
+            let validate_action = |raw: &str, attr: &str| -> syn::Result<()> {
+                let normalised = raw.trim().to_uppercase();
+                if VALID_FK_ACTIONS.iter().any(|v| *v == normalised) {
+                    Ok(())
+                } else {
+                    Err(syn::Error::new_spanned(
+                        field,
+                        format!(
+                            "invalid `{attr}` value {raw:?}; expected one of: {}",
+                            VALID_FK_ACTIONS.join(", ")
+                        ),
+                    ))
+                }
+            };
+            if let Some(ref v) = col_attrs.on_delete {
+                validate_action(v, "on_delete")?;
+            }
+            if let Some(ref v) = col_attrs.on_update {
+                validate_action(v, "on_update")?;
+            }
             let on_delete_str = col_attrs.on_delete.as_deref().unwrap_or("NO ACTION");
             let on_update_str = col_attrs.on_update.as_deref().unwrap_or("NO ACTION");
             quote! {
@@ -207,9 +356,9 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                     references_table: #ref_table.to_string(),
                     references_column: #ref_col.to_string(),
                     on_delete: reify_core::schema::ForeignKeyAction::from_str(#on_delete_str)
-                        .unwrap_or(reify_core::schema::ForeignKeyAction::NoAction),
+                        .expect("on_delete validated at macro expansion"),
                     on_update: reify_core::schema::ForeignKeyAction::from_str(#on_update_str)
-                        .unwrap_or(reify_core::schema::ForeignKeyAction::NoAction),
+                        .expect("on_update validated at macro expansion"),
                 })
             }
         } else {
@@ -235,7 +384,9 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         });
     }
 
-    let col_name_strs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+    // Single canonical column-name representation: `col_names: &[String]`.
+    // `quote!` iterates `String` fine (via Display), so the extra `&str` view
+    // is unnecessary.
     let num_cols = col_names.len();
 
     let column_consts =
@@ -348,8 +499,8 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             }
 
             fn column_names() -> &'static [&'static str] {
-                static COLS: [&str; #num_cols] = [#(#col_name_strs),*];
-                &COLS
+                static __REIFY_COLS: [&str; #num_cols] = [#(#col_names),*];
+                &__REIFY_COLS
             }
 
             fn into_values(&self) -> Vec<reify_core::Value> {
@@ -406,16 +557,37 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         let dto_name = syn::Ident::new(&format!("{}Dto", struct_name), struct_name.span());
         let model_name_str = struct_name.to_string();
         let dto_doc = format!(
-            "Auto-generated DTO for `{model_name_str}`. \
+            "Auto-generated DTO for `{model_name_str}`.\n\n\
              Excludes auto-increment primary keys, timestamp columns, \
-             and any fields listed in `#[table(dto(skip = \"...\"))]`."
+             and any fields listed in `#[table(dto(skip = \"...\"))]`.\n\n\
+             # Relationship to the model\n\n\
+             Only the forward conversion `From<&{model_name_str}> for \
+             {model_name_str}Dto` is generated. The reverse direction is \
+             **deliberately not provided**: auto-PKs, server-managed \
+             timestamps, and `skip`-ped fields have no value in the DTO, \
+             and silently filling them with `Default::default()` (as earlier \
+             revisions did) was a footgun — a `dto(skip = \"password_hash\")` \
+             field would end up as an empty `String` in the reconstructed \
+             model.\n\n\
+             To insert, prefer `{model_name_str}Dto::validated_insert(&dto)` \
+             (available with the `dto-validation` feature) which validates \
+             before producing an `InsertBuilder<{model_name_str}Dto>` bound \
+             to the same table. When you need the full model, construct it \
+             explicitly with the missing fields."
         );
 
-        // M3: use IntoValue directly — no explicit .clone() on Copy types; the
-        // trait impl handles owned vs. borrowed correctly.
+        // 3.4: fast-path for known Copy primitives to skip a .clone() call.
+        // The match is intentionally a textual allow-list — it *only* bypasses
+        // a no-op clone on well-known primitives. Any type outside the list
+        // (aliases like `type Id = i64`, fully-qualified paths like
+        // `std::primitive::i32`, `uuid::Uuid`, tuples, user Copy wrappers)
+        // falls through to the `.clone()` path, which is always correct —
+        // just a negligible perf hit for types that trivially copy. A richer
+        // check would require full type resolution, which is outside what a
+        // proc-macro can do.
         let dto_value_conversions: Vec<proc_macro2::TokenStream> = dto_fields
             .iter()
-            .map(|(ident, ty, _)| {
+            .map(|(ident, ty, _, _)| {
                 let (is_option, inner) = unwrap_option_type(ty);
                 let inner_str = quote!(#inner).to_string().replace(' ', "");
                 let is_copy = matches!(
@@ -441,17 +613,32 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             })
             .collect();
 
-        let dto_col_names: Vec<String> =
-            dto_fields.iter().map(|(id, _, _)| id.to_string()).collect();
-        let dto_col_name_strs: Vec<&str> = dto_col_names.iter().map(|s| s.as_str()).collect();
+        let dto_col_names: Vec<String> = dto_fields
+            .iter()
+            .map(|(id, _, _, _)| id.to_string())
+            .collect();
         let dto_num_cols = dto_col_names.len();
 
-        // C1+C2: validate is already a TokenStream — no round-trip parse needed
+        // 3.7: build a per-field rustdoc block listing the validation rules.
+        // The validator crate's derive consumes `#[validate(...)]` at compile
+        // time, so the rules never appear in the public rustdoc of the
+        // generated DTO. Emitting a `/// ## Validation` doc string alongside
+        // keeps the rendered docs honest without affecting behaviour.
         #[cfg(feature = "dto-validation")]
         let dto_field_attrs: Vec<proc_macro2::TokenStream> = dto_fields
             .iter()
-            .map(|(_, _, validate)| match validate {
-                Some(tokens) => quote! { #[validate(#tokens)] },
+            .map(|(ident, _, validate, rule_names)| match validate {
+                Some(tokens) => {
+                    let doc = format!(
+                        "Validation rules on `{}`: `{}`.",
+                        ident,
+                        rule_names.join("`, `"),
+                    );
+                    quote! {
+                        #[doc = #doc]
+                        #[validate(#tokens)]
+                    }
+                }
                 None => quote! {},
             })
             .collect();
@@ -476,31 +663,32 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
         let dto_field_defs: Vec<proc_macro2::TokenStream> = dto_fields
             .iter()
-            .map(|(ident, ty, _)| quote! { pub #ident: #ty })
+            .map(|(ident, ty, _, _)| quote! { pub #ident: #ty })
             .collect();
 
         // H3: From<Model> for ModelDto and From<ModelDto> for Model
         let from_model_fields: Vec<proc_macro2::TokenStream> = dto_fields
             .iter()
-            .map(|(ident, _, _)| quote! { #ident: model.#ident.clone() })
+            .map(|(ident, _, _, _)| quote! { #ident: model.#ident.clone() })
             .collect();
 
         // Collect which fields are in the DTO to build the reverse mapping.
         // Fields absent from the DTO (auto-PK, timestamps, skipped) get
         // Default::default() in the reverse conversion.
-        let dto_field_idents: std::collections::HashSet<String> =
-            dto_fields.iter().map(|(id, _, _)| id.to_string()).collect();
-
-        let into_model_fields: Vec<proc_macro2::TokenStream> = col_idents
+        let dto_field_idents: std::collections::HashSet<String> = dto_fields
             .iter()
-            .map(|ident| {
-                if dto_field_idents.contains(&ident.to_string()) {
-                    quote! { #ident: dto.#ident.clone() }
-                } else {
-                    quote! { #ident: Default::default() }
-                }
-            })
+            .map(|(id, _, _, _)| id.to_string())
             .collect();
+
+        // Forward mapping only. The reverse `From<Dto> for Model` was
+        // removed: it silently filled fields absent from the DTO with
+        // `Default::default()`, which for a `dto(skip = "..."` field used
+        // to hide sensitive data meant a default value (e.g. empty
+        // `String`, `0`, `false`) silently leaked into the model instead
+        // of the user being forced to supply it explicitly. Callers who
+        // need to assemble a `Model` from a `Dto` plus the missing fields
+        // construct it by hand.
+        let _ = dto_field_idents;
 
         // H2: impl Table for the DTO so it can be used with InsertBuilder etc.
         // table_name() delegates to the parent model — DTOs share the same table.
@@ -520,8 +708,8 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 }
 
                 fn column_names() -> &'static [&'static str] {
-                    static COLS: [&str; #dto_num_cols] = [#(#dto_col_name_strs),*];
-                    &COLS
+                    static __REIFY_COLS: [&str; #dto_num_cols] = [#(#dto_col_names),*];
+                    &__REIFY_COLS
                 }
 
                 fn into_values(&self) -> Vec<reify_core::Value> {
@@ -541,6 +729,44 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 }
             }
 
+            // 3.3 fix: make it harder to skip validation. These helpers run
+            // `validator::Validate::validate` before producing an
+            // `InsertBuilder`, so `Dto::validated_insert(&dto)?.execute(&db)`
+            // replaces the easy-to-forget `.validate()?; insert(&db, &Dto::insert(&dto))`.
+            #[cfg(feature = "dto-validation")]
+            impl #dto_name {
+                /// Validate this DTO and return an [`InsertBuilder`](reify_core::InsertBuilder).
+                ///
+                /// Short-circuits with `validator::ValidationErrors` if any
+                /// `#[column(validate(...))]` rule on the DTO fails.
+                pub fn validated_insert(
+                    dto: &#dto_name,
+                ) -> ::std::result::Result<
+                    reify_core::InsertBuilder<#dto_name>,
+                    validator::ValidationErrors,
+                > {
+                    <#dto_name as validator::Validate>::validate(dto)?;
+                    Ok(reify_core::InsertBuilder::new(dto))
+                }
+
+                /// Validate every DTO in `dtos` and return an
+                /// [`InsertManyBuilder`](reify_core::InsertManyBuilder).
+                ///
+                /// Returns the first `ValidationErrors` encountered — all rows
+                /// are checked before any SQL is generated.
+                pub fn validated_insert_many(
+                    dtos: &[#dto_name],
+                ) -> ::std::result::Result<
+                    reify_core::InsertManyBuilder<#dto_name>,
+                    validator::ValidationErrors,
+                > {
+                    for dto in dtos {
+                        <#dto_name as validator::Validate>::validate(dto)?;
+                    }
+                    Ok(reify_core::InsertManyBuilder::new(dtos))
+                }
+            }
+
             impl From<&#struct_name> for #dto_name {
                 fn from(model: &#struct_name) -> Self {
                     Self { #(#from_model_fields),* }
@@ -553,20 +779,6 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 }
             }
 
-            impl From<&#dto_name> for #struct_name {
-                /// Reconstructs the full model from a DTO reference.
-                /// Fields absent from the DTO (auto-PK, timestamps, skipped fields)
-                /// are set to [`Default::default()`].
-                fn from(dto: &#dto_name) -> Self {
-                    Self { #(#into_model_fields),* }
-                }
-            }
-
-            impl From<#dto_name> for #struct_name {
-                fn from(dto: #dto_name) -> Self {
-                    Self::from(&dto)
-                }
-            }
         }
     };
 
@@ -611,6 +823,15 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                         syn::parenthesized!(content in inner.input);
                         let paths = content.parse_terminated(syn::Path::parse, syn::Token![,])?;
                         dto_extra_derives.extend(paths);
+                    } else {
+                        let ident = inner
+                            .path
+                            .get_ident()
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        return Err(inner.error(format!(
+                            "unknown `dto` attribute `{ident}`; expected one of: skip, derives"
+                        )));
                     }
                     Ok(())
                 })?;
@@ -658,6 +879,15 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                         if let Lit::Str(s) = lit {
                             predicate = Some(s.value());
                         }
+                    } else {
+                        let ident = inner
+                            .path
+                            .get_ident()
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        return Err(inner.error(format!(
+                            "unknown `index` attribute `{ident}`; expected one of: columns, unique, name, predicate"
+                        )));
                     }
                     Ok(())
                 })?;
@@ -668,6 +898,15 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                     name,
                     predicate,
                 });
+            } else {
+                let ident = meta
+                    .path
+                    .get_ident()
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                return Err(meta.error(format!(
+                    "unknown `table` attribute `{ident}`; expected one of: name, audit, dto, index"
+                )));
             }
             Ok(())
         })?;

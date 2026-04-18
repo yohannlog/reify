@@ -67,12 +67,19 @@ pub struct ViewSchema<M> {
 }
 
 impl<M> ViewSchema<M> {
-    /// Set the view query from a raw SQL string.
+    /// Set the view query from a compile-time SQL literal.
     ///
-    /// Use this for complex queries that cannot be expressed with `SelectBuilder`
-    /// (multi-table joins, subqueries, window functions, etc.).
-    pub fn raw_query(mut self, sql: impl Into<String>) -> Self {
-        self.query = Some(ViewQuery::Raw(sql.into()));
+    /// Use this for complex queries that cannot be expressed with
+    /// `SelectBuilder` (multi-table joins, subqueries, window
+    /// functions, etc.).
+    ///
+    /// `sql` is `&'static str` so that no runtime-built string \(and
+    /// therefore no attacker-controlled input\) can become a view
+    /// definition. If the SQL genuinely needs to vary at runtime,
+    /// whitelist the inputs at the call site and `Box::leak` the
+    /// resulting string \(an explicit, auditable opt-in\).
+    pub fn raw_query(mut self, sql: &'static str) -> Self {
+        self.query = Some(ViewQuery::Raw(sql.to_owned()));
         self
     }
 

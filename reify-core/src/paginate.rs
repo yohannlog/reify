@@ -262,40 +262,122 @@ impl<M: Table> CursorPaginated<M> {
 pub struct Cursor(pub String);
 
 impl Cursor {
-    /// Encode column values into an opaque cursor string.
+    /// Encode column values into an opaque (**unsigned**) cursor string.
+    ///
+    /// # Security
+    ///
+    /// Unsigned cursors can be forged by any client that understands the
+    /// encoding. They are fine for internal callers and for values that
+    /// cannot grant privilege escalation (e.g. stable public IDs in a
+    /// read-only list). For any API that exposes the cursor to untrusted
+    /// clients, use [`encode_signed`](Self::encode_signed) instead.
     pub fn encode(fields: &[(&str, &Value)]) -> Self {
-        let mut raw = String::new();
-        for (i, (col, val)) in fields.iter().enumerate() {
-            if i > 0 {
-                raw.push('|');
-            }
-            let _ = write!(raw, "{}:{}", col, encode_value(val));
-        }
-        Cursor(base64_encode(raw.as_bytes()))
+        Cursor(base64_encode(encode_raw(fields).as_bytes()))
     }
 
-    /// Decode an opaque cursor string back into column name + value pairs.
+    /// Decode an (**unsigned**) opaque cursor string back into column
+    /// name + value pairs.
     ///
-    /// Returns `None` if the cursor is malformed.
+    /// Returns `None` if the cursor is malformed. See
+    /// [`decode_signed`](Self::decode_signed) for the authenticated variant.
     pub fn decode(cursor: &str) -> Option<Vec<(String, Value)>> {
         let bytes = base64_decode(cursor)?;
         let raw = std::str::from_utf8(&bytes).ok()?;
-        let mut result = Vec::new();
-        // Split on unescaped `|` (escaped `\|` is part of a value)
-        for part in split_cursor_fields(raw) {
-            let (col, val) = decode_field(&part)?;
-            result.push((col, val));
-        }
-        if result.is_empty() {
+        decode_raw(raw)
+    }
+
+    /// Encode column values into a **signed** opaque cursor.
+    ///
+    /// The format is `<base64(payload)>.<base64(mac)>`, where `mac` is the
+    /// first 16 bytes of `HMAC-SHA256(key, payload)`. 128-bit truncation is
+    /// the NIST SP 800-107 minimum for HMAC authentication tags and keeps
+    /// the cursor short.
+    ///
+    /// Reuse the same HMAC key as the audit log
+    /// ([`crate::audit::AuditContext::with_integrity`]) so operators have
+    /// one secret to rotate, or use a distinct key — the API does not
+    /// enforce one choice.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic — `hmac::Hmac<Sha256>::new_from_slice` accepts any
+    /// key length. An empty key is accepted but provides no integrity.
+    pub fn encode_signed(fields: &[(&str, &Value)], key: &[u8]) -> Self {
+        let raw = encode_raw(fields);
+        let mac = crate::audit::hmac_sha256(key, raw.as_bytes());
+        let payload = base64_encode(raw.as_bytes());
+        let tag = base64_encode(&mac[..MAC_BYTES]);
+        Cursor(format!("{payload}.{tag}"))
+    }
+
+    /// Decode and **verify** a signed opaque cursor.
+    ///
+    /// Returns `None` if the cursor is malformed, the signature is
+    /// missing, or the MAC does not match (constant-time comparison).
+    /// The key must be the same one that signed the cursor.
+    pub fn decode_signed(cursor: &str, key: &[u8]) -> Option<Vec<(String, Value)>> {
+        let (payload_b64, tag_b64) = cursor.split_once('.')?;
+        let payload = base64_decode(payload_b64)?;
+        let provided = base64_decode(tag_b64)?;
+        if provided.len() != MAC_BYTES {
             return None;
         }
-        Some(result)
+        let expected = crate::audit::hmac_sha256(key, &payload);
+        if !constant_time_eq(&provided, &expected[..MAC_BYTES]) {
+            return None;
+        }
+        let raw = std::str::from_utf8(&payload).ok()?;
+        decode_raw(raw)
     }
 
     /// The raw opaque string.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Length of the truncated HMAC tag carried in signed cursors
+/// (16 bytes = 128 bits, NIST SP 800-107 minimum).
+const MAC_BYTES: usize = 16;
+
+/// Build the unsigned `col:type:value|...` payload shared by both
+/// `encode` and `encode_signed`.
+fn encode_raw(fields: &[(&str, &Value)]) -> String {
+    let mut raw = String::new();
+    for (i, (col, val)) in fields.iter().enumerate() {
+        if i > 0 {
+            raw.push('|');
+        }
+        let _ = write!(raw, "{}:{}", col, encode_value(val));
+    }
+    raw
+}
+
+/// Parse the unsigned `col:type:value|...` payload into `(col, value)`
+/// pairs. Returns `None` when the payload is malformed or empty.
+fn decode_raw(raw: &str) -> Option<Vec<(String, Value)>> {
+    let mut result = Vec::new();
+    for part in split_cursor_fields(raw) {
+        let (col, val) = decode_field(&part)?;
+        result.push((col, val));
+    }
+    if result.is_empty() {
+        return None;
+    }
+    Some(result)
+}
+
+/// Constant-time byte-slice comparison. Returns `false` for length
+/// mismatch without short-circuiting on content.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl std::fmt::Display for Cursor {
@@ -631,6 +713,10 @@ pub struct CursorBuilder<M: Table> {
     backward: bool,
     cursor: Option<String>,
     with_count: bool,
+    /// When set, incoming cursors are verified with this HMAC-SHA256 key
+    /// and emitted cursors are signed with it. Untrusted callers
+    /// (REST/GraphQL clients) should always go through this path.
+    signing_key: Option<Vec<u8>>,
 }
 
 impl<M: Table> CursorBuilder<M> {
@@ -643,7 +729,24 @@ impl<M: Table> CursorBuilder<M> {
             backward: false,
             cursor: None,
             with_count: false,
+            signing_key: None,
         }
+    }
+
+    /// Require incoming cursors to be HMAC-signed, and sign emitted cursors.
+    ///
+    /// Use the same key as [`crate::audit::AuditContext::with_integrity`] to
+    /// keep secret rotation centralised, or a separate key per surface — both
+    /// are acceptable.
+    ///
+    /// When set, any unsigned or tampered cursor passed to
+    /// [`after_cursor`](Self::after_cursor) / [`before_cursor`](Self::before_cursor)
+    /// is silently ignored (treated as "no cursor"). Emitted cursors in
+    /// `CursorPage::edges`, `page_info.start_cursor`, and `page_info.end_cursor`
+    /// are signed.
+    pub fn signed(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.signing_key = Some(key.into());
+        self
     }
 
     /// Set the page size (forward direction). Default: 25.
@@ -719,9 +822,15 @@ impl<M: Table> CursorBuilder<M> {
                 having,
                 ..
             } => {
-                // Decode cursor and add WHERE condition
+                // Decode cursor and add WHERE condition. When a signing key
+                // is configured, only signed cursors are accepted; unsigned
+                // or tampered input is silently treated as "no cursor".
                 if let Some(ref cursor_str) = self.cursor {
-                    if let Some(decoded) = Cursor::decode(cursor_str) {
+                    let decoded = match self.signing_key.as_deref() {
+                        Some(key) => Cursor::decode_signed(cursor_str, key),
+                        None => Cursor::decode(cursor_str),
+                    };
+                    if let Some(decoded) = decoded {
                         let cond = build_cursor_condition(&self.columns, &decoded, self.backward);
                         if let Some(c) = cond {
                             conditions.to_mut().push(c);
@@ -790,9 +899,11 @@ impl<M: Table> CursorBuilder<M> {
             .map(|row| {
                 let fields = cursor_extractor(row);
                 let refs: Vec<(&str, &Value)> = fields.iter().map(|(k, v)| (*k, v)).collect();
-                Edge {
-                    cursor: Cursor::encode(&refs),
-                }
+                let cursor = match self.signing_key.as_deref() {
+                    Some(key) => Cursor::encode_signed(&refs, key),
+                    None => Cursor::encode(&refs),
+                };
+                Edge { cursor }
             })
             .collect();
 
@@ -1101,6 +1212,67 @@ mod tests {
             let unescaped = unescape_cursor_str(&escaped);
             assert_eq!(&unescaped, s, "roundtrip failed for: {s:?}");
         }
+    }
+
+    // ── Signed cursor tests ─────────────────────────────────────────
+
+    #[test]
+    fn signed_cursor_roundtrip() {
+        let key = b"test-hmac-secret-key-32-bytes!!!";
+        let fields = [("id", &Value::I64(42))];
+        let cursor = Cursor::encode_signed(&fields, key);
+        let decoded = Cursor::decode_signed(cursor.as_str(), key).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].1, Value::I64(42));
+    }
+
+    #[test]
+    fn signed_cursor_rejects_wrong_key() {
+        let key = b"correct-key-xxxxxxxxxxxxxxxxxxxx";
+        let wrong = b"wrong-key-yyyyyyyyyyyyyyyyyyyyyy";
+        let fields = [("id", &Value::I64(7))];
+        let cursor = Cursor::encode_signed(&fields, key);
+        assert!(Cursor::decode_signed(cursor.as_str(), wrong).is_none());
+    }
+
+    #[test]
+    fn signed_cursor_rejects_tampered_payload() {
+        let key = b"test-hmac-secret-key-32-bytes!!!";
+        let fields = [("id", &Value::I64(1))];
+        let cursor = Cursor::encode_signed(&fields, key);
+        // Flip the last byte of the payload (before the `.`), keep tag intact.
+        let s = cursor.as_str().to_string();
+        let dot = s.rfind('.').unwrap();
+        let mut bytes = s.into_bytes();
+        bytes[dot - 1] ^= 0x01;
+        let tampered = std::str::from_utf8(&bytes).unwrap();
+        assert!(Cursor::decode_signed(tampered, key).is_none());
+    }
+
+    #[test]
+    fn signed_cursor_rejects_unsigned_input() {
+        let key = b"test-hmac-secret-key-32-bytes!!!";
+        let fields = [("id", &Value::I64(1))];
+        // Plain unsigned cursor — no `.` separator.
+        let unsigned = Cursor::encode(&fields);
+        assert!(Cursor::decode_signed(unsigned.as_str(), key).is_none());
+    }
+
+    #[test]
+    fn unsigned_decode_rejects_signed_input() {
+        // A signed cursor has a `.` in it and therefore decodes as invalid
+        // base64 when fed through the legacy unsigned path.
+        let key = b"test-hmac-secret-key-32-bytes!!!";
+        let fields = [("id", &Value::I64(1))];
+        let signed = Cursor::encode_signed(&fields, key);
+        assert!(Cursor::decode(signed.as_str()).is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_handles_length_mismatch() {
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
     }
 
     #[test]

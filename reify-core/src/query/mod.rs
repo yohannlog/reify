@@ -205,6 +205,7 @@ pub fn rewrite_placeholders_pg(sql: &str) -> String {
             // 1. `sql` is valid UTF-8.
             // 2. `?` (0x3F) is ASCII and cannot be a UTF-8 continuation byte,
             //    so splitting at any `?` position always lands on a char boundary.
+            debug_assert!(std::str::from_utf8(&bytes[start..i]).is_ok());
             result.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
             let _ = write!(result, "${idx}");
             idx += 1;
@@ -212,6 +213,7 @@ pub fn rewrite_placeholders_pg(sql: &str) -> String {
         }
     }
     // Append the tail after the last placeholder (or the whole string if none).
+    debug_assert!(std::str::from_utf8(&bytes[start..]).is_ok());
     result.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..]) });
     result
 }

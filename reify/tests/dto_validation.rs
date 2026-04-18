@@ -146,3 +146,110 @@ fn multiple_invalid_fields_reported() {
     assert!(field_errors.contains_key("email"));
     assert!(field_errors.contains_key("name"));
 }
+
+// ── validated_insert / validated_insert_many ────────────────────────
+
+#[test]
+fn validated_insert_rejects_invalid_dto() {
+    let dto = UserDto {
+        email: "not-an-email".into(),
+        name: "Alice".into(),
+        bio: None,
+    };
+    let errors = UserDto::validated_insert(&dto)
+        .err()
+        .expect("invalid DTO must not produce a builder");
+    assert!(errors.field_errors().contains_key("email"));
+}
+
+#[test]
+fn validated_insert_accepts_valid_dto() {
+    let dto = UserDto {
+        email: "alice@example.com".into(),
+        name: "Alice".into(),
+        bio: None,
+    };
+    let builder = UserDto::validated_insert(&dto).expect("valid DTO");
+    let (sql, params) = builder.build();
+    assert!(sql.to_ascii_uppercase().contains("INSERT INTO"));
+    assert!(!params.is_empty());
+}
+
+#[test]
+fn validated_insert_many_rejects_any_invalid_row() {
+    let dtos = vec![
+        UserDto {
+            email: "ok@example.com".into(),
+            name: "Ok".into(),
+            bio: None,
+        },
+        UserDto {
+            email: "bad".into(), // invalid
+            name: "Bad".into(),
+            bio: None,
+        },
+    ];
+    assert!(
+        UserDto::validated_insert_many(&dtos).is_err(),
+        "one invalid row must fail the whole batch"
+    );
+}
+
+#[test]
+fn validated_insert_many_accepts_all_valid() {
+    let dtos = vec![
+        UserDto {
+            email: "a@example.com".into(),
+            name: "A".into(),
+            bio: None,
+        },
+        UserDto {
+            email: "b@example.com".into(),
+            name: "B".into(),
+            bio: None,
+        },
+    ];
+    let builder = UserDto::validated_insert_many(&dtos).expect("all valid");
+    let (sql, _params) = builder.build();
+    assert!(sql.to_ascii_uppercase().contains("INSERT INTO"));
+}
+
+// ── 3.5 — unknown rule names rejected at macro-expansion ─────────────
+//
+// The negative case lives in `tests/compile_fail/`. This test is the
+// positive counterpart: every rule listed in the macro's allow-list
+// parses without error.
+
+#[derive(Table, Debug, Clone)]
+#[table(name = "all_rules")]
+pub struct CoversAllRules {
+    #[column(primary_key, auto_increment)]
+    pub id: i64,
+    #[column(validate(email, length(max = 254)))]
+    pub email: String,
+    #[column(validate(url))]
+    pub site: String,
+    #[column(validate(range(min = 0, max = 100)))]
+    pub score: i32,
+    // `required` lifts the Option-skip footgun for value rules.
+    #[column(nullable, validate(required, length(min = 1)))]
+    pub bio: Option<String>,
+}
+
+#[test]
+fn covers_all_rules_compiles_and_validates() {
+    let dto = CoversAllRulesDto {
+        email: "a@example.com".into(),
+        site: "https://example.com".into(),
+        score: 50,
+        bio: Some("ok".into()),
+    };
+    assert!(dto.validate().is_ok());
+
+    // None on a `required`d Option field must fail.
+    let bad = CoversAllRulesDto {
+        bio: None,
+        ..dto.clone()
+    };
+    assert!(bad.validate().is_err());
+}

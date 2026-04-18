@@ -1,0 +1,23 @@
+[package]
+name = "reify-bench"
+version.workspace = true
+edition.workspace = true
+authors = ["Yohann Catherine"]
+description = "Comparative benchmark orchestrator for Reify ORM vs Diesel, SeaORM, sqlx"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yohann-catherine/reify"
+publish = false
+rust-version = "1.85"
+
+[[bin]]
+name = "reify-bench"
+path = "src/main.rs"
+
+# The orchestrator deliberately has no database dependencies. Each
+# framework lives in its own sibling crate (reify-bench-{reify,rusqlite,
+# diesel,seaorm,sqlx}) so their conflicting `links = "sqlite3"` native deps
+# never share a dependency graph. The orchestrator spawns each child binary
+# and aggregates its JSON output.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }

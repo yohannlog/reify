@@ -1,5 +1,5 @@
 [workspace]
-members = ["reify", "reify-core", "reify-macros", "reify-postgres", "reify-mysql", "reify-sqlite", "reify-cli"]
+members = ["reify", "reify-core", "reify-macros", "reify-postgres", "reify-mysql", "reify-sqlite", "reify-cli", "reify-bench"]
 resolver = "2"
 
 [workspace.package]

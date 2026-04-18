@@ -369,7 +369,8 @@ async fn audited_update_row_data_contains_before_and_after() {
     reify::audited_update(&db, builder, &ctx).await.unwrap();
 
     let params = db.executed_params();
-    let row_data = match &params[1][2] {
+    // Audit INSERT params: [operation, actor_id, changed_at, row_data, row_hash?]
+    let row_data = match &params[1][3] {
         Value::String(s) => s.clone(),
         other => panic!("expected String row_data, got {other:?}"),
     };
@@ -454,9 +455,10 @@ async fn audited_delete_captures_rows_and_inserts_audit() {
         sqls[1]
     );
 
-    // Verify row_data contains the old email
+    // Verify row_data contains the old email.
+    // Audit INSERT params: [operation, actor_id, changed_at, row_data, row_hash?]
     let params = db.executed_params();
-    let row_data = match &params[1][2] {
+    let row_data = match &params[1][3] {
         Value::String(s) => s.clone(),
         other => panic!("expected String row_data, got {other:?}"),
     };

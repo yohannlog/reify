@@ -1,6 +1,30 @@
 use super::{BuildError, Dialect, OnConflict, trace_query, write_on_conflict};
 #[cfg(feature = "postgres")]
 use super::{rewrite_placeholders_pg, write_returning};
+
+/// Error returned when a statement would exceed the database's bind-parameter
+/// limit. Recover by calling [`InsertManyBuilder::build_chunked`] (or
+/// `build_chunked_pg`) which splits rows across multiple statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamLimitExceeded {
+    pub dialect: Dialect,
+    pub limit: usize,
+    pub requested: usize,
+    pub num_cols: usize,
+    pub num_rows: usize,
+}
+
+impl std::fmt::Display for ParamLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "insert_many with {} rows × {} columns = {} bind parameters exceeds {:?} limit of {}. Use .build_chunked(dialect) to split across multiple statements.",
+            self.num_rows, self.num_cols, self.requested, self.dialect, self.limit
+        )
+    }
+}
+
+impl std::error::Error for ParamLimitExceeded {}
 use crate::condition::Condition;
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};
@@ -241,11 +265,41 @@ impl<M: Table> InsertManyBuilder<M> {
     }
 
     /// Build SQL for a specific [`Dialect`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_rows × num_cols` exceeds `dialect.max_params()`.
+    /// Use [`try_build_with_dialect`](Self::try_build_with_dialect) to get a
+    /// recoverable error, or [`build_chunked`](Self::build_chunked) to split
+    /// the statement automatically.
     #[allow(unused_mut)]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        self.try_build_with_dialect(dialect)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Build SQL for a specific [`Dialect`], returning [`ParamLimitExceeded`]
+    /// if the bind-parameter limit would be violated.
+    #[allow(unused_mut)]
+    pub fn try_build_with_dialect(
+        &self,
+        dialect: Dialect,
+    ) -> Result<(String, Vec<Value>), ParamLimitExceeded> {
         let col_names = M::writable_column_names();
         let num_cols = col_names.len();
         let num_rows = self.rows.len();
+
+        let requested = num_cols.saturating_mul(num_rows);
+        let limit = dialect.max_params();
+        if requested > limit {
+            return Err(ParamLimitExceeded {
+                dialect,
+                limit,
+                requested,
+                num_cols,
+                num_rows,
+            });
+        }
 
         // Flatten all row values into a single params vec.
         let params: Vec<Value> = self.rows.iter().flat_map(|r| r.iter().cloned()).collect();
@@ -283,7 +337,7 @@ impl<M: Table> InsertManyBuilder<M> {
         write_returning(&mut sql, &self.returning);
 
         trace_query("insert_many", M::table_name(), &sql, &params);
-        (sql, params)
+        Ok((sql, params))
     }
 }
 

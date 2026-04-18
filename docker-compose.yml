@@ -1,14 +1,36 @@
+# ==============================================================================
+# DEV ONLY — do NOT use this file for any production or internet-exposed setup.
+# ==============================================================================
+#
+# This compose file brings up throwaway Postgres/MySQL instances for local
+# development and CI integration tests. Credentials come from `.env` (copied
+# from `docker-compose.example.env`); the example values are obviously-weak
+# strings to make accidental production use fail loudly.
+#
+# The MySQL healthcheck uses `MYSQL_PWD` (read from the environment) instead
+# of passing the password on the command line, so `ps`/`/proc` on the host
+# does NOT leak it.
+#
+# Override credentials by creating `.env` next to this file:
+#
+#     cp docker-compose.example.env .env
+#     # edit .env and set your own POSTGRES_PASSWORD / MYSQL_PASSWORD
+#     docker compose up -d
+#
+# Ports are bound to 127.0.0.1 only — the services are never reachable from
+# outside the host.
+
 services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: reify
-      POSTGRES_PASSWORD: reify
-      POSTGRES_DB: reify_test
+      POSTGRES_USER: ${POSTGRES_USER:-reify}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-reify_test}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U reify -d reify_test"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-reify} -d ${POSTGRES_DB:-reify_test}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -16,14 +38,17 @@ services:
   mysql:
     image: mysql:8
     environment:
-      MYSQL_ROOT_PASSWORD: reify
-      MYSQL_DATABASE: reify_test
-      MYSQL_USER: reify
-      MYSQL_PASSWORD: reify
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD must be set (see .env.example)}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-reify_test}
+      MYSQL_USER: ${MYSQL_USER:-reify}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD must be set (see .env.example)}
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "reify", "-preify"]
+      # Pass the password via MYSQL_PWD so it never appears in `ps`/`/proc`.
+      test:
+        - "CMD-SHELL"
+        - "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysqladmin ping -h localhost -u \"$$MYSQL_USER\" --silent"
       interval: 5s
       timeout: 5s
       retries: 10
