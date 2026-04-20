@@ -19,6 +19,7 @@ mysql = ["dep:reify-mysql", "reify-core/mysql", "reify-sqlite?/mysql"]
 sqlite = ["dep:reify-sqlite"]
 dto = ["reify-macros/dto"]
 dto-validation = ["reify-macros/dto-validation", "dto", "dep:validator"]
+metrics = ["reify-core/metrics"]
 integration-tests = ["postgres", "mysql", "sqlite"]
 
 [dependencies]

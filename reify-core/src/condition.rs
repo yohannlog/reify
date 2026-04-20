@@ -36,15 +36,23 @@ pub enum Condition {
     // ── Escape hatch ────────────────────────────────────────────────
     /// Raw SQL condition with bound parameters.
     ///
-    /// **Do not construct this variant directly from user code** —
-    /// `#[non_exhaustive]` blocks external tuple construction, so an
-    /// attacker-controlled `String` cannot reach the SQL verbatim. The
-    /// safe public entry point is [`Condition::raw`], which only
-    /// accepts a [`RawFragment`] built from a `&'static str` literal.
+    /// # Safety contract
     ///
-    /// Used internally for row-value comparisons in cursor pagination
-    /// (e.g. `(created_at, id) < (?, ?)`) and for JSON path operators.
-    #[non_exhaustive]
+    /// **Do not construct this variant directly from user code.**
+    /// The safe public entry point is [`Condition::raw`], which only
+    /// accepts a [`RawFragment`] built from a `&'static str` literal,
+    /// preventing runtime SQL injection.
+    ///
+    /// This variant is constructed internally by the library for cases
+    /// where the SQL template is built from quoted identifiers at
+    /// runtime (cursor row-value comparisons, JSON path operators).
+    /// All such internal uses quote identifiers via `crate::ident::qi`
+    /// and bind user data exclusively through the `Vec<Value>` params.
+    ///
+    /// `#[non_exhaustive]` is intentionally absent: it only blocks
+    /// external *match* exhaustiveness, not construction, so it gave
+    /// a false sense of security while preventing legitimate internal
+    /// pattern matching. The doc contract above is the actual guard.
     Raw(String, Vec<Value>),
 }
 

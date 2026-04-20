@@ -12,7 +12,6 @@ pub struct User {
     #[column(unique)]
     pub email: String,
     pub name: String,
-    #[column(nullable)]
     pub age: Option<i32>,
 }
 

@@ -35,7 +35,6 @@ pub struct Event {
     /// `TIME`
     pub time_of_day: NaiveTime,
     /// Nullable `DATETIME`
-    #[column(nullable)]
     pub resolved_at: Option<NaiveDateTime>,
 }
 

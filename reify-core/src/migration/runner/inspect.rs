@@ -96,7 +96,7 @@ impl MigrationRunner {
 
                                 // Default
                                 let struct_default =
-                                    def.and_then(|d| d.default.as_deref().map(str::to_string));
+                                    def.and_then(|d| d.default.as_ref().map(|dv| dv.as_sql().to_string()));
                                 if struct_default != db_col.column_default {
                                     diffs.push(ColumnDiff::DefaultChanged {
                                         column: col_name.to_string(),
@@ -230,6 +230,8 @@ impl MigrationRunner {
             // Only auto-table plans carry a schema_diff; views and manual plans do not.
             let table_name = if let Some(rest) = plan.version.strip_prefix("auto__") {
                 // Strip any trailing "_add_<cols>" suffix to recover the base table name.
+                // The cols segment uses comma separators (e.g. "auto__users_add_city,role"),
+                // so splitting on "_add_" is unambiguous — table names never contain "_add_".
                 rest.split("_add_").next().unwrap_or(rest)
             } else {
                 continue;

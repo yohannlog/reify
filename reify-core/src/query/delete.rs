@@ -132,7 +132,7 @@ impl<M: Table> DeleteBuilder<M> {
         Ok((sql, params))
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
     ///
     /// # Panics
     ///
@@ -144,7 +144,7 @@ impl<M: Table> DeleteBuilder<M> {
         crate::built_query::BuiltQuery::new(pg_sql, params)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
     ///
     /// Returns `Err(BuildError::MissingFilter)` if no `.filter()` or `.unfiltered()` has been called.
     #[cfg(feature = "postgres")]

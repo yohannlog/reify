@@ -11,7 +11,6 @@ pub struct User {
     pub id: i64,
     #[column(unique)]
     pub email: String,
-    #[column(nullable)]
     pub role: Option<String>,
 }
 
@@ -359,7 +358,10 @@ fn schema_default_value() {
     let schema =
         reify::table::<User>("users").column(User::role, |c| c.nullable().default("member"));
     let role_col = &schema.columns[0];
-    assert_eq!(role_col.default, Some("member".to_string()));
+    assert_eq!(
+        role_col.default,
+        Some(reify::DefaultValue::Literal("member".to_string()))
+    );
 }
 
 // ── Offset-based pagination ─────────────────────────────────────────
@@ -419,9 +421,11 @@ fn paginate_single_page() {
 }
 
 #[test]
-#[should_panic(expected = "Page number must be >= 1")]
-fn paginate_page_zero_panics() {
-    User::find().paginate(0, 25);
+fn paginate_page_zero_clamps_to_one() {
+    // page=0 is clamped to 1 instead of panicking — safe for web handlers
+    // that receive untrusted query-string parameters.
+    let paginated = User::find().paginate(0, 25);
+    let (_, _, _) = paginated.build(); // must not panic
 }
 
 // ── Cursor-based pagination ─────────────────────────────────────────

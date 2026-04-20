@@ -113,7 +113,7 @@ impl<M: Table> InsertBuilder<M> {
         self.build_with_dialect(Dialect::Generic)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
     ///
     /// Uses `build_with_dialect(Dialect::Postgres)` so that `ON CONFLICT … DO UPDATE SET`
     /// syntax is generated correctly, then rewrites `?` → `$N` once at build time.
@@ -253,7 +253,7 @@ impl<M: Table> InsertManyBuilder<M> {
         self.build_with_dialect(Dialect::Generic)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
     ///
     /// Uses `build_with_dialect(Dialect::Postgres)` so that `ON CONFLICT … DO UPDATE SET`
     /// syntax is generated correctly, then rewrites `?` → `$N` once at build time.
@@ -278,7 +278,7 @@ impl<M: Table> InsertManyBuilder<M> {
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
-    /// Build SQL for a specific [`Dialect`], returning [`ParamLimitExceeded`]
+    /// Build SQL for a specific [`Dialect`], returning [`crate::ParamLimitExceeded`]
     /// if the bind-parameter limit would be violated.
     #[allow(unused_mut)]
     pub fn try_build_with_dialect(
@@ -425,7 +425,7 @@ impl<M: Table> InsertManyBuilder<M> {
     /// Build chunked queries with PostgreSQL `$N` placeholders.
     ///
     /// Each chunk respects the 65 535 parameter limit. Returns one
-    /// [`BuiltQuery`](crate::built_query::BuiltQuery) per chunk.
+    /// [`crate::BuiltQuery`] per chunk.
     #[cfg(feature = "postgres")]
     pub fn build_chunked_pg(&self) -> Vec<crate::built_query::BuiltQuery> {
         self.build_chunked(Dialect::Postgres)
@@ -538,7 +538,7 @@ mod tests {
         fn column_names() -> &'static [&'static str] {
             &["a", "b", "c"]
         }
-        fn into_values(&self) -> Vec<Value> {
+        fn as_values(&self) -> Vec<Value> {
             vec![Value::I32(self.a), Value::I32(self.b), Value::I32(self.c)]
         }
         fn column_defs() -> Vec<ColumnDef> {

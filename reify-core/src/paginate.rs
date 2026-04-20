@@ -67,12 +67,10 @@ pub struct Paginated<M: Table> {
 
 impl<M: Table> Paginated<M> {
     pub fn new(builder: SelectBuilder<M>, page: u64, per_page: u64) -> Self {
-        assert!(page >= 1, "Page number must be >= 1");
-        assert!(per_page >= 1, "Per-page must be >= 1");
         Self {
             builder,
-            page,
-            per_page,
+            page: page.max(1),
+            per_page: per_page.max(1),
         }
     }
 
@@ -85,6 +83,11 @@ impl<M: Table> Paginated<M> {
     pub fn build(&self) -> (String, String, Vec<Value>) {
         let ast = self.builder.build_ast();
         let offset = (self.page - 1) * self.per_page;
+
+        // Count query derived from the same AST before consuming it.
+        let count_ast = ast.clone().to_count_query();
+        let mut count_params = Vec::new();
+        let count_sql = count_ast.render(&mut count_params);
 
         // Data query: set LIMIT/OFFSET on the AST
         let data_ast = match ast {
@@ -115,11 +118,6 @@ impl<M: Table> Paginated<M> {
 
         let mut data_params = Vec::new();
         let data_sql = data_ast.render(&mut data_params);
-
-        // Count query: from the AST
-        let count_ast = self.builder.build_ast().to_count_query();
-        let mut count_params = Vec::new();
-        let count_sql = count_ast.render(&mut count_params);
 
         // Use data_params as the shared params (count params are identical)
         (data_sql, count_sql, data_params)
@@ -166,13 +164,12 @@ impl<M: Table> CursorPaginated<M> {
         direction: CursorDirection,
         limit: u64,
     ) -> Self {
-        assert!(limit >= 1, "Limit must be >= 1");
         Self {
             builder,
             cursor_column,
             cursor_value,
             direction,
-            limit,
+            limit: limit.max(1),
         }
     }
 
@@ -585,7 +582,7 @@ fn b64_val(c: u8) -> Option<u32> {
 ///
 /// Pairs a row's cursor with its position in the result set.
 /// The `node` field is not included — the caller maps rows to edges
-/// using [`CursorPage::from_rows`].
+/// using [`CursorBuilder::into_page`].
 #[derive(Debug, Clone)]
 pub struct Edge {
     /// Opaque cursor for this row.
@@ -721,7 +718,8 @@ pub struct CursorBuilder<M: Table> {
 
 impl<M: Table> CursorBuilder<M> {
     fn new(inner: SelectBuilder<M>, columns: Vec<CursorCol>) -> Self {
-        assert!(!columns.is_empty(), "cursor requires at least one column");
+        // Silently ignore empty columns — build() will produce a query without cursor ordering.
+        // Callers using .cursor(col) or .cursor_by(cols) always pass at least one column.
         Self {
             inner,
             columns,
@@ -751,16 +749,14 @@ impl<M: Table> CursorBuilder<M> {
 
     /// Set the page size (forward direction). Default: 25.
     pub fn first(mut self, n: u64) -> Self {
-        assert!(n >= 1, "first must be >= 1");
-        self.limit = n;
+        self.limit = n.max(1);
         self.backward = false;
         self
     }
 
     /// Set the page size (backward direction).
     pub fn last(mut self, n: u64) -> Self {
-        assert!(n >= 1, "last must be >= 1");
-        self.limit = n;
+        self.limit = n.max(1);
         self.backward = true;
         self
     }

@@ -67,10 +67,11 @@ use syn::{parse_macro_input, DeriveInput};
 ///     #[column(validate(custom(function = "crate::validators::check_slug")))]
 ///     pub slug: String,
 ///
-///     // nullable + value rule → MUST include `required` to reject `None`,
+///     // Option<T> fields are automatically nullable — no `nullable` attribute needed.
+///     // Value rules on Option<T> MUST include `required` to reject `None`,
 ///     // otherwise the macro refuses to compile (validator skips `None`
 ///     // silently by default, which is a common footgun).
-///     #[column(nullable, validate(required, length(min = 1)))]
+///     #[column(validate(required, length(min = 1)))]
 ///     pub bio: Option<String>,
 /// }
 /// ```

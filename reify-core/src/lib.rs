@@ -18,6 +18,7 @@ pub mod schema;
 pub mod sql;
 pub mod table;
 pub mod value;
+pub mod telemetry;
 pub mod view;
 
 pub use tracing;
@@ -34,7 +35,7 @@ pub use query::rewrite_placeholders_pg;
 #[allow(deprecated)]
 pub use query::{
     BuildError, DeleteBuilder, Dialect, Expr, InsertBuilder, InsertManyBuilder, JoinClause,
-    JoinKind, OnConflict, SelectBuilder, UpdateBuilder, WithBuilder,
+    JoinKind, OnConflict, ParamLimitExceeded, SelectBuilder, UpdateBuilder, WithBuilder,
 };
 
 pub use func::count_all;
@@ -45,9 +46,9 @@ pub use table::Table;
 pub use value::{FromValue, Value};
 
 pub use schema::{
-    ColumnBuilder, ColumnDef, ComputedColumn, ForeignKeyAction, ForeignKeyDef, HasTimestamp,
-    IndexBuilder, IndexColumnDef, IndexDef, IndexKind, NoTimestamp, Schema, SortDirection, SqlType,
-    TableSchema, TimestampKind, TimestampSource, TimestampState, table,
+    ColumnBuilder, ColumnDef, ComputedColumn, DefaultValue, ForeignKeyAction, ForeignKeyDef,
+    HasTimestamp, IndexBuilder, IndexColumnDef, IndexDef, IndexKind, NoTimestamp, Schema,
+    SortDirection, SqlType, TableSchema, TimestampKind, TimestampSource, TimestampState, table,
 };
 
 pub use paginate::{
@@ -85,6 +86,8 @@ pub use audit::{
 };
 
 pub use enumeration::{DbEnum, enum_from_value};
+
+pub use hooks::{AsyncModelHooks, HookError, ModelHooks};
 
 pub use range::{Bound, Range, RangeElement};
 

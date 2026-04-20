@@ -87,6 +87,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     let mut col_idents = Vec::new();
     let mut col_types = Vec::new();
     let mut value_conversions = Vec::new();
+    let mut into_value_conversions: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut single_col_indexes: Vec<String> = Vec::new();
     let mut update_ts_vm_cols: Vec<String> = Vec::new();
 
@@ -137,14 +138,14 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         // / regex / url / contains / does_not_contain / must_match / phone
         // / credit_card / ip / non_control_character) is a footgun: the
         // `validator` crate skips `None` by default, so callers who write
-        // `#[column(nullable, validate(length(min=1)))]` think they've
+        // `#[column(validate(length(min=1)))]` on an Option<T> field think they've
         // forbidden empty strings but `None` slips through silently.
         // Require an explicit `required` rule (or the user removing the
         // value rule) so the intent is unambiguous.
         #[cfg(feature = "dto-validation")]
         if !col_attrs.validate_rule_names.is_empty() {
             let (is_option, _) = unwrap_option_type(ty);
-            let is_option_field = is_option || col_attrs.nullable;
+            let is_option_field = is_option;
             let has_required = col_attrs
                 .validate_rule_names
                 .iter()
@@ -218,14 +219,20 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             value_conversions.push(quote! {
                 reify_core::value::IntoValue::into_value(chrono::Utc::now())
             });
+            into_value_conversions.push(quote! {
+                reify_core::value::IntoValue::into_value(chrono::Utc::now())
+            });
         } else {
             value_conversions.push(quote! {
                 reify_core::value::IntoValue::into_value(self.#ident.clone())
             });
+            into_value_conversions.push(quote! {
+                reify_core::value::IntoValue::into_value(self.#ident)
+            });
         }
 
         let (is_option, inner_ty) = unwrap_option_type(ty);
-        let is_nullable = col_attrs.nullable || is_option;
+        let is_nullable = is_option;
 
         // Validate that `creation_timestamp`/`update_timestamp` are only
         // applied to temporal types. The macro can only inspect the
@@ -274,8 +281,10 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
         let is_db_source = col_attrs.timestamp_source.as_deref() == Some("db");
         let default_token = match &col_attrs.default {
-            Some(d) => quote! { Some(#d.to_string()) },
-            None if is_db_source => quote! { Some("NOW()".to_string()) },
+            Some(d) => quote! { Some(reify_core::schema::DefaultValue::Literal(#d.to_string())) },
+            None if is_db_source => {
+                quote! { Some(reify_core::schema::DefaultValue::Expr("NOW()")) }
+            }
             None => quote! { None },
         };
 
@@ -503,8 +512,12 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 &__REIFY_COLS
             }
 
-            fn into_values(&self) -> Vec<reify_core::Value> {
+            fn as_values(&self) -> Vec<reify_core::Value> {
                 vec![#(#value_conversions),*]
+            }
+
+            fn into_values(self) -> Vec<reify_core::Value> {
+                vec![#(#into_value_conversions),*]
             }
 
             fn column_defs() -> Vec<reify_core::schema::ColumnDef> {
@@ -613,6 +626,14 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             })
             .collect();
 
+        // into_values: move every field (no clone needed — self is consumed).
+        let dto_into_value_conversions: Vec<proc_macro2::TokenStream> = dto_fields
+            .iter()
+            .map(|(ident, _, _, _)| {
+                quote! { reify_core::value::IntoValue::into_value(self.#ident) }
+            })
+            .collect();
+
         let dto_col_names: Vec<String> = dto_fields
             .iter()
             .map(|(id, _, _, _)| id.to_string())
@@ -712,8 +733,12 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                     &__REIFY_COLS
                 }
 
-                fn into_values(&self) -> Vec<reify_core::Value> {
+                fn as_values(&self) -> Vec<reify_core::Value> {
                     vec![#(#dto_value_conversions),*]
+                }
+
+                fn into_values(self) -> Vec<reify_core::Value> {
+                    vec![#(#dto_into_value_conversions),*]
                 }
             }
 
@@ -724,8 +749,8 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 }
 
                 /// Converts this DTO into an ordered list of [`reify_core::Value`]s.
-                pub fn into_values(&self) -> Vec<reify_core::Value> {
-                    <Self as reify_core::Table>::into_values(self)
+                pub fn as_values(&self) -> Vec<reify_core::Value> {
+                    <Self as reify_core::Table>::as_values(self)
                 }
             }
 

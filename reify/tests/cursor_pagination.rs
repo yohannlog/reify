@@ -228,7 +228,7 @@ fn cursor_builder_multi_column_after_cursor() {
     // DESC + forward → LT for row-value comparison
     assert_eq!(
         sql,
-        "SELECT * FROM \"posts\" WHERE (user_id, id) < (?, ?) ORDER BY \"user_id\" DESC, \"id\" DESC LIMIT 21"
+        "SELECT * FROM \"posts\" WHERE (\"user_id\", \"id\") < (?, ?) ORDER BY \"user_id\" DESC, \"id\" DESC LIMIT 21"
     );
     assert_eq!(params, vec![Value::I64(5), Value::I64(100)]);
 }
@@ -244,7 +244,7 @@ fn cursor_builder_multi_column_before_cursor() {
     // DESC + backward → GT, order flips to ASC
     assert_eq!(
         sql,
-        "SELECT * FROM \"posts\" WHERE (user_id, id) > (?, ?) ORDER BY \"user_id\" ASC, \"id\" ASC LIMIT 21"
+        "SELECT * FROM \"posts\" WHERE (\"user_id\", \"id\") > (?, ?) ORDER BY \"user_id\" ASC, \"id\" ASC LIMIT 21"
     );
     assert_eq!(params, vec![Value::I64(5), Value::I64(100)]);
 }

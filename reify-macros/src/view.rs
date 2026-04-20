@@ -86,7 +86,7 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
 
         let col_attrs = parse_column_attrs(&field.attrs)?;
         let (is_option, inner_ty) = unwrap_option_type(ty);
-        let is_nullable = col_attrs.nullable || is_option;
+        let is_nullable = is_option;
         let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
             parse_sql_type_string(custom)
         } else {
@@ -151,7 +151,7 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                 &__REIFY_COLS
             }
 
-            fn into_values(&self) -> Vec<reify_core::Value> {
+            fn as_values(&self) -> Vec<reify_core::Value> {
                 vec![]
             }
 

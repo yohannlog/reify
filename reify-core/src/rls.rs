@@ -172,8 +172,8 @@ pub trait Policy: crate::table::Table {
     /// [`PolicyDecision::Unrestricted`] to allow full access (e.g. for
     /// admins). There is **no implicit default** — you must choose
     /// explicitly. Forgetting to read a context key must not collapse
-    /// into unrestricted access: return a [`PolicyDecision::Deny`] via
-    /// `?` on [`RlsContext::require`] instead.
+    /// into unrestricted access: propagate [`RlsError`] via `?` on
+    /// [`RlsContext::require`] instead.
     ///
     /// ```ignore
     /// impl Policy for Post {
@@ -370,8 +370,16 @@ pub async fn scoped_fetch_all<M: crate::table::Table + Policy>(
     builder: crate::query::SelectBuilder<M>,
 ) -> Result<Vec<Row>, DbError> {
     let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
-    let (sql, params) = builder.build();
-    Database::query(scoped, &sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.build_pg();
+        return Database::query(scoped, &q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.build();
+        Database::query(scoped, &sql, &params).await
+    }
 }
 
 /// Fetch typed results with RLS policy applied.
@@ -389,8 +397,16 @@ pub async fn scoped_update<M: crate::table::Table + Policy>(
     builder: crate::query::UpdateBuilder<M>,
 ) -> Result<u64, DbError> {
     let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
-    let (sql, params) = builder.build();
-    Database::execute(scoped, &sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.try_build_pg().map_err(|e| DbError::Other(e.to_string()))?;
+        return Database::execute(scoped, &q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.try_build().map_err(|e| DbError::Other(e.to_string()))?;
+        Database::execute(scoped, &sql, &params).await
+    }
 }
 
 /// Execute a DELETE with RLS policy applied to the WHERE clause.
@@ -399,8 +415,16 @@ pub async fn scoped_delete<M: crate::table::Table + Policy>(
     builder: crate::query::DeleteBuilder<M>,
 ) -> Result<u64, DbError> {
     let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
-    let (sql, params) = builder.build();
-    Database::execute(scoped, &sql, &params).await
+    #[cfg(feature = "postgres")]
+    {
+        let q = builder.try_build_pg().map_err(|e| DbError::Other(e.to_string()))?;
+        return Database::execute(scoped, &q.sql, &q.params).await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let (sql, params) = builder.try_build().map_err(|e| DbError::Other(e.to_string()))?;
+        Database::execute(scoped, &sql, &params).await
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -459,7 +483,7 @@ mod tests {
         fn column_names() -> &'static [&'static str] {
             &["id", "tenant_id", "title"]
         }
-        fn into_values(&self) -> Vec<Value> {
+        fn as_values(&self) -> Vec<Value> {
             vec![]
         }
     }
@@ -515,7 +539,7 @@ mod tests {
         let queries = log.lock().unwrap();
         assert_eq!(queries.len(), 1);
         assert!(
-            queries[0].contains("\"tenant_id\" = ?"),
+            queries[0].contains("\"tenant_id\" ="),
             "RLS filter should be applied, got: {}",
             queries[0]
         );
@@ -545,7 +569,7 @@ mod tests {
         let queries = log.lock().unwrap();
         assert_eq!(queries.len(), 1, "expected exactly one query");
         assert!(
-            queries[0].contains("\"tenant_id\" = ?"),
+            queries[0].contains("\"tenant_id\" ="),
             "RLS filter must be applied inside transaction, got: {}",
             queries[0]
         );

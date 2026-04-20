@@ -41,7 +41,6 @@ pub struct Event {
     /// `JSONB`
     pub metadata: serde_json::Value,
     /// Nullable `TIMESTAMPTZ`
-    #[column(nullable)]
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 

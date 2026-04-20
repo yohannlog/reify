@@ -61,8 +61,19 @@ impl MigrationContext {
     /// Execute a raw SQL statement as part of this migration.
     ///
     /// Use `?` as the placeholder character.
+    ///
+    /// The statement is trimmed of surrounding whitespace. A trailing semicolon
+    /// is appended automatically if absent — some drivers reject statements
+    /// without one.
     pub fn execute(&mut self, sql: impl Into<String>) {
-        self.statements.push(sql.into());
+        let mut s = sql.into();
+        let trimmed = s.trim_end();
+        if !trimmed.ends_with(';') {
+            s = format!("{trimmed};");
+        } else {
+            s = trimmed.to_string();
+        }
+        self.statements.push(s);
     }
 
     /// Create or replace a SQL view.

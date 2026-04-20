@@ -98,7 +98,7 @@ mod tests {
         fn column_names() -> &'static [&'static str] {
             &["id", "email", "role"]
         }
-        fn into_values(&self) -> Vec<Value> {
+        fn as_values(&self) -> Vec<Value> {
             vec![]
         }
         fn column_defs() -> Vec<crate::schema::ColumnDef> {
@@ -385,6 +385,7 @@ mod tests {
             statements: stmts,
             checksum,
             schema_diff: None,
+            timeout: None,
         };
         let display = plan.display();
         assert!(display.contains("Would apply (up)"));
@@ -406,6 +407,7 @@ mod tests {
             comment: None,
             statements: stmts,
             checksum,
+            timeout: None,
             schema_diff: Some(SchemaDiff {
                 tables: vec![TableDiff {
                     table_name: "users".into(),
@@ -907,7 +909,7 @@ mod tests {
             fn column_names() -> &'static [&'static str] {
                 &["id", "user_id"]
             }
-            fn into_values(&self) -> Vec<Value> {
+            fn as_values(&self) -> Vec<Value> {
                 vec![]
             }
         }
@@ -997,7 +999,7 @@ mod tests {
         fn column_names() -> &'static [&'static str] {
             &["id", "email"]
         }
-        fn into_values(&self) -> Vec<Value> {
+        fn as_values(&self) -> Vec<Value> {
             vec![]
         }
     }
@@ -1128,7 +1130,7 @@ mod tests {
         fn column_names() -> &'static [&'static str] {
             &["seller_no", "sales_amt"]
         }
-        fn into_values(&self) -> Vec<Value> {
+        fn as_values(&self) -> Vec<Value> {
             vec![]
         }
     }

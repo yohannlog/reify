@@ -8,6 +8,7 @@ use crate::migration::plan::compute_checksum;
 use crate::query::Dialect;
 use crate::value::Value;
 use std::collections::HashSet;
+use tokio::time::timeout as tokio_timeout;
 
 impl MigrationRunner {
     /// Apply all pending migrations (auto-diff + manual + views) against the database.
@@ -23,6 +24,14 @@ impl MigrationRunner {
     /// tracking-table INSERT are committed atomically. On PostgreSQL this gives full
     /// ACID guarantees; on MySQL/MariaDB DDL statements cause an implicit commit, so
     /// the transaction boundary still protects the tracking INSERT from being lost.
+    /// # Warning — additive-only auto-diff
+    ///
+    /// Auto-diff migrations registered via [`add_table`](MigrationRunner::add_table)
+    /// are **additive only**: `CREATE TABLE` and `ADD COLUMN` are emitted
+    /// automatically, but drops, renames, and type changes are **silently skipped**.
+    ///
+    /// Use [`diff`](MigrationRunner::diff) to inspect what the runner detected
+    /// but will not apply, and write a manual migration for those changes.
     pub async fn run(&self, db: &impl Database) -> Result<(), MigrationError> {
         self.ensure_tracking_table(db).await?;
         MigrationLock::ensure(db, self.dialect).await?;
@@ -32,7 +41,7 @@ impl MigrationRunner {
 
         // Always release, even on error. Panics are not caught here — the
         // stale-lock TTL in acquire() handles crashed processes automatically.
-        MigrationLock::release(db).await.ok();
+        MigrationLock::release(db, self.dialect).await.ok();
 
         result
     }
@@ -78,8 +87,8 @@ impl MigrationRunner {
             let description = plan.description.clone();
             let comment = plan.comment.clone();
             let checksum = plan.checksum.clone();
-            let result = db
-                .transaction(Box::new(move |txn| {
+            let result = {
+                let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
                         for stmt in &stmts {
                             txn.execute(stmt, &[]).await?;
@@ -103,9 +112,18 @@ impl MigrationRunner {
                         .await?;
                         Ok(())
                     })
-                }))
-                .await
-                .map_err(MigrationError::Db);
+                }));
+                match plan.timeout {
+                    Some(dur) => tokio_timeout(dur, fut)
+                        .await
+                        .map_err(|_| MigrationError::TimedOut {
+                            version: plan.version.clone(),
+                            timeout_secs: dur.as_secs(),
+                        })
+                        .and_then(|r| r.map_err(MigrationError::Db)),
+                    None => fut.await.map_err(MigrationError::Db),
+                }
+            };
             match result {
                 Ok(()) => self.hooks.call_after(&plan).await?,
                 Err(e) => {
@@ -131,7 +149,7 @@ impl MigrationRunner {
 
         let result = self.run_since_inner(db, since).await;
 
-        MigrationLock::release(db).await.ok();
+        MigrationLock::release(db, self.dialect).await.ok();
 
         result
     }
@@ -171,6 +189,7 @@ impl MigrationRunner {
 
         let auto_plans = self.auto_diff_plans(db, &skip).await?;
         let view_plans = self.view_plans(&skip);
+        let mat_view_plans = self.mat_view_plans(&skip);
         let manual_plans = self.manual_plans(&skip);
 
         // Build the dialect-appropriate upsert SQL once, outside the loop.
@@ -197,7 +216,11 @@ impl MigrationRunner {
             }
         };
 
-        let all_plans = auto_plans.into_iter().chain(view_plans).chain(manual_plans);
+        let all_plans = auto_plans
+            .into_iter()
+            .chain(view_plans)
+            .chain(mat_view_plans)
+            .chain(manual_plans);
         for plan in all_plans {
             self.hooks.call_before(&plan).await?;
             let stmts = plan.statements.clone();
@@ -205,8 +228,8 @@ impl MigrationRunner {
             let description = plan.description.clone();
             let comment = plan.comment.clone();
             let checksum = plan.checksum.clone();
-            let result = db
-                .transaction(Box::new(move |txn| {
+            let result = {
+                let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
                         for stmt in &stmts {
                             txn.execute(stmt, &[]).await?;
@@ -226,9 +249,18 @@ impl MigrationRunner {
                         .await?;
                         Ok(())
                     })
-                }))
-                .await
-                .map_err(MigrationError::Db);
+                }));
+                match plan.timeout {
+                    Some(dur) => tokio_timeout(dur, fut)
+                        .await
+                        .map_err(|_| MigrationError::TimedOut {
+                            version: plan.version.clone(),
+                            timeout_secs: dur.as_secs(),
+                        })
+                        .and_then(|r| r.map_err(MigrationError::Db)),
+                    None => fut.await.map_err(MigrationError::Db),
+                }
+            };
             match result {
                 Ok(()) => self.hooks.call_after(&plan).await?,
                 Err(e) => {

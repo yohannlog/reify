@@ -15,7 +15,6 @@ pub struct User {
     pub id: i64,
     #[column(unique)]
     pub email: String,
-    #[column(nullable)]
     pub role: Option<String>,
 }
 

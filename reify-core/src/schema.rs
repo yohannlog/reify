@@ -296,6 +296,57 @@ impl ForeignKeyDef {
     }
 }
 
+// ── Default value ──────────────────────────────────────────────────
+
+/// Typed default value for a column.
+///
+/// Distinguishes between a SQL literal (a quoted constant the ORM supplies
+/// verbatim) and a SQL expression (a server-side function call).
+///
+/// # Examples
+///
+/// ```ignore
+/// // Literal — the string is already a valid SQL literal
+/// DefaultValue::Literal("'member'".to_string())   // TEXT default
+/// DefaultValue::Literal("0".to_string())           // numeric default
+/// DefaultValue::Literal("FALSE".to_string())       // boolean default
+///
+/// // Expression — evaluated by the database engine
+/// DefaultValue::Expr("NOW()")
+/// DefaultValue::Expr("gen_random_uuid()")
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultValue {
+    /// A SQL literal constant, e.g. `'member'`, `0`, `FALSE`.
+    ///
+    /// The string is emitted as-is after `DEFAULT` in DDL — it must already
+    /// be a valid SQL literal for the target dialect.
+    Literal(String),
+    /// A SQL expression evaluated by the database engine, e.g. `NOW()`,
+    /// `gen_random_uuid()`, `CURRENT_TIMESTAMP`.
+    Expr(&'static str),
+}
+
+impl DefaultValue {
+    /// Render as the SQL fragment that follows `DEFAULT` in a DDL statement.
+    pub fn as_sql(&self) -> &str {
+        match self {
+            DefaultValue::Literal(s) => s.as_str(),
+            DefaultValue::Expr(s) => s,
+        }
+    }
+
+    /// Return `true` if this is a [`DefaultValue::Expr`].
+    pub fn is_expr(&self) -> bool {
+        matches!(self, DefaultValue::Expr(_))
+    }
+
+    /// Return `true` if this is a [`DefaultValue::Literal`].
+    pub fn is_literal(&self) -> bool {
+        matches!(self, DefaultValue::Literal(_))
+    }
+}
+
 // ── Column attributes ───────────────────────────────────────────────
 
 /// Metadata for a single column, built via the fluent `ColumnBuilder`.
@@ -308,7 +359,7 @@ pub struct ColumnDef {
     pub unique: bool,
     pub index: bool,
     pub nullable: bool,
-    pub default: Option<String>,
+    pub default: Option<DefaultValue>,
     /// When set, the column is computed and excluded from INSERT/UPDATE.
     pub computed: Option<ComputedColumn>,
     /// Auto-managed timestamp role (`Creation` or `Update`).
@@ -382,7 +433,7 @@ impl<T> ColumnBuilder<T, NoTimestamp> {
                 unique: false,
                 index: false,
                 nullable: false,
-                default: None,
+                default: None::<DefaultValue>,
                 computed: None,
                 timestamp_kind: None,
                 timestamp_source: TimestampSource::Vm,
@@ -437,8 +488,32 @@ impl<T, S: TimestampState> ColumnBuilder<T, S> {
         self
     }
 
+    /// Set a SQL literal default, e.g. `"'member'"`, `"0"`, `"FALSE"`.
+    ///
+    /// The value is emitted verbatim after `DEFAULT` in DDL — it must already
+    /// be a valid SQL literal for the target dialect.
+    ///
+    /// ```ignore
+    /// .column(User::role, |c| c.nullable().default("'member'"))
+    /// // → role TEXT DEFAULT 'member'
+    /// ```
     pub fn default(mut self, value: impl Into<String>) -> Self {
-        self.def.default = Some(value.into());
+        self.def.default = Some(DefaultValue::Literal(value.into()));
+        self
+    }
+
+    /// Set a SQL expression default, e.g. `"NOW()"`, `"gen_random_uuid()"`.
+    ///
+    /// Unlike [`default`](Self::default), this marks the value as a
+    /// server-side expression rather than a literal constant, which allows
+    /// tooling to distinguish `DEFAULT 'member'` from `DEFAULT NOW()`.
+    ///
+    /// ```ignore
+    /// .column(Event::created_at, |c| c.default_expr("NOW()"))
+    /// // → created_at TIMESTAMPTZ DEFAULT NOW()
+    /// ```
+    pub fn default_expr(mut self, expr: &'static str) -> Self {
+        self.def.default = Some(DefaultValue::Expr(expr));
         self
     }
 

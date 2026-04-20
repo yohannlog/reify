@@ -15,7 +15,7 @@ mod update;
 mod with;
 
 pub use delete::DeleteBuilder;
-pub use insert::{InsertBuilder, InsertManyBuilder};
+pub use insert::{InsertBuilder, InsertManyBuilder, ParamLimitExceeded};
 pub use join::{JoinClause, JoinKind};
 pub use select::SelectBuilder;
 pub use update::UpdateBuilder;
@@ -118,14 +118,7 @@ pub enum OnConflict {
 }
 
 pub(crate) fn trace_query(operation: &str, table: &'static str, sql: &str, params: &[Value]) {
-    debug!(
-        target: "reify::query",
-        operation,
-        table,
-        sql = %sql,
-        params = ?params,
-        "Built SQL query"
-    );
+    crate::telemetry::record_query_built(operation, table, sql, params.len());
 }
 
 /// Append an `ON CONFLICT` clause to `sql` based on the conflict strategy and dialect.

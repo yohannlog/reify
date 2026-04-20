@@ -78,6 +78,15 @@ impl MigrationRunner {
     /// - If the table does not exist → emits `CREATE TABLE IF NOT EXISTS`.
     /// - If the table exists but has new columns → emits `ALTER TABLE ADD COLUMN`.
     /// - Drops, renames, and type changes are **never** auto-generated.
+    ///
+    /// # Warning — additive-only diff
+    ///
+    /// The auto-diff is **additive only**. If you rename a Rust field, the diff
+    /// will report a `Removed` column and an `Added` column but will **not**
+    /// emit any SQL — the runner silently skips non-additive changes.
+    ///
+    /// For renames, type changes, or column drops, write a manual migration
+    /// with [`MigrationRunner::add`] instead.
     pub fn add_table<T: Table>(mut self) -> Self {
         // Use rich metadata from column_defs() when available;
         // fall back to minimal defs from column_names() for plain Table impls.

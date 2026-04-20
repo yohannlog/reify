@@ -465,7 +465,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             unique: false,
             index: false,
             nullable: false,
-            default: Some("NOW()".to_string()),
+            default: Some(crate::schema::DefaultValue::Expr("NOW()")),
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Db,
@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(defs[2].sql_type, SqlType::Text);
         assert!(defs[2].nullable);
         assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
-        assert_eq!(defs[3].default, Some("NOW()".to_string()));
+        assert_eq!(defs[3].default, Some(crate::schema::DefaultValue::Expr("NOW()")));
         assert_eq!(defs[4].sql_type, SqlType::Jsonb);
         assert_eq!(defs[5].sql_type, SqlType::Text);
         assert!(defs[5].nullable);

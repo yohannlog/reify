@@ -7,7 +7,6 @@ pub struct User {
     pub id: i64,
     pub name: String,
     pub score: f64,
-    #[column(nullable)]
     pub bio: Option<String>,
 }
 

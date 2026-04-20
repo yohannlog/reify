@@ -48,6 +48,16 @@ fn acquire_sql(dialect: Dialect) -> String {
 }
 
 /// Build a human-readable lock-holder identifier: `reify@<hostname>:<pid>`.
+/// Build a human-readable lock-holder identifier: `reify@<hostname>:<pid>`.
+///
+/// Hostname resolution order:
+/// 1. `HOSTNAME` environment variable (set automatically in Kubernetes pods,
+///    Docker containers, and most CI environments — the recommended override).
+/// 2. Contents of `/etc/hostname` (Linux fallback).
+/// 3. `"unknown"` — used when neither source is available. The lock still
+///    works correctly; the error message for a held lock will just show
+///    `reify@unknown:<pid>` instead of a meaningful host name. Set the
+///    `HOSTNAME` env var in your container spec to improve diagnostics.
 fn lock_holder_id() -> String {
     let hostname = std::env::var("HOSTNAME")
         .or_else(|_| {
@@ -63,9 +73,9 @@ fn lock_holder_id() -> String {
 /// Prevents concurrent deployments from running migrations simultaneously.
 /// Uses a single sentinel row (id=1) in `_reify_migrations_lock`.
 ///
-/// Stale locks (held longer than [`STALE_LOCK_MINUTES`] minutes) are
-/// automatically reclaimed by the next `acquire()` call, so a crashed process
-/// never permanently blocks deployments.
+/// Stale locks (held longer than 10 minutes) are automatically reclaimed
+/// by the next `acquire()` call, so a crashed process never permanently
+/// blocks deployments.
 pub struct MigrationLock;
 
 impl MigrationLock {
@@ -89,8 +99,7 @@ impl MigrationLock {
     /// Acquire the lock.
     ///
     /// Atomically sets `locked = true` where `locked = false` **or** where
-    /// the lock has been held longer than [`STALE_LOCK_MINUTES`] minutes
-    /// (stale-lock reclaim).
+    /// the lock has been held longer than 10 minutes (stale-lock reclaim).
     ///
     /// Returns `Err(MigrationError::Locked)` if the lock is actively held by
     /// another process within the TTL window.
@@ -131,14 +140,23 @@ impl MigrationLock {
     }
 
     /// Release the lock.
-    pub async fn release(db: &impl Database) -> Result<(), MigrationError> {
-        db.execute(
-            "UPDATE \"_reify_migrations_lock\" \
-             SET \"locked\" = false, \"locked_by\" = NULL, \"locked_at\" = NULL \
-             WHERE \"id\" = 1;",
-            &[],
-        )
-        .await?;
+    ///
+    /// The SQL is dialect-aware: MySQL uses `0` for the `TINYINT(1)` column;
+    /// PostgreSQL and Generic use `false` for the `BOOLEAN` column.
+    pub async fn release(db: &impl Database, dialect: Dialect) -> Result<(), MigrationError> {
+        let sql = match dialect {
+            Dialect::Mysql => {
+                "UPDATE `_reify_migrations_lock` \
+                 SET `locked` = 0, `locked_by` = NULL, `locked_at` = NULL \
+                 WHERE `id` = 1;"
+            }
+            _ => {
+                "UPDATE \"_reify_migrations_lock\" \
+                 SET \"locked\" = false, \"locked_by\" = NULL, \"locked_at\" = NULL \
+                 WHERE \"id\" = 1;"
+            }
+        };
+        db.execute(sql, &[]).await?;
         Ok(())
     }
 }

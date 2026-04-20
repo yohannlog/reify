@@ -72,7 +72,7 @@ pub trait FromRow: Sized {
 // ── Error type ──────────────────────────────────────────────────────
 
 /// Database error.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DbError {
     /// Connection failed.
     Connection(String),
@@ -342,12 +342,18 @@ pub async fn fetch_all<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        return db.query(&q.sql, &q.params).await;
+        let timer = crate::telemetry::start_query("select", M::table_name(), &q.sql, q.params.len());
+        let result = db.query(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().map(|r| r.len()).unwrap_or(0));
+        return result;
     }
     #[cfg(not(feature = "postgres"))]
     {
         let (sql, params) = builder.build();
-        db.query(&sql, &params).await
+        let timer = crate::telemetry::start_query("select", M::table_name(), &sql, params.len());
+        let result = db.query(&sql, &params).await;
+        timer.finish(result.as_ref().map(|r| r.len()).unwrap_or(0));
+        result
     }
 }
 
@@ -377,6 +383,7 @@ pub async fn fetch<M: Table + FromRow>(
     rows.iter().map(|r| M::from_row(r)).collect()
 }
 
+
 /// Execute a SELECT and return an asynchronous stream of typed results.
 pub async fn fetch_stream<'a, M: Table + FromRow>(
     db: &'a impl Database,
@@ -396,12 +403,16 @@ pub async fn fetch_one<M: Table + FromRow>(
     db: &impl Database,
     builder: &crate::query::SelectBuilder<M>,
 ) -> Result<M, DbError> {
-    let rows = fetch(db, builder).await?;
+    // Fetch at most 2 rows: 1 to return, 1 to detect TooManyRows.
+    // Avoids loading the full result set when the caller expects exactly one row.
+    let limited = <crate::query::SelectBuilder<M> as Clone>::clone(builder).limit(2);
+    let rows = fetch_all(db, &limited).await?;
+    let mut rows: Vec<M> = rows
+        .iter()
+        .map(|r| M::from_row(r))
+        .collect::<Result<_, _>>()?;
     match rows.len() {
-        1 => Ok(rows
-            .into_iter()
-            .next()
-            .expect("len() == 1 guarantees one element")),
+        1 => Ok(rows.remove(0)),
         0 => Err(DbError::RecordNotFound),
         _ => Err(DbError::TooManyRows),
     }
@@ -414,12 +425,16 @@ pub async fn fetch_optional<M: Table + FromRow>(
     db: &impl Database,
     builder: &crate::query::SelectBuilder<M>,
 ) -> Result<Option<M>, DbError> {
-    let rows = fetch(db, builder).await?;
+    // Fetch at most 2 rows: 1 to return, 1 to detect TooManyRows.
+    let limited = <crate::query::SelectBuilder<M> as Clone>::clone(builder).limit(2);
+    let rows = fetch_all(db, &limited).await?;
+    let mut rows: Vec<M> = rows
+        .iter()
+        .map(|r| M::from_row(r))
+        .collect::<Result<_, _>>()?;
     match rows.len() {
         0 => Ok(None),
-        1 => Ok(Some(rows.into_iter().next().expect(
-            "len() == 1 guarantees one element",
-        ))),
+        1 => Ok(Some(rows.remove(0))),
         _ => Err(DbError::TooManyRows),
     }
 }
@@ -432,12 +447,18 @@ pub async fn insert<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        return db.execute(&q.sql, &q.params).await;
+        let timer = crate::telemetry::start_query("insert", M::table_name(), &q.sql, q.params.len());
+        let result = db.execute(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        return result;
     }
     #[cfg(not(feature = "postgres"))]
     {
         let (sql, params) = builder.build();
-        db.execute(&sql, &params).await
+        let timer = crate::telemetry::start_query("insert", M::table_name(), &sql, params.len());
+        let result = db.execute(&sql, &params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result
     }
 }
 
@@ -449,12 +470,18 @@ pub async fn insert_many<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        return db.execute(&q.sql, &q.params).await;
+        let timer = crate::telemetry::start_query("insert_many", M::table_name(), &q.sql, q.params.len());
+        let result = db.execute(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        return result;
     }
     #[cfg(not(feature = "postgres"))]
     {
         let (sql, params) = builder.build();
-        db.execute(&sql, &params).await
+        let timer = crate::telemetry::start_query("insert_many", M::table_name(), &sql, params.len());
+        let result = db.execute(&sql, &params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result
     }
 }
 
@@ -488,12 +515,18 @@ pub async fn update<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        return db.execute(&q.sql, &q.params).await;
+        let timer = crate::telemetry::start_query("update", M::table_name(), &q.sql, q.params.len());
+        let result = db.execute(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        return result;
     }
     #[cfg(not(feature = "postgres"))]
     {
         let (sql, params) = builder.build();
-        db.execute(&sql, &params).await
+        let timer = crate::telemetry::start_query("update", M::table_name(), &sql, params.len());
+        let result = db.execute(&sql, &params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result
     }
 }
 
@@ -516,12 +549,18 @@ pub async fn delete<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        return db.execute(&q.sql, &q.params).await;
+        let timer = crate::telemetry::start_query("delete", M::table_name(), &q.sql, q.params.len());
+        let result = db.execute(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        return result;
     }
     #[cfg(not(feature = "postgres"))]
     {
         let (sql, params) = builder.build();
-        db.execute(&sql, &params).await
+        let timer = crate::telemetry::start_query("delete", M::table_name(), &sql, params.len());
+        let result = db.execute(&sql, &params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result
     }
 }
 
@@ -547,7 +586,10 @@ pub async fn delete_returning<M: Table + FromRow>(
 /// let affected = raw_execute(db, "DELETE FROM sessions WHERE expires_at < ?", &[Value::Timestamptz(cutoff)]).await?;
 /// ```
 pub async fn raw_execute(db: &impl Database, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-    db.execute(sql, params).await
+    let timer = crate::telemetry::start_query("raw_execute", "raw", sql, params.len());
+    let result = db.execute(sql, params).await;
+    timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+    result
 }
 
 /// Execute a raw SQL SELECT and return untyped rows.
@@ -562,7 +604,10 @@ pub async fn raw_query(
     sql: &str,
     params: &[Value],
 ) -> Result<Vec<Row>, DbError> {
-    db.query(sql, params).await
+    let timer = crate::telemetry::start_query("raw_query", "raw", sql, params.len());
+    let result = db.query(sql, params).await;
+    timer.finish(result.as_ref().map(|r| r.len()).unwrap_or(0));
+    result
 }
 
 /// Execute a raw SQL SELECT and deserialize each row into `T`.
@@ -893,4 +938,129 @@ pub async fn delete_with_hooks<M: Table + crate::hooks::ModelHooks>(
         let (sql, params) = builder.build();
         db.execute(&sql, &params).await
     }
+}
+
+// ── Async lifecycle hooks ────────────────────────────────────────────
+
+/// Execute an INSERT with async before/after hooks.
+///
+/// Calls [`crate::AsyncModelHooks::before_insert`] first — a [`crate::HookError::Reject`]
+/// aborts without executing any SQL. On success, calls
+/// [`crate::AsyncModelHooks::after_insert`] with the rows-affected count.
+///
+/// # Example
+///
+/// ```ignore
+/// let affected = insert_with_async_hooks(&db, &mut user, |m| User::insert(m)).await?;
+/// ```
+pub async fn insert_with_async_hooks<M: Table + crate::hooks::AsyncModelHooks>(
+    db: &impl Database,
+    model: &mut M,
+    builder_fn: impl FnOnce(&M) -> crate::query::InsertBuilder<M>,
+) -> Result<u64, DbError> {
+    model.before_insert().await.map_err(DbError::from)?;
+
+    let builder = builder_fn(model);
+    #[cfg(feature = "postgres")]
+    let rows = {
+        let q = builder.build_pg();
+        let timer = crate::telemetry::start_query("insert", M::table_name(), &q.sql, q.params.len());
+        let result = db.execute(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result?
+    };
+    #[cfg(not(feature = "postgres"))]
+    let rows = {
+        let (sql, params) = builder.build();
+        let timer = crate::telemetry::start_query("insert", M::table_name(), &sql, params.len());
+        let result = db.execute(&sql, &params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result?
+    };
+
+    model.after_insert(rows).await.map_err(DbError::from)?;
+    Ok(rows)
+}
+
+/// Execute an UPDATE with async before/after hooks.
+///
+/// Calls [`crate::AsyncModelHooks::before_update`] first — a [`crate::HookError::Reject`]
+/// aborts without executing any SQL. On success, calls
+/// [`crate::AsyncModelHooks::after_update`].
+///
+/// # Example
+///
+/// ```ignore
+/// let affected = update_with_async_hooks(&db, &mut user, |m| {
+///     User::update().set(User::email, &m.email).filter(User::id.eq(m.id))
+/// }).await?;
+/// ```
+pub async fn update_with_async_hooks<M: Table + crate::hooks::AsyncModelHooks>(
+    db: &impl Database,
+    model: &mut M,
+    builder_fn: impl FnOnce(&M) -> crate::query::UpdateBuilder<M>,
+) -> Result<u64, DbError> {
+    model.before_update().await.map_err(DbError::from)?;
+
+    let builder = builder_fn(model);
+    #[cfg(feature = "postgres")]
+    let rows = {
+        let q = builder.build_pg();
+        let timer = crate::telemetry::start_query("update", M::table_name(), &q.sql, q.params.len());
+        let result = db.execute(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result?
+    };
+    #[cfg(not(feature = "postgres"))]
+    let rows = {
+        let (sql, params) = builder.build();
+        let timer = crate::telemetry::start_query("update", M::table_name(), &sql, params.len());
+        let result = db.execute(&sql, &params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result?
+    };
+
+    model.after_update(rows).await.map_err(DbError::from)?;
+    Ok(rows)
+}
+
+/// Execute a DELETE with async before/after hooks.
+///
+/// Calls [`crate::AsyncModelHooks::before_delete`] first — a [`crate::HookError::Reject`]
+/// aborts without executing any SQL. On success, calls
+/// [`crate::AsyncModelHooks::after_delete`].
+///
+/// # Example
+///
+/// ```ignore
+/// let affected = delete_with_async_hooks(
+///     &db, &user, &User::delete().filter(User::id.eq(user.id))
+/// ).await?;
+/// ```
+pub async fn delete_with_async_hooks<M: Table + crate::hooks::AsyncModelHooks>(
+    db: &impl Database,
+    model: &M,
+    builder: &crate::query::DeleteBuilder<M>,
+) -> Result<u64, DbError> {
+    model.before_delete().await.map_err(DbError::from)?;
+
+    #[cfg(feature = "postgres")]
+    let rows = {
+        let q = builder.build_pg();
+        let timer = crate::telemetry::start_query("delete", M::table_name(), &q.sql, q.params.len());
+        let result = db.execute(&q.sql, &q.params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result?
+    };
+    #[cfg(not(feature = "postgres"))]
+    let rows = {
+        let (sql, params) = builder.build();
+        let timer = crate::telemetry::start_query("delete", M::table_name(), &sql, params.len());
+        let result = db.execute(&sql, &params).await;
+        timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
+        result?
+    };
+
+    model.after_delete(rows).await.map_err(DbError::from)?;
+    Ok(rows)
 }

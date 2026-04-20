@@ -7,7 +7,6 @@ pub struct User {
     pub id: i64,
     #[column(unique)]
     pub email: String,
-    #[column(nullable)]
     pub role: Option<String>,
 }
 
@@ -18,7 +17,6 @@ pub struct Post {
     pub id: i64,
     pub user_id: i64,
     pub title: String,
-    #[column(nullable)]
     pub body: Option<String>,
 }
 

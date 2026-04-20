@@ -11,8 +11,22 @@ pub trait Table: Sized {
     /// Ordered list of column names (matches struct field order).
     fn column_names() -> &'static [&'static str];
 
-    /// Convert this instance into a list of `Value`s (same order as `column_names`).
-    fn into_values(&self) -> Vec<Value>;
+    /// Borrow this instance and produce an ordered list of `Value`s (same order as `column_names`).
+    ///
+    /// Prefer [`into_values`](Table::into_values) on insert paths where you already own the
+    /// value — it moves heap fields (`String`, `Vec<u8>`, etc.) instead of cloning them.
+    fn as_values(&self) -> Vec<Value>;
+
+    /// Consume this instance and produce an ordered list of `Value`s.
+    ///
+    /// Default implementation calls [`as_values`](Table::as_values). The `#[derive(Table)]`
+    /// macro overrides this with a move-based version that avoids cloning heap fields.
+    fn into_values(self) -> Vec<Value>
+    where
+        Self: Sized,
+    {
+        self.as_values()
+    }
 
     /// Rich column metadata (SQL types, constraints) derived from Rust types.
     ///
@@ -60,9 +74,9 @@ pub trait Table: Sized {
     fn writable_values(&self) -> Vec<Value> {
         let defs = Self::column_defs();
         if defs.is_empty() {
-            return self.into_values();
+            return self.as_values();
         }
-        let all_values = self.into_values();
+        let all_values = self.as_values();
         defs.iter()
             .zip(all_values)
             .filter(|(d, _)| d.computed.is_none() && d.timestamp_source != TimestampSource::Db)

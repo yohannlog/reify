@@ -7,7 +7,6 @@ use reify::{Table, Value};
 pub struct Order {
     #[column(primary_key)]
     pub id: i64,
-    #[column(nullable)]
     pub group: Option<String>,
     pub user: String,
     pub select: String,

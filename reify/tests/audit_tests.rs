@@ -86,7 +86,6 @@ pub struct AuditUser {
     pub id: i64,
     #[column(unique)]
     pub email: String,
-    #[column(nullable)]
     pub role: Option<String>,
 }
 
@@ -138,7 +137,7 @@ fn audit_column_defs_types() {
     assert_eq!(defs[2].sql_type, SqlType::Text);
     assert!(defs[2].nullable);
     assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
-    assert_eq!(defs[3].default, Some("NOW()".to_string()));
+    assert_eq!(defs[3].default, Some(reify::DefaultValue::Expr("NOW()")));
     assert_eq!(defs[4].sql_type, SqlType::Jsonb);
     assert!(!defs[4].nullable);
     assert_eq!(defs[5].sql_type, SqlType::Text);

@@ -291,10 +291,18 @@ where
 /// Keys are passed as bound parameters, but we still reject null bytes
 /// and excessively long strings as a defence-in-depth measure.
 #[cfg(feature = "postgres")]
-fn validate_json_key(key: &str) -> &str {
-    assert!(!key.contains('\0'), "JSON key must not contain null bytes");
-    assert!(key.len() <= 512, "JSON key too long (max 512 chars)");
-    key
+fn validate_json_key(key: &str) -> Result<&str, crate::db::DbError> {
+    if key.contains('\0') {
+        return Err(crate::db::DbError::Other(
+            "JSON key must not contain null bytes".into(),
+        ));
+    }
+    if key.len() > 512 {
+        return Err(crate::db::DbError::Other(
+            "JSON key too long (max 512 chars)".into(),
+        ));
+    }
+    Ok(key)
 }
 
 /// A JSONB single-key access expression: `column ->> $key`.
@@ -417,25 +425,30 @@ impl<M: 'static> Column<M, serde_json::Value> {
     /// The key is passed as a **bound parameter** — safe for user-supplied input.
     /// Returns a [`JsonExpr`] — chain `.eq()`, `.neq()`, `.is_null()`, etc.
     ///
+    /// Returns `None` if `key` contains null bytes or exceeds 512 characters.
+    ///
     /// ```ignore
-    /// User::metadata.json_get("role").eq("admin")
+    /// User::metadata.json_get("role")?.eq("admin")
     /// // → "metadata" ->> $1 = $2
     /// ```
-    pub fn json_get(&self, key: &str) -> JsonExpr {
-        JsonExpr {
+    pub fn json_get(&self, key: &str) -> Option<JsonExpr> {
+        Some(JsonExpr {
             column: self.name,
-            key: std::borrow::Cow::Owned(validate_json_key(key).to_owned()),
-        }
+            key: std::borrow::Cow::Owned(validate_json_key(key).ok()?.to_owned()),
+        })
     }
 
     /// Same as [`json_get`](Self::json_get) but takes a `&'static str`
     /// literal, avoiding the key allocation entirely. Prefer this when
     /// the key is known at compile time.
-    pub fn json_get_static(&self, key: &'static str) -> JsonExpr {
-        JsonExpr {
+    ///
+    /// Returns `None` if `key` contains null bytes or exceeds 512 characters
+    /// (in practice impossible for compile-time literals, but kept consistent).
+    pub fn json_get_static(&self, key: &'static str) -> Option<JsonExpr> {
+        Some(JsonExpr {
             column: self.name,
-            key: std::borrow::Cow::Borrowed(validate_json_key(key)),
-        }
+            key: std::borrow::Cow::Borrowed(validate_json_key(key).ok()?),
+        })
     }
 
     /// JSONB nested path access as text: `"column" #>> ARRAY[...]`.
