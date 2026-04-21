@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use crate::condition::Condition;
 #[cfg(feature = "postgres")]
 use crate::condition::PgCondition;
-use crate::query::{Expr, SelectBuilder};
+use crate::query::{Expr, Order, SelectBuilder};
 use crate::table::Table;
 use crate::value::IntoValue;
 
@@ -51,6 +51,16 @@ impl<M, T> Column<M, T> {
     /// `MAX(col)` aggregate expression.
     pub fn max_expr(&self) -> Expr {
         Expr::Max(self.name)
+    }
+
+    /// Ascending sort expression: `ORDER BY col ASC`.
+    pub fn asc(self) -> Order {
+        Order::Asc(self.name)
+    }
+
+    /// Descending sort expression: `ORDER BY col DESC`.
+    pub fn desc(self) -> Order {
+        Order::Desc(self.name)
     }
 }
 

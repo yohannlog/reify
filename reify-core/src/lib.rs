@@ -34,11 +34,17 @@ pub use condition::{AggregateCondition, Condition, LogicalOp};
 pub use query::rewrite_placeholders_pg;
 #[allow(deprecated)]
 pub use query::{
-    BuildError, DeleteBuilder, Dialect, Expr, InsertBuilder, InsertManyBuilder, JoinClause,
-    JoinKind, OnConflict, ParamLimitExceeded, SelectBuilder, UpdateBuilder, WithBuilder,
+    BuildError, DatePart, DeleteBuilder, Dialect, Expr, InsertBuilder, InsertManyBuilder,
+    JoinClause, JoinKind, OnConflict, ParamLimitExceeded, SelectBuilder, TrimWhere, UpdateBuilder,
+    WithBuilder,
 };
 
-pub use func::count_all;
+pub use func::{
+    count_all, day, hour, ltrim, ltrim_chars, minute, month, rtrim, rtrim_chars, second, trim,
+    trim_chars, year,
+};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub use func::variance;
 
 pub use relation::{Related, Relation, RelationType};
 pub use sql::{JoinFragment, OrderFragment, SqlFragment, ToSql};

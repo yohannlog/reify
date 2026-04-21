@@ -2,6 +2,7 @@ use super::select::SelectBuilder;
 use super::{BuildError, Dialect, trace_query};
 #[cfg(feature = "postgres")]
 use super::{rewrite_placeholders_pg, write_returning};
+use crate::column::Column;
 use crate::condition::Condition;
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};
@@ -52,6 +53,13 @@ impl<M: Table> DeleteBuilder<M> {
     #[cfg(feature = "postgres")]
     pub fn returning(mut self, cols: &[&'static str]) -> Self {
         self.returning = Some(cols.to_vec());
+        self
+    }
+
+    /// Append a `RETURNING` clause using typed [`Column`] references (PostgreSQL only).
+    #[cfg(feature = "postgres")]
+    pub fn returning_cols<T>(mut self, cols: &[Column<M, T>]) -> Self {
+        self.returning = Some(cols.iter().map(|c| c.name).collect());
         self
     }
 

@@ -194,6 +194,22 @@ fn insert_build() {
     assert_eq!(params.len(), 3);
 }
 
+#[cfg(feature = "postgres")]
+#[test]
+fn insert_returning_cols_postgres() {
+    let user = User {
+        id: 0,
+        email: "alice@example.com".into(),
+        role: Some("member".into()),
+    };
+    let (sql, params) = User::insert(&user).returning_cols(&[User::id]).build();
+    assert_eq!(
+        sql,
+        "INSERT INTO \"users\" (\"id\", \"email\", \"role\") VALUES (?, ?, ?) RETURNING \"id\""
+    );
+    assert_eq!(params.len(), 3);
+}
+
 // ── UPDATE builder ──────────────────────────────────────────────────
 
 #[test]
@@ -212,6 +228,18 @@ fn update_without_where_panics() {
     User::update().set(User::role, "admin").build();
 }
 
+#[cfg(feature = "postgres")]
+#[test]
+fn update_returning_cols_postgres() {
+    let (sql, params) = User::update()
+        .set(User::role, "admin")
+        .filter(User::id.eq(42i64))
+        .returning_cols(&[User::id])
+        .build();
+    assert_eq!(sql, "UPDATE \"users\" SET \"role\" = ? WHERE \"id\" = ? RETURNING \"id\"");
+    assert_eq!(params, vec![Value::String("admin".into()), Value::I64(42)]);
+}
+
 // ── DELETE builder ──────────────────────────────────────────────────
 
 #[test]
@@ -225,6 +253,17 @@ fn delete_build() {
 #[should_panic(expected = "DELETE without WHERE is forbidden")]
 fn delete_without_where_panics() {
     User::delete().build();
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn delete_returning_cols_postgres() {
+    let (sql, params) = User::delete()
+        .filter(User::id.eq(42i64))
+        .returning_cols(&[User::id])
+        .build();
+    assert_eq!(sql, "DELETE FROM \"users\" WHERE \"id\" = ? RETURNING \"id\"");
+    assert_eq!(params, vec![Value::I64(42)]);
 }
 
 // ── try_build / unfiltered ──────────────────────────────────────────

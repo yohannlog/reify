@@ -29,108 +29,100 @@ impl SavepointCounter {
 
 // ── Quote-aware SQL rewriting ───────────────────────────────────────
 
-/// Scan `sql` and invoke `on_code(byte, output)` for every byte that is part
-/// of ordinary SQL code (i.e. *not* inside a `'single-quoted'` string
-/// literal), forwarding string-literal bytes verbatim.
+/// Copy a single-quoted SQL string literal from `bytes` starting at `i` into
+/// `out`, honouring `''` escapes. Returns the index after the closing quote.
 ///
-/// Used by the MySQL adapter to rewrite `$N → ?` and `"ident" → `` `ident` ``
-/// without corrupting literals like `'$1'` or `'"abc"'`.
-///
-/// PostgreSQL-style `E'…'` escape strings and `$tag$…$tag$` dollar-quoted
-/// strings are not supported here because the MySQL adapter will never see
-/// them — `build_pg()` only emits plain single-quoted string literals.
-fn scan_with_string_awareness<F>(sql: &str, mut on_code: F) -> String
-where
-    F: FnMut(&str, &mut String, &mut std::str::Chars<'_>),
-{
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars();
-    while let Some(ch) = chars.clone().next() {
-        if ch == '\'' {
-            // Copy the string literal verbatim, honouring `''` escapes.
-            chars.next();
-            out.push('\'');
-            loop {
-                match chars.next() {
-                    None => return out,
-                    Some('\'') => {
-                        // `''` inside a string literal is an escaped quote.
-                        if chars.clone().next() == Some('\'') {
-                            chars.next();
-                            out.push_str("''");
-                        } else {
-                            out.push('\'');
-                            break;
-                        }
-                    }
-                    Some(other) => out.push(other),
-                }
+/// Panics if `i` does not point to a `'` byte.
+fn copy_string_literal(bytes: &[u8], mut i: usize, out: &mut String) -> usize {
+    debug_assert!(bytes[i] == b'\'');
+    out.push('\'');
+    i += 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        out.push(b as char);
+        if b == b'\'' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'\'' {
+                out.push('\'');
+                i += 1;
+            } else {
+                break; // end of literal
             }
         } else {
-            // Slice from the current position of `chars` and let the callback
-            // decide how many chars to consume via its own `Chars` iterator.
-            let rest = chars.as_str();
-            on_code(rest, &mut out, &mut chars);
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Rewrite PostgreSQL-style `$N` placeholders to MySQL/SQLite `?`
+/// placeholders, leaving `'…'` string literals untouched.
+///
+/// Operates on raw bytes: all characters we care about (`$`, `'`, digits and
+/// `?`) are ASCII, so byte-level scanning is safe and avoids the overhead
+/// of `chars()` / UTF-8 decoding.
+pub fn rewrite_placeholders_to_question(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i = copy_string_literal(bytes, i, &mut out);
+        } else if b == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            // consume `$` + digits
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            out.push('?');
+        } else {
+            out.push(b as char);
+            i += 1;
         }
     }
     out
 }
 
-/// Rewrite PostgreSQL-style `$N` placeholders to MySQL/SQLite `?`
-/// placeholders, leaving `'…'` string literals untouched.
-pub fn rewrite_placeholders_to_question(sql: &str) -> String {
-    scan_with_string_awareness(sql, |rest, out, chars| {
-        let mut it = rest.chars();
-        let ch = it.next().unwrap();
-        if ch == '$' && it.clone().next().is_some_and(|c| c.is_ascii_digit()) {
-            // consume `$` + digits
-            chars.next();
-            while let Some(c) = chars.clone().next() {
-                if c.is_ascii_digit() {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            out.push('?');
-        } else {
-            chars.next();
-            out.push(ch);
-        }
-    })
-}
-
 /// Rewrite ANSI-style `"ident"` double-quoted identifiers to MySQL backtick
 /// style `` `ident` ``. Single-quoted string literals are left untouched, so
 /// a literal like `'"abc"'` is preserved intact.
+///
+/// Escaped double quotes (`""`) inside an identifier become a single `"`
+/// inside backticks.
 pub fn rewrite_double_quoted_idents_to_backticks(sql: &str) -> String {
-    scan_with_string_awareness(sql, |rest, out, chars| {
-        let mut it = rest.chars();
-        let ch = it.next().unwrap();
-        if ch == '"' {
-            chars.next();
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i = copy_string_literal(bytes, i, &mut out);
+        } else if b == b'"' {
             out.push('`');
-            loop {
-                match chars.next() {
-                    None => break,
-                    Some('"') => {
-                        // `""` inside an identifier is an escaped quote.
-                        if chars.clone().next() == Some('"') {
-                            chars.next();
-                            out.push('"');
-                        } else {
-                            out.push('`');
-                            break;
-                        }
+            i += 1;
+            while i < bytes.len() {
+                let b2 = bytes[i];
+                if b2 == b'"' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'"' {
+                        out.push('"');
+                        i += 1;
+                    } else {
+                        out.push('`');
+                        break;
                     }
-                    Some(inner) => out.push(inner),
+                } else {
+                    out.push(b2 as char);
+                    i += 1;
                 }
             }
         } else {
-            chars.next();
-            out.push(ch);
+            out.push(b as char);
+            i += 1;
         }
-    })
+    }
+    out
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

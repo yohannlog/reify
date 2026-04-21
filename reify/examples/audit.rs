@@ -63,8 +63,8 @@
 use std::sync::{Arc, Mutex};
 
 use reify::{
-    ActorId, AuditContext, Auditable, Database, DbError, MigrationRunner, Row, TransactionFn,
-    Value, audit::verify_audit_row,
+    audit::verify_audit_row, ActorId, AuditContext, Database, DbError, MigrationRunner, Row,
+    TransactionFn, Value,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────

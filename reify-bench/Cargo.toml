@@ -21,3 +21,10 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "bytecount"
+harness = false

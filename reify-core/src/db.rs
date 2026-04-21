@@ -5,15 +5,18 @@ use crate::value::Value;
 
 /// A single row returned by a query.
 ///
-/// Column lookup by name is O(1) via an internal index map built lazily on
-/// the first call to [`get`](Row::get). Positional access via
-/// [`get_idx`](Row::get_idx) is always O(1).
+/// Column lookup by name uses a compact `(hash, index)` vector built lazily
+/// on the first call to [`get`](Row::get). This avoids the ~56-byte
+/// `HashMap` overhead per row and eliminates `String` clones of column
+/// names. Positional access via [`get_idx`](Row::get_idx) is always O(1).
 #[derive(Debug, Clone)]
 pub struct Row {
     columns: Vec<String>,
     values: Vec<Value>,
-    /// Lazily-built column-name → index map for O(1) named lookups.
-    index: std::sync::OnceLock<std::collections::HashMap<String, usize>>,
+    /// Lazily-built compact index: `(fnv1a_hash, column_index)` pairs.
+    /// Scanning this `Vec` is cache-friendly and avoids the per-row `HashMap`
+    /// allocation. Hash collisions are resolved by checking `columns`.
+    index: std::sync::OnceLock<Vec<(u64, usize)>>,
 }
 
 impl Row {
@@ -25,16 +28,30 @@ impl Row {
         }
     }
 
-    /// Get a value by column name (O(1) after the first call).
+    /// Get a value by column name.
+    ///
+    /// The first call builds a compact hash index; subsequent calls scan it
+    /// linearly. For the small number of columns typical in a result row,
+    /// this is comparable to `HashMap` lookup while using far less memory.
     pub fn get(&self, column: &str) -> Option<&Value> {
-        let idx_map = self.index.get_or_init(|| {
+        let idx = self.index.get_or_init(|| {
             self.columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (c.clone(), i))
+                .map(|(i, c)| (fnv1a_64(c.as_bytes()), i))
                 .collect()
         });
-        idx_map.get(column).and_then(|&i| self.values.get(i))
+        let h = fnv1a_64(column.as_bytes());
+        for &(hh, i) in idx {
+            if hh == h {
+                if let Some(c) = self.columns.get(i) {
+                    if c == column {
+                        return self.values.get(i);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Get a value by column index (always O(1)).
@@ -60,6 +77,19 @@ impl Row {
             _ => None,
         }
     }
+}
+
+// ── Compact hash helper ───────────────────────────────────────────
+
+/// Fast FNV-1a 64-bit hash for small strings (column names).
+#[inline]
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 // ── FromRow trait ───────────────────────────────────────────────────

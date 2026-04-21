@@ -81,7 +81,7 @@ impl PostgresDb {
 
 /// Wrapper to implement `ToSql` for our `Value` type.
 #[derive(Debug)]
-struct PgValue<'a>(&'a Value);
+pub(crate) struct PgValue<'a>(&'a Value);
 
 impl PgToSql for PgValue<'_> {
     fn to_sql(
@@ -520,7 +520,7 @@ fn pg_column_to_value(
 
 /// Map a `tokio_postgres::Error` to a `DbError`, promoting constraint
 /// violations (SQLSTATE class 23) to `DbError::Constraint`.
-fn pg_err(e: tokio_postgres::Error) -> DbError {
+pub(crate) fn pg_err(e: tokio_postgres::Error) -> DbError {
     use reify_core::db::sqlstate;
     if let Some(db_err) = e.as_db_error() {
         let code = db_err.code().code().to_owned();
@@ -535,7 +535,7 @@ fn pg_err(e: tokio_postgres::Error) -> DbError {
 }
 
 /// Acquire a pooled connection, mapping pool errors to `DbError`.
-async fn get_conn(pool: &Pool) -> Result<deadpool_postgres::Object, DbError> {
+pub(crate) async fn get_conn(pool: &Pool) -> Result<deadpool_postgres::Object, DbError> {
     pool.get()
         .await
         .map_err(|e| DbError::Connection(e.to_string()))
@@ -755,3 +755,5 @@ impl Database for PgTransaction {
         }
     }
 }
+
+mod copy;

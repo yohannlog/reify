@@ -28,13 +28,21 @@ pub fn qi(name: &str) -> String {
 pub fn quote_ident(name: &str, dialect: Dialect) -> String {
     match dialect {
         Dialect::Mysql => {
-            let escaped = name.replace('`', "``");
-            format!("`{escaped}`")
+            // Avoid the `replace` allocation when no backtick is present.
+            if name.contains('`') {
+                format!("`{}`", name.replace('`', "``"))
+            } else {
+                format!("`{name}`")
+            }
         }
         // PostgreSQL, SQLite, Generic all use double-quote quoting.
         _ => {
-            let escaped = name.replace('"', "\"\"");
-            format!("\"{escaped}\"")
+            // Avoid the `replace` allocation when no double-quote is present.
+            if name.contains('"') {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            } else {
+                format!("\"{name}\"")
+            }
         }
     }
 }
