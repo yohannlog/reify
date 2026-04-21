@@ -7,7 +7,6 @@ pub(crate) struct ColumnAttrs {
     pub primary_key: bool,
     pub auto_increment: bool,
     pub unique: bool,
-    pub nullable: bool,
     pub index: bool,
     pub default: Option<String>,
     pub sql_type: Option<String>,
@@ -40,8 +39,6 @@ pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs
                 result.auto_increment = true;
             } else if meta.path.is_ident("unique") {
                 result.unique = true;
-            } else if meta.path.is_ident("nullable") {
-                result.nullable = true;
             } else if meta.path.is_ident("index") {
                 result.index = true;
             } else if meta.path.is_ident("default") {
@@ -163,7 +160,7 @@ ip_v4, ip_v6, custom, nested, skip_on_field_errors",
             } else {
                 return Err(meta.error(format!(
                     "unknown `column` attribute `{}`; expected one of: \
-primary_key, auto_increment, unique, nullable, index, default, sql_type, \
+primary_key, auto_increment, unique, index, default, sql_type, \
 computed, computed_rust, creation_timestamp, update_timestamp, source, \
 check, references, on_delete, on_update, validate",
                     meta.path

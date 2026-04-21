@@ -25,6 +25,7 @@ impl std::fmt::Display for ParamLimitExceeded {
 }
 
 impl std::error::Error for ParamLimitExceeded {}
+use crate::column::Column;
 use crate::condition::Condition;
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};
@@ -53,6 +54,8 @@ pub struct InsertBuilder<M: Table> {
     on_conflict: Option<OnConflict>,
     #[cfg(feature = "postgres")]
     returning: Option<Vec<&'static str>>,
+    #[cfg(feature = "postgres18")]
+    returning_old_new: Option<super::ReturningOldNew>,
     _model: PhantomData<M>,
 }
 
@@ -66,6 +69,8 @@ impl<M: Table> InsertBuilder<M> {
             on_conflict: None,
             #[cfg(feature = "postgres")]
             returning: None,
+            #[cfg(feature = "postgres18")]
+            returning_old_new: None,
             _model: PhantomData,
         }
     }
@@ -79,6 +84,22 @@ impl<M: Table> InsertBuilder<M> {
     #[cfg(feature = "postgres")]
     pub fn returning(mut self, cols: &[&'static str]) -> Self {
         self.returning = Some(cols.to_vec());
+        self
+    }
+
+    /// Append a `RETURNING` clause using typed [`Column`] references (PostgreSQL only).
+    #[cfg(feature = "postgres")]
+    pub fn returning_cols<T>(mut self, cols: &[Column<M, T>]) -> Self {
+        self.returning = Some(cols.iter().map(|c| c.name).collect());
+        self
+    }
+
+    /// Append `RETURNING new.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns the inserted row state (INSERT has no `old` state).
+    #[cfg(feature = "postgres18")]
+    pub fn returning_new_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::New);
         self
     }
 
@@ -113,7 +134,7 @@ impl<M: Table> InsertBuilder<M> {
         self.build_with_dialect(Dialect::Generic)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
     ///
     /// Uses `build_with_dialect(Dialect::Postgres)` so that `ON CONFLICT … DO UPDATE SET`
     /// syntax is generated correctly, then rewrites `?` → `$N` once at build time.
@@ -154,6 +175,11 @@ impl<M: Table> InsertBuilder<M> {
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
 
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
+
         trace_query("insert", M::table_name(), &sql, &self.values);
         (sql, self.values.clone())
     }
@@ -179,6 +205,20 @@ impl<M: Table> InsertBuilder<M> {
     {
         crate::db::insert_returning(db, self).await
     }
+
+    /// Execute this INSERT … RETURNING new.* and return `OldNew<M>` results (PostgreSQL 18+).
+    ///
+    /// Requires `.returning_new_all()` to be called first.
+    #[cfg(feature = "postgres18")]
+    pub async fn fetch_new(
+        &self,
+        db: &impl crate::db::Database,
+    ) -> Result<Vec<crate::db::OldNew<M>>, crate::db::DbError>
+    where
+        M: crate::db::FromRowPositional,
+    {
+        crate::db::insert_returning_new(db, self).await
+    }
 }
 
 // ── InsertManyBuilder ────────────────────────────────────────────────
@@ -192,6 +232,8 @@ pub struct InsertManyBuilder<M: Table> {
     on_conflict: Option<OnConflict>,
     #[cfg(feature = "postgres")]
     returning: Option<Vec<&'static str>>,
+    #[cfg(feature = "postgres18")]
+    returning_old_new: Option<super::ReturningOldNew>,
     _model: PhantomData<M>,
 }
 
@@ -218,6 +260,8 @@ impl<M: Table> InsertManyBuilder<M> {
             on_conflict: None,
             #[cfg(feature = "postgres")]
             returning: None,
+            #[cfg(feature = "postgres18")]
+            returning_old_new: None,
             _model: PhantomData,
         })
     }
@@ -226,6 +270,22 @@ impl<M: Table> InsertManyBuilder<M> {
     #[cfg(feature = "postgres")]
     pub fn returning(mut self, cols: &[&'static str]) -> Self {
         self.returning = Some(cols.to_vec());
+        self
+    }
+
+    /// Append `RETURNING new.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns the inserted row states (INSERT has no `old` state).
+    #[cfg(feature = "postgres18")]
+    pub fn returning_new_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::New);
+        self
+    }
+
+    /// Append a `RETURNING` clause using typed [`Column`] references (PostgreSQL only).
+    #[cfg(feature = "postgres")]
+    pub fn returning_cols<T>(mut self, cols: &[Column<M, T>]) -> Self {
+        self.returning = Some(cols.iter().map(|c| c.name).collect());
         self
     }
 
@@ -253,7 +313,7 @@ impl<M: Table> InsertManyBuilder<M> {
         self.build_with_dialect(Dialect::Generic)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders and PostgreSQL upsert syntax (PostgreSQL only).
     ///
     /// Uses `build_with_dialect(Dialect::Postgres)` so that `ON CONFLICT … DO UPDATE SET`
     /// syntax is generated correctly, then rewrites `?` → `$N` once at build time.
@@ -278,7 +338,7 @@ impl<M: Table> InsertManyBuilder<M> {
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
-    /// Build SQL for a specific [`Dialect`], returning [`ParamLimitExceeded`]
+    /// Build SQL for a specific [`Dialect`], returning [`crate::ParamLimitExceeded`]
     /// if the bind-parameter limit would be violated.
     #[allow(unused_mut)]
     pub fn try_build_with_dialect(
@@ -335,6 +395,11 @@ impl<M: Table> InsertManyBuilder<M> {
 
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
+
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
 
         trace_query("insert_many", M::table_name(), &sql, &params);
         Ok((sql, params))
@@ -393,6 +458,11 @@ impl<M: Table> InsertManyBuilder<M> {
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
 
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
+
         trace_query("insert_many_chunk", M::table_name(), &sql, &params);
         (sql, params)
     }
@@ -425,13 +495,49 @@ impl<M: Table> InsertManyBuilder<M> {
     /// Build chunked queries with PostgreSQL `$N` placeholders.
     ///
     /// Each chunk respects the 65 535 parameter limit. Returns one
-    /// [`BuiltQuery`](crate::built_query::BuiltQuery) per chunk.
+    /// [`crate::BuiltQuery`] per chunk.
+    ///
+    /// # Performance note
+    ///
+    /// All full-size chunks share the same SQL shape, so only the first
+    /// (and the last, if it differs in row count) require a placeholder
+    /// rewrite scan. The rest reuse the first chunk's rewritten SQL directly.
     #[cfg(feature = "postgres")]
     pub fn build_chunked_pg(&self) -> Vec<crate::built_query::BuiltQuery> {
-        self.build_chunked(Dialect::Postgres)
+        let chunks = self.build_chunked(Dialect::Postgres);
+        if chunks.is_empty() {
+            return vec![];
+        }
+
+        // Single chunk — simple path.
+        if chunks.len() == 1 {
+            let (sql, params) = chunks.into_iter().next().unwrap();
+            let pg_sql = rewrite_placeholders_pg(&sql);
+            return vec![crate::built_query::BuiltQuery::new(pg_sql, params)];
+        }
+
+        let total_rows = self.rows.len();
+        let chunk_size = self.rows_per_chunk(Dialect::Postgres);
+        let last_chunk_rows = total_rows % chunk_size;
+        // If evenly divisible, every chunk is full-size; otherwise the last one is partial.
+        let last_is_partial = last_chunk_rows != 0;
+
+        // Rewrite the first chunk once — all full-size chunks share this SQL.
+        let first_pg_sql = rewrite_placeholders_pg(&chunks[0].0);
+        let chunks_len = chunks.len();
+
+        chunks
             .into_iter()
-            .map(|(sql, params)| {
-                let pg_sql = rewrite_placeholders_pg(&sql);
+            .enumerate()
+            .map(|(idx, (sql, params))| {
+                let is_last = idx == chunks_len - 1;
+                let pg_sql = if is_last && last_is_partial {
+                    // Last chunk has fewer rows (and placeholders) — needs its own rewrite.
+                    rewrite_placeholders_pg(&sql)
+                } else {
+                    // Full-size chunk — identical SQL shape as the first chunk.
+                    first_pg_sql.clone()
+                };
                 crate::built_query::BuiltQuery::new(pg_sql, params)
             })
             .collect()
@@ -457,6 +563,20 @@ impl<M: Table> InsertManyBuilder<M> {
         M: crate::db::FromRow,
     {
         crate::db::insert_many_returning(db, self).await
+    }
+
+    /// Execute this batch INSERT … RETURNING new.* and return `OldNew<M>` results (PostgreSQL 18+).
+    ///
+    /// Requires `.returning_new_all()` to be called first.
+    #[cfg(feature = "postgres18")]
+    pub async fn fetch_new(
+        &self,
+        db: &impl crate::db::Database,
+    ) -> Result<Vec<crate::db::OldNew<M>>, crate::db::DbError>
+    where
+        M: crate::db::FromRowPositional,
+    {
+        crate::db::insert_many_returning_new(db, self).await
     }
 
     /// Execute a batch INSERT, automatically chunking to stay within the
@@ -538,7 +658,7 @@ mod tests {
         fn column_names() -> &'static [&'static str] {
             &["a", "b", "c"]
         }
-        fn into_values(&self) -> Vec<Value> {
+        fn as_values(&self) -> Vec<Value> {
             vec![Value::I32(self.a), Value::I32(self.b), Value::I32(self.c)]
         }
         fn column_defs() -> Vec<ColumnDef> {
@@ -621,5 +741,111 @@ mod tests {
         assert_eq!(builder.rows_per_chunk(Dialect::Postgres), 21_845);
         // 3 cols → 32_766 / 3 = 10_922 rows per chunk for Generic
         assert_eq!(builder.rows_per_chunk(Dialect::Generic), 10_922);
+    }
+
+    // ── build_chunked_pg tests (PostgreSQL-only) ────────────────────
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn build_chunked_pg_single_chunk() {
+        let rows = make_rows(5);
+        let builder = InsertManyBuilder::new(&rows);
+        let chunks = builder.build_chunked_pg();
+
+        assert_eq!(chunks.len(), 1);
+        let q = &chunks[0];
+        // 5 rows × 3 cols = 15 params → $1 .. $15
+        assert!(
+            q.sql.contains("$1"),
+            "SQL should contain $1 placeholders: {}",
+            q.sql
+        );
+        assert!(
+            q.sql.contains("$15"),
+            "SQL should contain $15 placeholders: {}",
+            q.sql
+        );
+        assert!(
+            !q.sql.contains('?'),
+            "SQL should not contain ? placeholders"
+        );
+        assert_eq!(q.params.len(), 15);
+    }
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn build_chunked_pg_even_chunks_have_identical_sql() {
+        // 2 full chunks: 21_845 × 2 = 43_690 rows
+        let rows = make_rows(21_845 * 2);
+        let builder = InsertManyBuilder::new(&rows);
+        let chunks = builder.build_chunked_pg();
+
+        assert_eq!(chunks.len(), 2);
+        // Both chunks are full-size → same SQL shape, same placeholder count
+        assert_eq!(chunks[0].sql, chunks[1].sql);
+
+        // Each chunk starts at $1 (independent queries)
+        assert!(chunks[0].sql.contains("$1"));
+        assert!(chunks[1].sql.contains("$1"));
+
+        // 21_845 rows × 3 cols = 65_535 params per chunk
+        assert_eq!(chunks[0].params.len(), 65_535);
+        assert_eq!(chunks[1].params.len(), 65_535);
+    }
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn build_chunked_pg_partial_last_chunk() {
+        // 2 full chunks + 1 partial row: 21_845 × 2 + 1 = 43_691 rows
+        let rows = make_rows(21_845 * 2 + 1);
+        let builder = InsertManyBuilder::new(&rows);
+        let chunks = builder.build_chunked_pg();
+
+        assert_eq!(chunks.len(), 3);
+
+        // First two chunks are full-size → identical SQL
+        assert_eq!(chunks[0].sql, chunks[1].sql);
+
+        // Last chunk is partial (1 row × 3 cols = 3 params) → different SQL
+        assert_ne!(chunks[0].sql, chunks[2].sql);
+
+        // Verify placeholder counts by scanning SQL
+        let count_dollars = |s: &str| s.matches("$").count();
+        // Full chunks: 65_535 placeholders → 65_535 "$" occurrences
+        assert_eq!(count_dollars(&chunks[0].sql), 65_535);
+        assert_eq!(count_dollars(&chunks[1].sql), 65_535);
+        // Partial chunk: only 3 placeholders
+        assert_eq!(count_dollars(&chunks[2].sql), 3);
+
+        // Params count
+        assert_eq!(chunks[0].params.len(), 65_535);
+        assert_eq!(chunks[1].params.len(), 65_535);
+        assert_eq!(chunks[2].params.len(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn build_chunked_pg_params_partitioned_correctly() {
+        // 3 chunks: 2 full + 1 partial (5 rows)
+        let rows = make_rows(21_845 * 2 + 5);
+        let builder = InsertManyBuilder::new(&rows);
+        let chunks = builder.build_chunked_pg();
+
+        assert_eq!(chunks.len(), 3);
+
+        // First chunk params: rows 0..21_845
+        assert_eq!(chunks[0].params[0], Value::I32(0));
+        assert_eq!(chunks[0].params[1], Value::I32(0));
+        assert_eq!(chunks[0].params[2], Value::I32(0));
+
+        // Second chunk params: rows 21_845..43_690
+        assert_eq!(chunks[1].params[0], Value::I32(21_845));
+        assert_eq!(chunks[1].params[1], Value::I32(21_845 * 10));
+        assert_eq!(chunks[1].params[2], Value::I32(21_845 * 100));
+
+        // Third chunk params: rows 43_690..43_695
+        assert_eq!(chunks[2].params[0], Value::I32(43_690));
+        assert_eq!(chunks[2].params[1], Value::I32(43_690 * 10));
+        assert_eq!(chunks[2].params[2], Value::I32(43_690 * 100));
     }
 }

@@ -2,6 +2,7 @@ use super::select::SelectBuilder;
 use super::{BuildError, Dialect, trace_query};
 #[cfg(feature = "postgres")]
 use super::{rewrite_placeholders_pg, write_returning};
+use crate::column::Column;
 use crate::condition::Condition;
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};
@@ -31,6 +32,8 @@ pub struct DeleteBuilder<M: Table> {
     unfiltered: bool,
     #[cfg(feature = "postgres")]
     returning: Option<Vec<&'static str>>,
+    #[cfg(feature = "postgres18")]
+    returning_old_new: Option<super::ReturningOldNew>,
     _model: PhantomData<M>,
 }
 
@@ -44,6 +47,8 @@ impl<M: Table> DeleteBuilder<M> {
             unfiltered: false,
             #[cfg(feature = "postgres")]
             returning: None,
+            #[cfg(feature = "postgres18")]
+            returning_old_new: None,
             _model: PhantomData,
         }
     }
@@ -52,6 +57,22 @@ impl<M: Table> DeleteBuilder<M> {
     #[cfg(feature = "postgres")]
     pub fn returning(mut self, cols: &[&'static str]) -> Self {
         self.returning = Some(cols.to_vec());
+        self
+    }
+
+    /// Append a `RETURNING` clause using typed [`Column`] references (PostgreSQL only).
+    #[cfg(feature = "postgres")]
+    pub fn returning_cols<T>(mut self, cols: &[Column<M, T>]) -> Self {
+        self.returning = Some(cols.iter().map(|c| c.name).collect());
+        self
+    }
+
+    /// Append `RETURNING old.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns the deleted row state.
+    #[cfg(feature = "postgres18")]
+    pub fn returning_old_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::Old);
         self
     }
 
@@ -128,11 +149,16 @@ impl<M: Table> DeleteBuilder<M> {
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
 
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
+
         trace_query("delete", M::table_name(), &sql, &params);
         Ok((sql, params))
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
     ///
     /// # Panics
     ///
@@ -144,7 +170,7 @@ impl<M: Table> DeleteBuilder<M> {
         crate::built_query::BuiltQuery::new(pg_sql, params)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
     ///
     /// Returns `Err(BuildError::MissingFilter)` if no `.filter()` or `.unfiltered()` has been called.
     #[cfg(feature = "postgres")]
@@ -180,5 +206,19 @@ impl<M: Table> DeleteBuilder<M> {
         M: crate::db::FromRow,
     {
         crate::db::delete_returning(db, self).await
+    }
+
+    /// Execute this DELETE … RETURNING old.* and return `OldNew<M>` results (PostgreSQL 18+).
+    ///
+    /// Requires `.returning_old_all()` to be called first.
+    #[cfg(feature = "postgres18")]
+    pub async fn fetch_old(
+        &self,
+        db: &impl crate::db::Database,
+    ) -> Result<Vec<crate::db::OldNew<M>>, crate::db::DbError>
+    where
+        M: crate::db::FromRowPositional,
+    {
+        crate::db::delete_returning_old(db, self).await
     }
 }

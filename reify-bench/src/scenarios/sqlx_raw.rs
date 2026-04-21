@@ -83,7 +83,12 @@ async fn bench_insert_batch(rows: usize, iters: usize) -> Duration {
         }
         let mut q = sqlx::query(&sql);
         for r in &data {
-            q = q.bind(r.id).bind(&r.name).bind(&r.email).bind(r.score).bind(r.active);
+            q = q
+                .bind(r.id)
+                .bind(&r.name)
+                .bind(&r.email)
+                .bind(r.score)
+                .bind(r.active);
         }
         q.execute(&pool).await.unwrap();
     })

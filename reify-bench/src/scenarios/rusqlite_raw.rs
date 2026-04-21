@@ -138,8 +138,11 @@ async fn bench_update(rows: usize, iters: usize) -> Duration {
     time_iters(iters, || async {
         let c = fresh_conn();
         seed(&c, &data);
-        c.execute("UPDATE users SET score = ? WHERE active = ?", params![999, 1])
-            .unwrap();
+        c.execute(
+            "UPDATE users SET score = ? WHERE active = ?",
+            params![999, 1],
+        )
+        .unwrap();
     })
     .await
 }

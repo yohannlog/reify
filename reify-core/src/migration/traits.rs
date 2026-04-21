@@ -63,4 +63,21 @@ pub trait Migration: Send + Sync {
     fn is_reversible(&self) -> bool {
         true
     }
+
+    /// Maximum wall-clock time allowed for this migration's transaction.
+    ///
+    /// When `Some(duration)`, the runner wraps the transaction in
+    /// `tokio::time::timeout`. If the deadline is exceeded the transaction is
+    /// rolled back, no tracking-table row is written (the migration remains
+    /// pending), and `MigrationError::TimedOut` is returned.
+    ///
+    /// Use this for migrations that touch large tables and could lock rows for
+    /// an unacceptable duration in production. A timed-out migration can be
+    /// retried after the root cause (missing index, table size, etc.) is
+    /// addressed.
+    ///
+    /// Defaults to `None` — no timeout.
+    fn timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
 }

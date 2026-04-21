@@ -25,6 +25,16 @@ pub enum MigrationError {
         /// Timestamp when the lock was acquired, if available.
         locked_at: Option<String>,
     },
+    /// A migration exceeded its declared timeout and was aborted.
+    ///
+    /// The transaction was rolled back by the database. No tracking-table row
+    /// was inserted, so the migration is still pending and can be retried.
+    TimedOut {
+        /// Migration version string.
+        version: String,
+        /// The timeout that was exceeded, in seconds.
+        timeout_secs: u64,
+    },
     /// Generic migration error.
     Other(String),
 }
@@ -63,6 +73,14 @@ impl std::fmt::Display for MigrationError {
                 ),
                 None => write!(f, "migration lock is already held by another process"),
             },
+            MigrationError::TimedOut {
+                version,
+                timeout_secs,
+            } => write!(
+                f,
+                "migration '{version}' timed out after {timeout_secs}s — \
+                 transaction rolled back, migration is still pending"
+            ),
             MigrationError::Other(msg) => write!(f, "migration error: {msg}"),
         }
     }

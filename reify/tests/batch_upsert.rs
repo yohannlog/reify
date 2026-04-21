@@ -249,3 +249,16 @@ fn insert_many_upsert_returning_postgres() {
          ON CONFLICT (\"email\") DO UPDATE SET \"name\" = EXCLUDED.\"name\" RETURNING \"id\""
     );
 }
+
+#[cfg(feature = "postgres")]
+#[test]
+fn insert_many_returning_cols_postgres() {
+    let (sql, params) = User::insert_many(&[alice(), bob()])
+        .returning_cols(&[User::id])
+        .build_with_dialect(Dialect::Postgres);
+    assert_eq!(
+        sql,
+        "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (?, ?, ?), (?, ?, ?) RETURNING \"id\""
+    );
+    assert_eq!(params.len(), 6);
+}

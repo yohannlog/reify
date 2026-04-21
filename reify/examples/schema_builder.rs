@@ -87,7 +87,7 @@ fn main() {
             attrs.push("NULLABLE");
         }
         if let Some(ref default) = col.default {
-            attrs.push(default);
+            attrs.push(default.as_sql());
         }
         println!(
             "  {} {}",

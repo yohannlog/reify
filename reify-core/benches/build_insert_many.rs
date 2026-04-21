@@ -21,7 +21,7 @@ impl Table for BenchRow {
         &["id", "name", "email", "score", "active"]
     }
 
-    fn into_values(&self) -> Vec<Value> {
+    fn as_values(&self) -> Vec<Value> {
         vec![
             Value::I64(self.id),
             Value::String(self.name.clone()),

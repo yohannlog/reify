@@ -121,7 +121,10 @@ async fn bench_update(rows: usize, iters: usize) -> Duration {
         let db = fresh_db().await;
         seed(&db, &data).await;
         entity::Entity::update_many()
-            .col_expr(entity::Column::Score, sea_orm::sea_query::Expr::value(999_i32))
+            .col_expr(
+                entity::Column::Score,
+                sea_orm::sea_query::Expr::value(999_i32),
+            )
             .filter(entity::Column::Active.eq(true))
             .exec(&db)
             .await

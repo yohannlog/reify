@@ -26,9 +26,6 @@ impl<F: Table, T: Table> WithBuilder<F, T> {
     /// Returns `(parent_sql, parent_params, child_sql_template)`.
     /// The child SQL uses an `IN (?)` placeholder; the caller must
     /// substitute the actual parent key values at runtime.
-    ///
-    /// In practice use [`crate::db::with_related`] which handles both
-    /// queries and the in-memory grouping automatically.
     pub fn build_queries(&self) -> ((String, Vec<Value>), String) {
         let (parent_sql, parent_params) = self.parent.build();
         // Child query: SELECT * FROM to_table WHERE to_col IN (?)

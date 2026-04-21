@@ -33,8 +33,10 @@ impl MigrationRunner {
                         .collect();
                     if !new_cols.is_empty() {
                         // Sort for a stable, deterministic version key.
+                        // Use comma as separator — underscores in column names would
+                        // corrupt an underscore-joined key and break table-name extraction.
                         new_cols.sort_unstable();
-                        let cols_key = new_cols.join("_");
+                        let cols_key = new_cols.join(",");
                         let add_version = format!("auto__{}_add_{}", entry.table_name, cols_key);
                         if !applied.contains(&add_version) {
                             let stmts: Vec<String> = new_cols
@@ -61,6 +63,7 @@ impl MigrationRunner {
                                 statements: stmts,
                                 checksum,
                                 schema_diff: None,
+                                timeout: None,
                             });
                         }
                     }
@@ -81,6 +84,7 @@ impl MigrationRunner {
                         statements: stmts,
                         checksum,
                         schema_diff: None,
+                        timeout: None,
                     });
                 }
                 Some(existing_cols) => {
@@ -106,6 +110,7 @@ impl MigrationRunner {
                             statements: stmts,
                             checksum,
                             schema_diff: None,
+                            timeout: None,
                         });
                     }
                 }
@@ -137,6 +142,7 @@ impl MigrationRunner {
                 statements: stmts,
                 checksum,
                 schema_diff: None,
+                timeout: None,
             });
         }
 
@@ -169,6 +175,7 @@ impl MigrationRunner {
                 statements: stmts,
                 checksum,
                 schema_diff: None,
+                timeout: None,
             });
         }
 
@@ -195,6 +202,7 @@ impl MigrationRunner {
                     statements,
                     checksum,
                     schema_diff: None,
+                    timeout: m.timeout(),
                 }
             })
             .collect()

@@ -174,9 +174,9 @@ mod postgres_tests {
     #[test]
     fn from_value_vec_f32() {
         use reify::value::FromValue;
-        let val = Value::ArrayF32(vec![1.0f32, 2.5, 3.14]);
+        let val = Value::ArrayF32(vec![1.0f32, 2.5, 3.15]);
         let result = Vec::<f32>::from_value(val).unwrap();
-        assert_eq!(result, vec![1.0f32, 2.5, 3.14]);
+        assert_eq!(result, vec![1.0f32, 2.5, 3.15]);
     }
 
     #[test]

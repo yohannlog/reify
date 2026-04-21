@@ -63,8 +63,8 @@
 use std::sync::{Arc, Mutex};
 
 use reify::{
-    ActorId, AuditContext, Auditable, Database, DbError, MigrationRunner, Row, TransactionFn,
-    Value, audit::verify_audit_row,
+    ActorId, AuditContext, Database, DbError, MigrationRunner, Row, TransactionFn, Value,
+    audit::verify_audit_row,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -81,7 +81,6 @@ pub struct User {
     pub id: i64,
     #[column(unique)]
     pub email: String,
-    #[column(nullable)]
     pub role: Option<String>,
 }
 

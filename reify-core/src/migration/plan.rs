@@ -29,6 +29,10 @@ pub struct MigrationPlan {
     pub checksum: String,
     /// Structural schema diff for auto-diff plans (None for manual/view plans).
     pub schema_diff: Option<SchemaDiff>,
+    /// Maximum wall-clock time allowed for this migration's transaction.
+    /// `None` means no timeout (the default for auto-diff and view plans).
+    /// Set via `Migration::timeout()` on manual migrations.
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl MigrationPlan {
@@ -53,6 +57,9 @@ impl MigrationPlan {
                     out.push_str(&format!("    {line}\n"));
                 }
             }
+        }
+        if let Some(t) = self.timeout {
+            out.push_str(&format!("    -- timeout: {}s\n", t.as_secs()));
         }
         out.push_str("    SQL:\n");
         for stmt in &self.statements {
@@ -88,15 +95,22 @@ pub struct MigrationStatus {
 
 impl MigrationStatus {
     /// Format for CLI display.
+    ///
+    /// Output format:
+    /// ```text
+    /// ✓ Applied  [auto]    auto__users  (2024-03-20 12:00:00+00)
+    /// ~ Pending  [manual]  20240320_000001_add_city
+    /// ```
     pub fn display(&self) -> String {
         let mark = if self.applied {
             "✓ Applied"
         } else {
             "~ Pending"
         };
+        let kind = if self.is_auto { "[auto]  " } else { "[manual]" };
         match &self.applied_at {
-            Some(ts) => format!("  {mark}  {}  ({})", self.version, ts),
-            None => format!("  {mark}  {}", self.version),
+            Some(ts) => format!("  {mark}  {kind}  {}  ({})", self.version, ts),
+            None => format!("  {mark}  {kind}  {}", self.version),
         }
     }
 }

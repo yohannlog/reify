@@ -29,7 +29,6 @@ use tracing::debug;
 ///     .limit(10)
 ///     .build();
 /// ```
-#[derive(Clone)]
 pub struct SelectBuilder<M: Table> {
     distinct: bool,
     columns: Option<Vec<&'static str>>,
@@ -225,7 +224,7 @@ impl<M: Table> SelectBuilder<M> {
         (sql, params)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
     ///
     /// Equivalent to calling `build()` followed by `rewrite_placeholders_pg`, but
     /// performs the rewrite once at build time so the adapter can skip it at execution time.
@@ -234,6 +233,24 @@ impl<M: Table> SelectBuilder<M> {
         let (sql, params) = self.build();
         let pg_sql = rewrite_placeholders_pg(&sql);
         crate::built_query::BuiltQuery::new(pg_sql, params)
+    }
+}
+
+impl<M: Table> Clone for SelectBuilder<M> {
+    fn clone(&self) -> Self {
+        Self {
+            distinct: self.distinct,
+            columns: self.columns.clone(),
+            exprs: self.exprs.clone(),
+            conditions: self.conditions.clone(),
+            joins: self.joins.clone(),
+            group_by: self.group_by.clone(),
+            having: self.having.clone(),
+            orders: self.orders.clone(),
+            limit: self.limit,
+            offset: self.offset,
+            _model: PhantomData,
+        }
     }
 }
 

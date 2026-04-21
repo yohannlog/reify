@@ -32,7 +32,7 @@ pub fn create_table_sql<T: Table>(
         let is_nullable = def.map(|d| d.nullable).unwrap_or(false);
         let is_pk = def.map(|d| d.primary_key).unwrap_or(false);
         let is_unique = def.map(|d| d.unique).unwrap_or(false);
-        let default_val = def.and_then(|d| d.default.as_deref());
+        let default_val = def.and_then(|d| d.default.as_ref().map(|dv| dv.as_sql()));
         let computed = def.and_then(|d| d.computed.as_ref());
         let ts_kind = def.and_then(|d| d.timestamp_kind);
         let ts_source = def
@@ -175,7 +175,7 @@ pub(crate) fn create_table_sql_named(
             };
             parts.push(default_now.into());
         } else if let Some(ref dv) = def.default {
-            parts.push(format!("DEFAULT {dv}"));
+            parts.push(format!("DEFAULT {}", dv.as_sql()));
         }
 
         // Column-level CHECK constraint
@@ -269,7 +269,7 @@ pub fn try_add_column_sql(
     let default_clause = if is_nullable {
         String::new()
     } else {
-        let explicit = def.and_then(|d| d.default.as_deref());
+        let explicit = def.and_then(|d| d.default.as_ref().map(|dv| dv.as_sql()));
         match explicit {
             Some(dv) => format!(" DEFAULT {dv}"),
             None => match default_for_type(&sql_type) {

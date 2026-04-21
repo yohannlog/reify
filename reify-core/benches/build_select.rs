@@ -16,7 +16,7 @@ impl Table for BenchTable {
         &["id", "name", "email", "score", "active"]
     }
 
-    fn into_values(&self) -> Vec<Value> {
+    fn as_values(&self) -> Vec<Value> {
         vec![
             Value::I64(1),
             Value::String("name".into()),

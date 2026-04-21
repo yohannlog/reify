@@ -6,6 +6,7 @@ use crate::migration::error::MigrationError;
 use crate::migration::lock::MigrationLock;
 use crate::migration::plan::{MigrationPlan, compute_checksum};
 use crate::value::Value;
+use tokio::time::timeout as tokio_timeout;
 
 impl MigrationRunner {
     /// Roll back the last applied migration.
@@ -66,12 +67,13 @@ impl MigrationRunner {
             statements: stmts,
             checksum,
             schema_diff: None,
+            timeout: migration.timeout(),
         };
         self.hooks.call_before(&plan).await?;
         let stmts_clone = plan.statements.clone();
         let version_clone = version.clone();
-        let result = db
-            .transaction(Box::new(move |txn| {
+        let result = {
+            let fut = db.transaction(Box::new(move |txn| {
                 Box::pin(async move {
                     for stmt in &stmts_clone {
                         txn.execute(stmt, &[]).await?;
@@ -83,19 +85,28 @@ impl MigrationRunner {
                     .await?;
                     Ok(())
                 })
-            }))
-            .await
-            .map_err(MigrationError::Db);
+            }));
+            match plan.timeout {
+                Some(dur) => tokio_timeout(dur, fut)
+                    .await
+                    .map_err(|_| MigrationError::TimedOut {
+                        version: plan.version.clone(),
+                        timeout_secs: dur.as_secs(),
+                    })
+                    .and_then(|r| r.map_err(MigrationError::Db)),
+                None => fut.await.map_err(MigrationError::Db),
+            }
+        };
         match result {
             Ok(()) => self.hooks.call_after(&plan).await?,
             Err(e) => {
                 self.hooks.call_error(&plan, &e).await;
-                MigrationLock::release(db).await.ok();
+                MigrationLock::release(db, self.dialect).await.ok();
                 return Err(e);
             }
         }
 
-        MigrationLock::release(db).await.ok();
+        MigrationLock::release(db, self.dialect).await.ok();
         Ok(())
     }
 
@@ -133,6 +144,28 @@ impl MigrationRunner {
             )));
         }
 
+        // Pre-validate all migrations in the rollback range before executing any.
+        // This prevents a partial rollback where N and N-1 succeed but N-2 fails
+        // because it is irreversible, leaving the DB in an inconsistent state.
+        for version in &versions {
+            let migration = self
+                .manual
+                .iter()
+                .find(|m| m.version() == version)
+                .ok_or_else(|| {
+                    MigrationError::Other(format!(
+                        "migration '{version}' is applied but not registered"
+                    ))
+                })?;
+            if !migration.is_reversible() {
+                MigrationLock::release(db, self.dialect).await.ok();
+                return Err(MigrationError::NotReversible(version.clone()));
+            }
+            if version == target_version {
+                break;
+            }
+        }
+
         // Roll back from newest to target (inclusive), each in its own transaction.
         for version in &versions {
             let migration = self
@@ -160,12 +193,13 @@ impl MigrationRunner {
                 statements: stmts,
                 checksum,
                 schema_diff: None,
+                timeout: migration.timeout(),
             };
             self.hooks.call_before(&plan).await?;
             let stmts_clone = plan.statements.clone();
             let version_clone = version.clone();
-            let result = db
-                .transaction(Box::new(move |txn| {
+            let result = {
+                let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
                         for stmt in &stmts_clone {
                             txn.execute(stmt, &[]).await?;
@@ -177,14 +211,23 @@ impl MigrationRunner {
                         .await?;
                         Ok(())
                     })
-                }))
-                .await
-                .map_err(MigrationError::Db);
+                }));
+                match plan.timeout {
+                    Some(dur) => tokio_timeout(dur, fut)
+                        .await
+                        .map_err(|_| MigrationError::TimedOut {
+                            version: plan.version.clone(),
+                            timeout_secs: dur.as_secs(),
+                        })
+                        .and_then(|r| r.map_err(MigrationError::Db)),
+                    None => fut.await.map_err(MigrationError::Db),
+                }
+            };
             match result {
                 Ok(()) => self.hooks.call_after(&plan).await?,
                 Err(e) => {
                     self.hooks.call_error(&plan, &e).await;
-                    MigrationLock::release(db).await.ok();
+                    MigrationLock::release(db, self.dialect).await.ok();
                     return Err(e);
                 }
             }
@@ -194,7 +237,7 @@ impl MigrationRunner {
             }
         }
 
-        MigrationLock::release(db).await.ok();
+        MigrationLock::release(db, self.dialect).await.ok();
         Ok(())
     }
 
@@ -237,6 +280,23 @@ impl MigrationRunner {
             )));
         }
 
+        // Pre-validate all migrations before executing any rollback.
+        for version in &versions {
+            let migration = self
+                .manual
+                .iter()
+                .find(|m| m.version() == version)
+                .ok_or_else(|| {
+                    MigrationError::Other(format!(
+                        "migration '{version}' is applied but not registered"
+                    ))
+                })?;
+            if !migration.is_reversible() {
+                MigrationLock::release(db, self.dialect).await.ok();
+                return Err(MigrationError::NotReversible(version.clone()));
+            }
+        }
+
         for version in &versions {
             let migration = self
                 .manual
@@ -263,12 +323,13 @@ impl MigrationRunner {
                 statements: stmts,
                 checksum,
                 schema_diff: None,
+                timeout: migration.timeout(),
             };
             self.hooks.call_before(&plan).await?;
             let stmts_clone = plan.statements.clone();
             let version_clone = version.clone();
-            let result = db
-                .transaction(Box::new(move |txn| {
+            let result = {
+                let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
                         for stmt in &stmts_clone {
                             txn.execute(stmt, &[]).await?;
@@ -280,20 +341,29 @@ impl MigrationRunner {
                         .await?;
                         Ok(())
                     })
-                }))
-                .await
-                .map_err(MigrationError::Db);
+                }));
+                match plan.timeout {
+                    Some(dur) => tokio_timeout(dur, fut)
+                        .await
+                        .map_err(|_| MigrationError::TimedOut {
+                            version: plan.version.clone(),
+                            timeout_secs: dur.as_secs(),
+                        })
+                        .and_then(|r| r.map_err(MigrationError::Db)),
+                    None => fut.await.map_err(MigrationError::Db),
+                }
+            };
             match result {
                 Ok(()) => self.hooks.call_after(&plan).await?,
                 Err(e) => {
                     self.hooks.call_error(&plan, &e).await;
-                    MigrationLock::release(db).await.ok();
+                    MigrationLock::release(db, self.dialect).await.ok();
                     return Err(e);
                 }
             }
         }
 
-        MigrationLock::release(db).await.ok();
+        MigrationLock::release(db, self.dialect).await.ok();
         Ok(())
     }
 }

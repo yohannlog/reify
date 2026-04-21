@@ -58,3 +58,6 @@ mod mysql_dto;
 
 #[path = "integration/mysql_migrations.rs"]
 mod mysql_migrations;
+
+#[path = "integration/pg_copy.rs"]
+mod pg_copy;

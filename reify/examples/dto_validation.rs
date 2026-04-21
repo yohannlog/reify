@@ -28,7 +28,6 @@ pub struct User {
     pub name: String,
 
     /// Optional bio — no validation rule applied.
-    #[column(nullable)]
     pub bio: Option<String>,
 }
 

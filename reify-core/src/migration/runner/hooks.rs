@@ -19,10 +19,10 @@ pub type MigrationErrorHookFn =
 
 /// Collection of lifecycle hooks for the migration runner.
 ///
-/// Register hooks via the builder methods on [`MigrationRunner`]:
-/// - [`on_before_each`](crate::migration::MigrationRunner::on_before_each)
-/// - [`on_after_each`](crate::migration::MigrationRunner::on_after_each)
-/// - [`on_migration_error`](crate::migration::MigrationRunner::on_migration_error)
+/// Register hooks via the builder methods on [`crate::MigrationRunner`]:
+/// - [`on_before_each`](crate::MigrationRunner::on_before_each)
+/// - [`on_after_each`](crate::MigrationRunner::on_after_each)
+/// - [`on_migration_error`](crate::MigrationRunner::on_migration_error)
 #[derive(Default)]
 pub struct MigrationHooks {
     /// Called before each plan's transaction begins.

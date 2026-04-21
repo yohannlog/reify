@@ -1,6 +1,7 @@
 use super::{BuildError, Dialect, trace_query};
 #[cfg(feature = "postgres")]
 use super::{rewrite_placeholders_pg, write_returning};
+use crate::column::Column;
 use crate::condition::Condition;
 use crate::ident::qi;
 use crate::sql::{ToSql, write_joined};
@@ -53,6 +54,8 @@ pub struct UpdateBuilder<M: Table> {
     unfiltered: bool,
     #[cfg(feature = "postgres")]
     returning: Option<Vec<&'static str>>,
+    #[cfg(feature = "postgres18")]
+    returning_old_new: Option<super::ReturningOldNew>,
     _model: PhantomData<M>,
 }
 
@@ -67,6 +70,8 @@ impl<M: Table> UpdateBuilder<M> {
             unfiltered: false,
             #[cfg(feature = "postgres")]
             returning: None,
+            #[cfg(feature = "postgres18")]
+            returning_old_new: None,
             _model: PhantomData,
         }
     }
@@ -75,6 +80,40 @@ impl<M: Table> UpdateBuilder<M> {
     #[cfg(feature = "postgres")]
     pub fn returning(mut self, cols: &[&'static str]) -> Self {
         self.returning = Some(cols.to_vec());
+        self
+    }
+
+    /// Append a `RETURNING` clause using typed [`Column`] references (PostgreSQL only).
+    #[cfg(feature = "postgres")]
+    pub fn returning_cols<T>(mut self, cols: &[Column<M, T>]) -> Self {
+        self.returning = Some(cols.iter().map(|c| c.name).collect());
+        self
+    }
+
+    /// Append `RETURNING old.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns the previous row state before the update.
+    #[cfg(feature = "postgres18")]
+    pub fn returning_old_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::Old);
+        self
+    }
+
+    /// Append `RETURNING new.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns the new row state after the update.
+    #[cfg(feature = "postgres18")]
+    pub fn returning_new_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::New);
+        self
+    }
+
+    /// Append `RETURNING old.*, new.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns both the previous and new row states.
+    #[cfg(feature = "postgres18")]
+    pub fn returning_old_new_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::OldNew);
         self
     }
 
@@ -244,11 +283,16 @@ impl<M: Table> UpdateBuilder<M> {
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
 
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
+
         trace_query("update", M::table_name(), &sql, &params);
         Ok((sql, params))
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
     ///
     /// Delegates to `try_build()` (enforcing the no-bare-update guard) and rewrites
     /// placeholders once at build time.
@@ -263,7 +307,7 @@ impl<M: Table> UpdateBuilder<M> {
         crate::built_query::BuiltQuery::new(pg_sql, params)
     }
 
-    /// Build a [`BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
+    /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
     ///
     /// Returns `Err(BuildError::MissingFilter)` if no `.filter()` or `.unfiltered()` has been called.
     #[cfg(feature = "postgres")]
@@ -299,5 +343,19 @@ impl<M: Table> UpdateBuilder<M> {
         M: crate::db::FromRow,
     {
         crate::db::update_returning(db, self).await
+    }
+
+    /// Execute this UPDATE … RETURNING old.*, new.* and return `OldNew<M>` results (PostgreSQL 18+).
+    ///
+    /// Requires `.returning_old_all()`, `.returning_new_all()`, or `.returning_old_new_all()` to be called first.
+    #[cfg(feature = "postgres18")]
+    pub async fn fetch_old_new(
+        &self,
+        db: &impl crate::db::Database,
+    ) -> Result<Vec<crate::db::OldNew<M>>, crate::db::DbError>
+    where
+        M: crate::db::FromRowPositional,
+    {
+        crate::db::update_returning_old_new(db, self).await
     }
 }

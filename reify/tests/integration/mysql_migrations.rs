@@ -25,7 +25,6 @@ pub struct User {
     pub id: i64,
     #[column(unique)]
     pub email: String,
-    #[column(nullable)]
     pub role: Option<String>,
 }
 
@@ -49,7 +48,11 @@ impl Migration for AddUserCity {
         "Add city column to mysql_mig_users"
     }
     fn up(&self, ctx: &mut MigrationContext) {
-        ctx.add_column("mysql_mig_users", "city", "VARCHAR(255) NOT NULL DEFAULT ''");
+        ctx.add_column(
+            "mysql_mig_users",
+            "city",
+            "VARCHAR(255) NOT NULL DEFAULT ''",
+        );
     }
     fn down(&self, ctx: &mut MigrationContext) {
         ctx.drop_column("mysql_mig_users", "city");
@@ -65,11 +68,7 @@ async fn connect() -> Option<MysqlDb> {
 }
 
 async fn cleanup(db: &MysqlDb) {
-    for table in &[
-        "mysql_mig_posts",
-        "mysql_mig_users",
-        "_reify_migrations",
-    ] {
+    for table in &["mysql_mig_posts", "mysql_mig_users", "_reify_migrations"] {
         raw_execute(db, &format!("DROP TABLE IF EXISTS `{table}`"), &[])
             .await
             .unwrap_or_else(|e| panic!("drop {table}: {e}"));
@@ -257,10 +256,7 @@ async fn mysql_migration_dry_run_previews_without_applying() {
     )
     .await
     .expect("check table after dry_run");
-    assert!(
-        table_exists.is_empty(),
-        "dry_run must not create the table"
-    );
+    assert!(table_exists.is_empty(), "dry_run must not create the table");
 
     cleanup(&db).await;
 }

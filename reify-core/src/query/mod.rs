@@ -15,7 +15,7 @@ mod update;
 mod with;
 
 pub use delete::DeleteBuilder;
-pub use insert::{InsertBuilder, InsertManyBuilder};
+pub use insert::{InsertBuilder, InsertManyBuilder, ParamLimitExceeded};
 pub use join::{JoinClause, JoinKind};
 pub use select::SelectBuilder;
 pub use update::UpdateBuilder;
@@ -118,14 +118,7 @@ pub enum OnConflict {
 }
 
 pub(crate) fn trace_query(operation: &str, table: &'static str, sql: &str, params: &[Value]) {
-    debug!(
-        target: "reify::query",
-        operation,
-        table,
-        sql = %sql,
-        params = ?params,
-        "Built SQL query"
-    );
+    crate::telemetry::record_query_built(operation, table, sql, params.len());
 }
 
 /// Append an `ON CONFLICT` clause to `sql` based on the conflict strategy and dialect.
@@ -168,6 +161,35 @@ pub(crate) fn write_returning(sql: &mut String, returning: &Option<Vec<&'static 
     if let Some(ret_cols) = returning {
         sql.push_str(" RETURNING ");
         write_joined(sql, ret_cols, ", ", |buf, c| buf.push_str(&qi(c)));
+    }
+}
+
+/// Which row state to return in PostgreSQL 18+ `RETURNING` clause.
+#[cfg(feature = "postgres18")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturningOldNew {
+    /// `RETURNING old.*` — previous row state (DELETE, UPDATE).
+    Old,
+    /// `RETURNING new.*` — new row state (INSERT, UPDATE).
+    New,
+    /// `RETURNING old.*, new.*` — both states (UPDATE only).
+    OldNew,
+}
+
+/// Append a `RETURNING old.*`, `new.*`, or both clause (PostgreSQL 18+).
+#[cfg(feature = "postgres18")]
+pub(crate) fn write_returning_old_new(sql: &mut String, mode: ReturningOldNew, table_name: &str) {
+    sql.push_str(" RETURNING ");
+    match mode {
+        ReturningOldNew::Old => {
+            sql.push_str("old.*");
+        }
+        ReturningOldNew::New => {
+            sql.push_str("new.*");
+        }
+        ReturningOldNew::OldNew => {
+            sql.push_str("old.*, new.*");
+        }
     }
 }
 
@@ -230,6 +252,55 @@ fn bytecount_question_marks(bytes: &[u8]) -> usize {
 
 // ── Aggregate expressions ───────────────────────────────────────────
 
+/// Date/time part for extraction functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePart {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+/// Trim direction for the TRIM function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrimWhere {
+    /// Remove from both ends (default).
+    #[default]
+    Both,
+    /// Remove from the start only.
+    Leading,
+    /// Remove from the end only.
+    Trailing,
+}
+
+impl DatePart {
+    /// Return the SQL keyword for this date part (used by EXTRACT/DATE_PART).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DatePart::Year => "YEAR",
+            DatePart::Month => "MONTH",
+            DatePart::Day => "DAY",
+            DatePart::Hour => "HOUR",
+            DatePart::Minute => "MINUTE",
+            DatePart::Second => "SECOND",
+        }
+    }
+
+    /// Return the strftime format specifier for SQLite.
+    pub fn strftime_format(&self) -> &'static str {
+        match self {
+            DatePart::Year => "%Y",
+            DatePart::Month => "%m",
+            DatePart::Day => "%d",
+            DatePart::Hour => "%H",
+            DatePart::Minute => "%M",
+            DatePart::Second => "%S",
+        }
+    }
+}
+
 /// A SQL expression that can appear in a SELECT list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -259,11 +330,58 @@ pub enum Expr {
     Round(&'static str, Option<i32>),
     /// `COALESCE(col, default)`.
     Coalesce(&'static str, Box<Value>),
+    /// Date/time part extraction: `YEAR(col)`, `EXTRACT(YEAR FROM col)`, or `strftime('%Y', col)`.
+    ///
+    /// Rendered differently per dialect:
+    /// - MySQL/MariaDB: `YEAR(col)`, `MONTH(col)`, etc.
+    /// - PostgreSQL: `EXTRACT(YEAR FROM col)`
+    /// - SQLite: `CAST(strftime('%Y', col) AS INTEGER)`
+    ///
+    /// Use `to_sql_fragment_dialect()` for dialect-aware rendering.
+    Extract(DatePart, &'static str),
+    /// `TRIM(col)` or `TRIM(BOTH chars FROM col)` — remove characters from string.
+    ///
+    /// Rendered differently per dialect:
+    /// - PostgreSQL: `TRIM(BOTH 'chars' FROM col)` or `TRIM(col)`
+    /// - MySQL/MariaDB: `TRIM(BOTH 'chars' FROM col)` or `TRIM(col)`
+    /// - SQLite: `TRIM(col, 'chars')` or `TRIM(col)`
+    ///
+    /// Arguments: (column, optional characters to trim, trim direction)
+    Trim(&'static str, Option<String>, TrimWhere),
+    /// `VARIANCE(col)` / `VAR_POP(col)` — population variance (aggregate).
+    ///
+    /// Rendered per dialect:
+    /// - PostgreSQL: `VARIANCE(col)` (alias for `VAR_SAMP`)
+    /// - MySQL/MariaDB: `VARIANCE(col)` (population variance)
+    ///
+    /// Note: PostgreSQL's `VARIANCE` is sample variance (`VAR_SAMP`), while
+    /// MySQL's `VARIANCE` is population variance (`VAR_POP`). For consistent
+    /// cross-database behavior, consider using raw SQL with explicit function names.
+    ///
+    /// # Availability
+    ///
+    /// Only available when the `postgres` or `mysql` feature is enabled.
+    /// SQLite does not support `VARIANCE`.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    Variance(&'static str),
 }
 
 impl Expr {
-    /// Render the expression to a SQL fragment.
+    /// Render the expression to a SQL fragment (generic dialect).
+    ///
+    /// For dialect-specific rendering (especially date extraction), use
+    /// [`to_sql_fragment_dialect`](Self::to_sql_fragment_dialect).
     pub fn to_sql_fragment(&self) -> String {
+        self.to_sql_fragment_dialect(Dialect::Generic)
+    }
+
+    /// Render the expression to a SQL fragment for a specific dialect.
+    ///
+    /// Date extraction functions are rendered differently per dialect:
+    /// - `Dialect::Mysql`: `YEAR(col)`, `MONTH(col)`, etc.
+    /// - `Dialect::Postgres`: `EXTRACT(YEAR FROM col)`
+    /// - `Dialect::Generic` (SQLite): `CAST(strftime('%Y', col) AS INTEGER)`
+    pub fn to_sql_fragment_dialect(&self, dialect: Dialect) -> String {
         match self {
             Expr::Col(c) => qi(c),
             Expr::Count(None) => "COUNT(*)".to_string(),
@@ -282,6 +400,54 @@ impl Expr {
             Expr::Coalesce(c, default) => {
                 format!("COALESCE({}, {})", qi(c), default.to_sql_literal())
             }
+            Expr::Extract(part, c) => match dialect {
+                Dialect::Mysql => format!("{}({})", part.as_str(), qi(c)),
+                Dialect::Postgres => format!("EXTRACT({} FROM {})", part.as_str(), qi(c)),
+                Dialect::Generic => {
+                    // SQLite: strftime returns text, cast to integer
+                    format!(
+                        "CAST(strftime('{}', {}) AS INTEGER)",
+                        part.strftime_format(),
+                        qi(c)
+                    )
+                }
+            },
+            Expr::Trim(c, chars, where_) => {
+                let where_kw = match where_ {
+                    TrimWhere::Both => "BOTH",
+                    TrimWhere::Leading => "LEADING",
+                    TrimWhere::Trailing => "TRAILING",
+                };
+                match (dialect, chars) {
+                    // SQLite uses different syntax: TRIM(col) or TRIM(col, 'chars')
+                    (Dialect::Generic, None) => format!("TRIM({})", qi(c)),
+                    (Dialect::Generic, Some(ch)) => {
+                        // SQLite doesn't support LEADING/TRAILING directly
+                        // LTRIM/RTRIM for leading/trailing, TRIM for both
+                        match where_ {
+                            TrimWhere::Both => {
+                                format!("TRIM({}, '{}')", qi(c), ch.replace('\'', "''"))
+                            }
+                            TrimWhere::Leading => {
+                                format!("LTRIM({}, '{}')", qi(c), ch.replace('\'', "''"))
+                            }
+                            TrimWhere::Trailing => {
+                                format!("RTRIM({}, '{}')", qi(c), ch.replace('\'', "''"))
+                            }
+                        }
+                    }
+                    // PostgreSQL and MySQL use: TRIM(BOTH 'chars' FROM col)
+                    (_, None) => format!("TRIM({} FROM {})", where_kw, qi(c)),
+                    (_, Some(ch)) => format!(
+                        "TRIM({} '{}' FROM {})",
+                        where_kw,
+                        ch.replace('\'', "''"),
+                        qi(c)
+                    ),
+                }
+            }
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Expr::Variance(c) => format!("VARIANCE({})", qi(c)),
         }
     }
 }
@@ -332,5 +498,306 @@ impl OrderExpr {
     /// Wrap this column in a descending [`Order`] expression.
     pub fn desc(self) -> Order {
         Order::Desc(self.col)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_year_mysql() {
+        let expr = Expr::Extract(DatePart::Year, "created_at");
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Mysql),
+            "YEAR(\"created_at\")"
+        );
+    }
+
+    #[test]
+    fn extract_year_postgres() {
+        let expr = Expr::Extract(DatePart::Year, "created_at");
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(YEAR FROM \"created_at\")"
+        );
+    }
+
+    #[test]
+    fn extract_year_sqlite() {
+        let expr = Expr::Extract(DatePart::Year, "created_at");
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Generic),
+            "CAST(strftime('%Y', \"created_at\") AS INTEGER)"
+        );
+    }
+
+    #[test]
+    fn extract_month_mysql() {
+        let expr = Expr::Extract(DatePart::Month, "date_col");
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Mysql),
+            "MONTH(\"date_col\")"
+        );
+    }
+
+    #[test]
+    fn extract_day_postgres() {
+        let expr = Expr::Extract(DatePart::Day, "date_col");
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(DAY FROM \"date_col\")"
+        );
+    }
+
+    #[test]
+    fn extract_hour_minute_second() {
+        let hour = Expr::Extract(DatePart::Hour, "ts");
+        let minute = Expr::Extract(DatePart::Minute, "ts");
+        let second = Expr::Extract(DatePart::Second, "ts");
+
+        // MySQL
+        assert_eq!(hour.to_sql_fragment_dialect(Dialect::Mysql), "HOUR(\"ts\")");
+        assert_eq!(
+            minute.to_sql_fragment_dialect(Dialect::Mysql),
+            "MINUTE(\"ts\")"
+        );
+        assert_eq!(
+            second.to_sql_fragment_dialect(Dialect::Mysql),
+            "SECOND(\"ts\")"
+        );
+
+        // PostgreSQL
+        assert_eq!(
+            hour.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(HOUR FROM \"ts\")"
+        );
+        assert_eq!(
+            minute.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(MINUTE FROM \"ts\")"
+        );
+        assert_eq!(
+            second.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(SECOND FROM \"ts\")"
+        );
+
+        // SQLite
+        assert_eq!(
+            hour.to_sql_fragment_dialect(Dialect::Generic),
+            "CAST(strftime('%H', \"ts\") AS INTEGER)"
+        );
+        assert_eq!(
+            minute.to_sql_fragment_dialect(Dialect::Generic),
+            "CAST(strftime('%M', \"ts\") AS INTEGER)"
+        );
+        assert_eq!(
+            second.to_sql_fragment_dialect(Dialect::Generic),
+            "CAST(strftime('%S', \"ts\") AS INTEGER)"
+        );
+    }
+
+    #[test]
+    fn date_part_as_str() {
+        assert_eq!(DatePart::Year.as_str(), "YEAR");
+        assert_eq!(DatePart::Month.as_str(), "MONTH");
+        assert_eq!(DatePart::Day.as_str(), "DAY");
+        assert_eq!(DatePart::Hour.as_str(), "HOUR");
+        assert_eq!(DatePart::Minute.as_str(), "MINUTE");
+        assert_eq!(DatePart::Second.as_str(), "SECOND");
+    }
+
+    #[test]
+    fn date_part_strftime_format() {
+        assert_eq!(DatePart::Year.strftime_format(), "%Y");
+        assert_eq!(DatePart::Month.strftime_format(), "%m");
+        assert_eq!(DatePart::Day.strftime_format(), "%d");
+        assert_eq!(DatePart::Hour.strftime_format(), "%H");
+        assert_eq!(DatePart::Minute.strftime_format(), "%M");
+        assert_eq!(DatePart::Second.strftime_format(), "%S");
+    }
+
+    #[test]
+    fn extract_to_sql_fragment_defaults_to_generic() {
+        // to_sql_fragment() without dialect should use Generic (SQLite syntax)
+        let expr = Expr::Extract(DatePart::Year, "col");
+        assert_eq!(
+            expr.to_sql_fragment(),
+            "CAST(strftime('%Y', \"col\") AS INTEGER)"
+        );
+    }
+
+    #[test]
+    fn extract_all_parts_all_dialects() {
+        let parts = [
+            (DatePart::Year, "YEAR", "%Y"),
+            (DatePart::Month, "MONTH", "%m"),
+            (DatePart::Day, "DAY", "%d"),
+            (DatePart::Hour, "HOUR", "%H"),
+            (DatePart::Minute, "MINUTE", "%M"),
+            (DatePart::Second, "SECOND", "%S"),
+        ];
+
+        for (part, name, fmt) in parts {
+            let expr = Expr::Extract(part, "c");
+
+            // MySQL: NAME("c")
+            assert_eq!(
+                expr.to_sql_fragment_dialect(Dialect::Mysql),
+                format!("{name}(\"c\")")
+            );
+
+            // PostgreSQL: EXTRACT(NAME FROM "c")
+            assert_eq!(
+                expr.to_sql_fragment_dialect(Dialect::Postgres),
+                format!("EXTRACT({name} FROM \"c\")")
+            );
+
+            // SQLite: CAST(strftime('fmt', "c") AS INTEGER)
+            assert_eq!(
+                expr.to_sql_fragment_dialect(Dialect::Generic),
+                format!("CAST(strftime('{fmt}', \"c\") AS INTEGER)")
+            );
+        }
+    }
+
+    // ── Trim tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn trim_both_no_chars_postgres() {
+        let expr = Expr::Trim("col", None, TrimWhere::Both);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "TRIM(BOTH FROM \"col\")"
+        );
+    }
+
+    #[test]
+    fn trim_both_no_chars_mysql() {
+        let expr = Expr::Trim("col", None, TrimWhere::Both);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Mysql),
+            "TRIM(BOTH FROM \"col\")"
+        );
+    }
+
+    #[test]
+    fn trim_both_no_chars_sqlite() {
+        let expr = Expr::Trim("col", None, TrimWhere::Both);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Generic),
+            "TRIM(\"col\")"
+        );
+    }
+
+    #[test]
+    fn trim_both_with_chars_postgres() {
+        let expr = Expr::Trim("col", Some("x".to_string()), TrimWhere::Both);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "TRIM(BOTH 'x' FROM \"col\")"
+        );
+    }
+
+    #[test]
+    fn trim_both_with_chars_mysql() {
+        let expr = Expr::Trim("col", Some("xy".to_string()), TrimWhere::Both);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Mysql),
+            "TRIM(BOTH 'xy' FROM \"col\")"
+        );
+    }
+
+    #[test]
+    fn trim_both_with_chars_sqlite() {
+        let expr = Expr::Trim("col", Some("x".to_string()), TrimWhere::Both);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Generic),
+            "TRIM(\"col\", 'x')"
+        );
+    }
+
+    #[test]
+    fn trim_leading_no_chars() {
+        let expr = Expr::Trim("col", None, TrimWhere::Leading);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "TRIM(LEADING FROM \"col\")"
+        );
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Mysql),
+            "TRIM(LEADING FROM \"col\")"
+        );
+    }
+
+    #[test]
+    fn trim_leading_with_chars_sqlite() {
+        let expr = Expr::Trim("col", Some("0".to_string()), TrimWhere::Leading);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Generic),
+            "LTRIM(\"col\", '0')"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_no_chars() {
+        let expr = Expr::Trim("col", None, TrimWhere::Trailing);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "TRIM(TRAILING FROM \"col\")"
+        );
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Mysql),
+            "TRIM(TRAILING FROM \"col\")"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_with_chars_sqlite() {
+        let expr = Expr::Trim("col", Some("!".to_string()), TrimWhere::Trailing);
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Generic),
+            "RTRIM(\"col\", '!')"
+        );
+    }
+
+    #[test]
+    fn trim_escapes_single_quotes() {
+        let expr = Expr::Trim("col", Some("'".to_string()), TrimWhere::Both);
+        // Single quote should be escaped as ''
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "TRIM(BOTH '''' FROM \"col\")"
+        );
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Generic),
+            "TRIM(\"col\", '''')"
+        );
+    }
+
+    #[test]
+    fn trim_where_default_is_both() {
+        assert_eq!(TrimWhere::default(), TrimWhere::Both);
+    }
+
+    // ── Variance tests ──────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn variance_postgres() {
+        let expr = Expr::Variance("score");
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Postgres),
+            "VARIANCE(\"score\")"
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn variance_mysql() {
+        let expr = Expr::Variance("score");
+        assert_eq!(
+            expr.to_sql_fragment_dialect(Dialect::Mysql),
+            "VARIANCE(\"score\")"
+        );
     }
 }

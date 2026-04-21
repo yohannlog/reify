@@ -144,7 +144,7 @@ impl MigrationRunner {
                 &[Value::String(table.into())],
             )
             .await
-            .unwrap_or_default();
+            .map_err(MigrationError::Db)?;
 
         let unique_cols: std::collections::HashSet<String> = unique_rows
             .into_iter()

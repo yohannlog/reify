@@ -14,7 +14,6 @@ pub struct User {
     pub email: String,
     #[column(validate(length(min = 1, max = 100)))]
     pub name: String,
-    #[column(nullable)]
     pub bio: Option<String>,
 }
 
@@ -232,7 +231,7 @@ pub struct CoversAllRules {
     #[column(validate(range(min = 0, max = 100)))]
     pub score: i32,
     // `required` lifts the Option-skip footgun for value rules.
-    #[column(nullable, validate(required, length(min = 1)))]
+    #[column(validate(required, length(min = 1)))]
     pub bio: Option<String>,
 }
 
