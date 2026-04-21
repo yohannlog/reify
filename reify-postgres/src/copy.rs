@@ -5,7 +5,7 @@ use reify_core::value::Value;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
 
-use crate::{get_conn, pg_err, PostgresDb, PgValue};
+use crate::{PgValue, PostgresDb, get_conn, pg_err};
 
 impl PostgresDb {
     /// Bulk-insert rows using PostgreSQL's binary COPY protocol.
@@ -38,7 +38,11 @@ impl PostgresDb {
                 .collect()
         } else {
             let first = &models[0];
-            first.writable_values().iter().map(value_to_pg_type).collect()
+            first
+                .writable_values()
+                .iter()
+                .map(value_to_pg_type)
+                .collect()
         };
 
         let mut writer = std::pin::pin!(BinaryCopyInWriter::new(sink, &types));
@@ -46,8 +50,10 @@ impl PostgresDb {
         for model in models {
             let values = model.writable_values();
             let pg_values: Vec<PgValue> = values.iter().map(PgValue).collect();
-            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                pg_values.iter().map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_values
+                .iter()
+                .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
             writer.as_mut().write(&refs).await.map_err(pg_err)?;
         }
 
@@ -168,13 +174,34 @@ mod tests {
 
     #[test]
     fn sql_type_to_pg_arrays() {
-        assert_eq!(sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Integer))), Type::INT4_ARRAY);
-        assert_eq!(sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Text))), Type::TEXT_ARRAY);
-        assert_eq!(sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Boolean))), Type::BOOL_ARRAY);
-        assert_eq!(sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Uuid))), Type::UUID_ARRAY);
-        assert_eq!(sql_type_to_pg(&SqlType::Array(Box::new(SqlType::BigInt))), Type::INT8_ARRAY);
-        assert_eq!(sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Float))), Type::FLOAT4_ARRAY);
-        assert_eq!(sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Double))), Type::FLOAT8_ARRAY);
+        assert_eq!(
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Integer))),
+            Type::INT4_ARRAY
+        );
+        assert_eq!(
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Text))),
+            Type::TEXT_ARRAY
+        );
+        assert_eq!(
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Boolean))),
+            Type::BOOL_ARRAY
+        );
+        assert_eq!(
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Uuid))),
+            Type::UUID_ARRAY
+        );
+        assert_eq!(
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::BigInt))),
+            Type::INT8_ARRAY
+        );
+        assert_eq!(
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Float))),
+            Type::FLOAT4_ARRAY
+        );
+        assert_eq!(
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Double))),
+            Type::FLOAT8_ARRAY
+        );
         assert_eq!(
             sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Varchar(100)))),
             Type::TEXT_ARRAY
@@ -184,7 +211,9 @@ mod tests {
     #[test]
     fn sql_type_to_pg_nested_array_fallback() {
         assert_eq!(
-            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Array(Box::new(SqlType::Integer))))),
+            sql_type_to_pg(&SqlType::Array(Box::new(SqlType::Array(Box::new(
+                SqlType::Integer
+            ))))),
             Type::TEXT_ARRAY
         );
     }
@@ -221,30 +250,51 @@ mod tests {
             value_to_pg_type(&Value::Jsonb(serde_json::json!({}))),
             Type::JSONB
         );
-        assert_eq!(
-            value_to_pg_type(&Value::Uuid(Uuid::nil())),
-            Type::UUID
-        );
+        assert_eq!(value_to_pg_type(&Value::Uuid(Uuid::nil())), Type::UUID);
     }
 
     #[test]
     fn value_to_pg_type_ranges() {
         use reify_core::range::Range;
-        assert_eq!(value_to_pg_type(&Value::Int4Range(Range::Empty)), Type::INT4_RANGE);
-        assert_eq!(value_to_pg_type(&Value::Int8Range(Range::Empty)), Type::INT8_RANGE);
-        assert_eq!(value_to_pg_type(&Value::TsRange(Range::Empty)), Type::TS_RANGE);
-        assert_eq!(value_to_pg_type(&Value::TstzRange(Range::Empty)), Type::TSTZ_RANGE);
-        assert_eq!(value_to_pg_type(&Value::DateRange(Range::Empty)), Type::DATE_RANGE);
+        assert_eq!(
+            value_to_pg_type(&Value::Int4Range(Range::Empty)),
+            Type::INT4_RANGE
+        );
+        assert_eq!(
+            value_to_pg_type(&Value::Int8Range(Range::Empty)),
+            Type::INT8_RANGE
+        );
+        assert_eq!(
+            value_to_pg_type(&Value::TsRange(Range::Empty)),
+            Type::TS_RANGE
+        );
+        assert_eq!(
+            value_to_pg_type(&Value::TstzRange(Range::Empty)),
+            Type::TSTZ_RANGE
+        );
+        assert_eq!(
+            value_to_pg_type(&Value::DateRange(Range::Empty)),
+            Type::DATE_RANGE
+        );
     }
 
     #[test]
     fn value_to_pg_type_arrays() {
-        assert_eq!(value_to_pg_type(&Value::ArrayBool(vec![])), Type::BOOL_ARRAY);
+        assert_eq!(
+            value_to_pg_type(&Value::ArrayBool(vec![])),
+            Type::BOOL_ARRAY
+        );
         assert_eq!(value_to_pg_type(&Value::ArrayI16(vec![])), Type::INT2_ARRAY);
         assert_eq!(value_to_pg_type(&Value::ArrayI32(vec![])), Type::INT4_ARRAY);
         assert_eq!(value_to_pg_type(&Value::ArrayI64(vec![])), Type::INT8_ARRAY);
-        assert_eq!(value_to_pg_type(&Value::ArrayF32(vec![])), Type::FLOAT4_ARRAY);
-        assert_eq!(value_to_pg_type(&Value::ArrayF64(vec![])), Type::FLOAT8_ARRAY);
+        assert_eq!(
+            value_to_pg_type(&Value::ArrayF32(vec![])),
+            Type::FLOAT4_ARRAY
+        );
+        assert_eq!(
+            value_to_pg_type(&Value::ArrayF64(vec![])),
+            Type::FLOAT8_ARRAY
+        );
         assert_eq!(
             value_to_pg_type(&Value::ArrayString(vec![])),
             Type::TEXT_ARRAY

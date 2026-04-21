@@ -26,8 +26,7 @@ use mysql_async::prelude::*;
 use tracing::{debug, error};
 
 use reify_core::adapter::{
-    SavepointCounter, rewrite_double_quoted_idents_to_backticks,
-    rewrite_placeholders_to_question,
+    SavepointCounter, rewrite_double_quoted_idents_to_backticks, rewrite_placeholders_to_question,
 };
 use reify_core::db::{Database, DbError, Row, TransactionFn};
 use reify_core::value::Value;
@@ -186,8 +185,7 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
         Some(MV::Float(v)) => Value::F32(*v),
         Some(MV::Double(v)) => Value::F64(*v),
         Some(MV::Date(year, month, day, hour, min, sec, micro)) => {
-            let date =
-                chrono::NaiveDate::from_ymd_opt(*year as i32, *month as u32, *day as u32);
+            let date = chrono::NaiveDate::from_ymd_opt(*year as i32, *month as u32, *day as u32);
             // DATE (no time component and no fractional seconds).
             if *hour == 0 && *min == 0 && *sec == 0 && *micro == 0 {
                 if let Some(d) = date {
@@ -216,14 +214,9 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
                 return Value::Null;
             }
             // TIME(0..6) — preserve full microsecond precision.
-            chrono::NaiveTime::from_hms_micro_opt(
-                *hours as u32,
-                *mins as u32,
-                *secs as u32,
-                *micro,
-            )
-            .map(Value::Time)
-            .unwrap_or(Value::Null)
+            chrono::NaiveTime::from_hms_micro_opt(*hours as u32, *mins as u32, *secs as u32, *micro)
+                .map(Value::Time)
+                .unwrap_or(Value::Null)
         }
     }
 }
@@ -269,8 +262,7 @@ fn mysql_err(e: mysql_async::Error) -> DbError {
 /// aware via [`reify_core::adapter`], so constants like `'$1'` or `'"abc"'`
 /// survive intact.
 fn prepare_mysql(sql: &str, params: &[Value]) -> Result<(String, mysql_async::Params), DbError> {
-    let sql =
-        rewrite_double_quoted_idents_to_backticks(&rewrite_placeholders_to_question(sql));
+    let sql = rewrite_double_quoted_idents_to_backticks(&rewrite_placeholders_to_question(sql));
     let mysql_params = values_to_mysql_params(params)?;
     Ok((sql, mysql_params))
 }

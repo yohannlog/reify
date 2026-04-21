@@ -281,7 +281,10 @@ pub fn print_table(cfg: &BenchConfig, results: &[BenchResult]) {
             }
         }
         for &fw in &cfg.frameworks {
-            let cell = match results.iter().find(|r| r.framework == fw && r.scenario == scn) {
+            let cell = match results
+                .iter()
+                .find(|r| r.framework == fw && r.scenario == scn)
+            {
                 Some(r) if r.skipped.is_none() => {
                     let mark = if Some(r.median) == fastest { "*" } else { " " };
                     format!("{}{:>11}", mark, fmt_dur(r.median))

@@ -254,43 +254,43 @@ where
 {
     use postgres_protocol::types::{RangeBound as PgBound, range_from_sql};
 
-    let parsed = range_from_sql(raw).map_err(|e| {
-        DbError::Conversion(format!("invalid PostgreSQL range wire format: {e}"))
-    })?;
+    let parsed = range_from_sql(raw)
+        .map_err(|e| DbError::Conversion(format!("invalid PostgreSQL range wire format: {e}")))?;
 
     fn decode<T, F>(b: PgBound<Option<&[u8]>>, parse: &F) -> Result<Bound<T>, DbError>
     where
         F: Fn(&[u8]) -> Option<T>,
     {
         Ok(match b {
-            PgBound::Inclusive(Some(bytes)) => Bound::Inclusive(parse(bytes).ok_or_else(
-                || DbError::Conversion("range element decode failed".to_string()),
-            )?),
-            PgBound::Exclusive(Some(bytes)) => Bound::Exclusive(parse(bytes).ok_or_else(
-                || DbError::Conversion("range element decode failed".to_string()),
-            )?),
-            PgBound::Inclusive(None)
-            | PgBound::Exclusive(None)
-            | PgBound::Unbounded => Bound::Unbounded,
+            PgBound::Inclusive(Some(bytes)) => {
+                Bound::Inclusive(parse(bytes).ok_or_else(|| {
+                    DbError::Conversion("range element decode failed".to_string())
+                })?)
+            }
+            PgBound::Exclusive(Some(bytes)) => {
+                Bound::Exclusive(parse(bytes).ok_or_else(|| {
+                    DbError::Conversion("range element decode failed".to_string())
+                })?)
+            }
+            PgBound::Inclusive(None) | PgBound::Exclusive(None) | PgBound::Unbounded => {
+                Bound::Unbounded
+            }
         })
     }
 
     Ok(match parsed {
         postgres_protocol::types::Range::Empty => Range::Empty,
-        postgres_protocol::types::Range::Nonempty(lower, upper) => {
-            Range::Nonempty(decode(lower, &parse_element)?, decode(upper, &parse_element)?)
-        }
+        postgres_protocol::types::Range::Nonempty(lower, upper) => Range::Nonempty(
+            decode(lower, &parse_element)?,
+            decode(upper, &parse_element)?,
+        ),
     })
 }
 
 /// Convenience for column-level range decoding: map a `DbError` to a
 /// logged warning + `Value::Null` so one malformed row doesn't abort the
 /// entire result set, but the error is still visible in logs.
-fn range_value_or_null<T, F>(
-    raw: &[u8],
-    ctor: fn(Range<T>) -> Value,
-    parse_element: F,
-) -> Value
+fn range_value_or_null<T, F>(raw: &[u8], ctor: fn(Range<T>) -> Value, parse_element: F) -> Value
 where
     F: Fn(&[u8]) -> Option<T>,
 {

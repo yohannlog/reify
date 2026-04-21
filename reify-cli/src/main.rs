@@ -84,10 +84,7 @@ fn classify_migration_error(msg: String) -> CliError {
     } else {
         EXIT_GENERIC
     };
-    CliError {
-        code,
-        message: msg,
-    }
+    CliError { code, message: msg }
 }
 
 // ── CLI definition ───────────────────────────────────────────────────
@@ -365,9 +362,9 @@ fn resolve_sqlite_path(path: &str) -> Result<String, String> {
         } else {
             let parent = p.parent().filter(|pp| !pp.as_os_str().is_empty());
             match parent {
-                Some(pp) => pp.canonicalize().map(|cp| {
-                    cp.join(p.file_name().unwrap_or_else(|| std::ffi::OsStr::new("")))
-                }),
+                Some(pp) => pp
+                    .canonicalize()
+                    .map(|cp| cp.join(p.file_name().unwrap_or_else(|| std::ffi::OsStr::new("")))),
                 None => std::env::current_dir().map(|cwd| cwd.join(p)),
             }
         }
@@ -537,7 +534,9 @@ fn cmd_bench(comparative: bool, extra: &[String]) -> i32 {
         Ok(s) => s.code().unwrap_or(EXIT_GENERIC),
         Err(e) => {
             eprintln!("error: failed to invoke cargo: {e}");
-            eprintln!("note: `reify bench` requires the reify workspace checkout and cargo on PATH.");
+            eprintln!(
+                "note: `reify bench` requires the reify workspace checkout and cargo on PATH."
+            );
             EXIT_GENERIC
         }
     }

@@ -17,8 +17,8 @@ pub mod rls;
 pub mod schema;
 pub mod sql;
 pub mod table;
-pub mod value;
 pub mod telemetry;
+pub mod value;
 pub mod view;
 
 pub use tracing;
@@ -39,12 +39,12 @@ pub use query::{
     WithBuilder,
 };
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub use func::variance;
 pub use func::{
     count_all, day, hour, ltrim, ltrim_chars, minute, month, rtrim, rtrim_chars, second, trim,
     trim_chars, year,
 };
-#[cfg(any(feature = "postgres", feature = "mysql"))]
-pub use func::variance;
 
 pub use relation::{Related, Relation, RelationType};
 pub use sql::{JoinFragment, OrderFragment, SqlFragment, ToSql};
@@ -72,6 +72,14 @@ pub use db::{
 
 #[cfg(feature = "postgres")]
 pub use db::{delete_returning, insert_many_returning, insert_returning, update_returning};
+
+#[cfg(feature = "postgres18")]
+pub use db::{
+    FromRowPositional, OldNew, delete_returning_old, insert_many_returning_new,
+    insert_returning_new, update_returning_old_new,
+};
+#[cfg(feature = "postgres18")]
+pub use query::ReturningOldNew;
 
 pub use migration::{
     ColumnDiff, DbColumnInfo, Migration, MigrationContext, MigrationError, MigrationPlan,

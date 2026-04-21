@@ -117,10 +117,7 @@ impl RlsContext {
     ///     }
     /// }
     /// ```
-    pub fn require<T: Send + Sync + 'static>(
-        &self,
-        key: &'static str,
-    ) -> Result<&T, RlsError> {
+    pub fn require<T: Send + Sync + 'static>(&self, key: &'static str) -> Result<&T, RlsError> {
         let entry = self.values.get(key).ok_or(RlsError::Missing { key })?;
         if entry.type_id != TypeId::of::<T>() {
             return Err(RlsError::TypeMismatch {
@@ -399,12 +396,16 @@ pub async fn scoped_update<M: crate::table::Table + Policy>(
     let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
     #[cfg(feature = "postgres")]
     {
-        let q = builder.try_build_pg().map_err(|e| DbError::Other(e.to_string()))?;
+        let q = builder
+            .try_build_pg()
+            .map_err(|e| DbError::Other(e.to_string()))?;
         return Database::execute(scoped, &q.sql, &q.params).await;
     }
     #[cfg(not(feature = "postgres"))]
     {
-        let (sql, params) = builder.try_build().map_err(|e| DbError::Other(e.to_string()))?;
+        let (sql, params) = builder
+            .try_build()
+            .map_err(|e| DbError::Other(e.to_string()))?;
         Database::execute(scoped, &sql, &params).await
     }
 }
@@ -417,12 +418,16 @@ pub async fn scoped_delete<M: crate::table::Table + Policy>(
     let builder = apply_policy::<M, _>(scoped, builder, |b, cond| b.filter(cond))?;
     #[cfg(feature = "postgres")]
     {
-        let q = builder.try_build_pg().map_err(|e| DbError::Other(e.to_string()))?;
+        let q = builder
+            .try_build_pg()
+            .map_err(|e| DbError::Other(e.to_string()))?;
         return Database::execute(scoped, &q.sql, &q.params).await;
     }
     #[cfg(not(feature = "postgres"))]
     {
-        let (sql, params) = builder.try_build().map_err(|e| DbError::Other(e.to_string()))?;
+        let (sql, params) = builder
+            .try_build()
+            .map_err(|e| DbError::Other(e.to_string()))?;
         Database::execute(scoped, &sql, &params).await
     }
 }

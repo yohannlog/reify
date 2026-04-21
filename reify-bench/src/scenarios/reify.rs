@@ -5,13 +5,12 @@ use std::time::Duration;
 use reify::{
     Database, InsertManyBuilder, SqliteDb, Table, delete, fetch, insert, raw_execute, update,
 };
-use reify_macros::Table as DeriveTable;
 
 use super::model::{CREATE_TABLE_SQL, DROP_TABLE_SQL, UserRow, make_rows};
 use crate::runner::Scenario;
 use crate::time_iters;
 
-#[derive(DeriveTable, Debug, Clone)]
+#[derive(Table, Debug, Clone)]
 #[table(name = "users")]
 pub struct User {
     #[column(primary_key)]
@@ -44,11 +43,11 @@ async fn fresh_db() -> SqliteDb {
 
 async fn seed(db: &SqliteDb, rows: &[UserRow]) {
     // Bulk seed — used by scenarios that read/modify pre-existing rows.
+    let users: Vec<User> = rows.iter().map(|r| r.into()).collect();
     db.transaction(Box::new(move |tx| {
         Box::pin(async move {
-            for r in rows {
-                let u: User = r.into();
-                let (sql, params) = User::insert(&u).build();
+            for u in &users {
+                let (sql, params) = User::insert(u).build();
                 tx.execute(&sql, &params).await?;
             }
             Ok(())
@@ -56,7 +55,6 @@ async fn seed(db: &SqliteDb, rows: &[UserRow]) {
     }))
     .await
     .expect("seed");
-    let _ = db; // silence unused
 }
 
 pub async fn run(scn: Scenario, rows: usize, iters: usize) -> Duration {

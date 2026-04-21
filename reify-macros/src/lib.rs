@@ -6,7 +6,7 @@ mod table;
 mod view;
 
 use proc_macro::TokenStream;
-use syn::{parse_macro_input, DeriveInput};
+use syn::{DeriveInput, parse_macro_input};
 
 /// Derive macro that implements `Table` and generates typed column constants + query builder helpers.
 ///

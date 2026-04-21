@@ -99,6 +99,78 @@ pub trait FromRow: Sized {
     fn from_row(row: &Row) -> Result<Self, DbError>;
 }
 
+/// Trait for types that can be constructed from a database row using positional access.
+///
+/// Used by `OldNew<T>` to parse `RETURNING old.*, new.*` results where columns
+/// are accessed by index rather than name.
+pub trait FromRowPositional: Sized {
+    /// Number of columns this type consumes.
+    fn column_count() -> usize;
+
+    /// Construct from a row starting at the given column offset.
+    fn from_row_at(row: &Row, offset: usize) -> Result<Self, DbError>;
+}
+
+// ── OldNew wrapper (PostgreSQL 18+) ─────────────────────────────────
+
+/// Wrapper for `RETURNING old.*, new.*` results (PostgreSQL 18+).
+///
+/// - `INSERT`: `old` is `None` (no previous row), `new` contains the inserted row.
+/// - `UPDATE`: both `old` and `new` are `Some`.
+/// - `DELETE`: `old` contains the deleted row, `new` is `None`.
+///
+/// # Example
+///
+/// ```ignore
+/// let changes: Vec<OldNew<User>> = User::update()
+///     .set(User::role, "admin")
+///     .filter(User::id.eq(1))
+///     .returning_old_new_all()
+///     .fetch_old_new(&db).await?;
+///
+/// for change in changes {
+///     println!("Changed {:?} -> {:?}", change.old, change.new);
+/// }
+/// ```
+#[cfg(feature = "postgres18")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OldNew<T> {
+    pub old: Option<T>,
+    pub new: Option<T>,
+}
+
+#[cfg(feature = "postgres18")]
+impl<T> OldNew<T> {
+    /// Create a new `OldNew` with both values.
+    pub fn new(old: Option<T>, new: Option<T>) -> Self {
+        Self { old, new }
+    }
+
+    /// Create for INSERT (no old value).
+    pub fn inserted(new: T) -> Self {
+        Self {
+            old: None,
+            new: Some(new),
+        }
+    }
+
+    /// Create for DELETE (no new value).
+    pub fn deleted(old: T) -> Self {
+        Self {
+            old: Some(old),
+            new: None,
+        }
+    }
+
+    /// Create for UPDATE (both values present).
+    pub fn updated(old: T, new: T) -> Self {
+        Self {
+            old: Some(old),
+            new: Some(new),
+        }
+    }
+}
+
 // ── Error type ──────────────────────────────────────────────────────
 
 /// Database error.
@@ -372,7 +444,8 @@ pub async fn fetch_all<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("select", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("select", M::table_name(), &q.sql, q.params.len());
         let result = db.query(&q.sql, &q.params).await;
         timer.finish(result.as_ref().map(|r| r.len()).unwrap_or(0));
         return result;
@@ -412,7 +485,6 @@ pub async fn fetch<M: Table + FromRow>(
     let rows = fetch_all(db, builder).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
 }
-
 
 /// Execute a SELECT and return an asynchronous stream of typed results.
 pub async fn fetch_stream<'a, M: Table + FromRow>(
@@ -477,7 +549,8 @@ pub async fn insert<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("insert", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("insert", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         return result;
@@ -500,7 +573,8 @@ pub async fn insert_many<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("insert_many", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("insert_many", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         return result;
@@ -508,7 +582,8 @@ pub async fn insert_many<M: Table>(
     #[cfg(not(feature = "postgres"))]
     {
         let (sql, params) = builder.build();
-        let timer = crate::telemetry::start_query("insert_many", M::table_name(), &sql, params.len());
+        let timer =
+            crate::telemetry::start_query("insert_many", M::table_name(), &sql, params.len());
         let result = db.execute(&sql, &params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         result
@@ -545,7 +620,8 @@ pub async fn update<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("update", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("update", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         return result;
@@ -579,7 +655,8 @@ pub async fn delete<M: Table>(
     #[cfg(feature = "postgres")]
     {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("delete", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("delete", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         return result;
@@ -603,6 +680,87 @@ pub async fn delete_returning<M: Table + FromRow>(
     let q = builder.build_pg();
     let rows = db.query(&q.sql, &q.params).await?;
     rows.iter().map(|r| M::from_row(r)).collect()
+}
+
+// ── PostgreSQL 18+ RETURNING old/new functions ─────────────────────
+
+/// Execute an UPDATE … RETURNING old.*, new.* and return `OldNew<M>` results (PostgreSQL 18+).
+#[cfg(feature = "postgres18")]
+pub async fn update_returning_old_new<M: Table + FromRowPositional>(
+    db: &impl Database,
+    builder: &crate::query::UpdateBuilder<M>,
+) -> Result<Vec<OldNew<M>>, DbError> {
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
+    rows.iter()
+        .map(|r| parse_old_new_row::<M>(r, true, true))
+        .collect()
+}
+
+/// Execute a DELETE … RETURNING old.* and return `OldNew<M>` results (PostgreSQL 18+).
+#[cfg(feature = "postgres18")]
+pub async fn delete_returning_old<M: Table + FromRowPositional>(
+    db: &impl Database,
+    builder: &crate::query::DeleteBuilder<M>,
+) -> Result<Vec<OldNew<M>>, DbError> {
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
+    rows.iter()
+        .map(|r| parse_old_new_row::<M>(r, true, false))
+        .collect()
+}
+
+/// Execute an INSERT … RETURNING new.* and return `OldNew<M>` results (PostgreSQL 18+).
+#[cfg(feature = "postgres18")]
+pub async fn insert_returning_new<M: Table + FromRowPositional>(
+    db: &impl Database,
+    builder: &crate::query::InsertBuilder<M>,
+) -> Result<Vec<OldNew<M>>, DbError> {
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
+    rows.iter()
+        .map(|r| parse_old_new_row::<M>(r, false, true))
+        .collect()
+}
+
+/// Execute an INSERT MANY … RETURNING new.* and return `OldNew<M>` results (PostgreSQL 18+).
+#[cfg(feature = "postgres18")]
+pub async fn insert_many_returning_new<M: Table + FromRowPositional>(
+    db: &impl Database,
+    builder: &crate::query::InsertManyBuilder<M>,
+) -> Result<Vec<OldNew<M>>, DbError> {
+    let q = builder.build_pg();
+    let rows = db.query(&q.sql, &q.params).await?;
+    rows.iter()
+        .map(|r| parse_old_new_row::<M>(r, false, true))
+        .collect()
+}
+
+/// Parse a row containing `old.*`, `new.*`, or both into `OldNew<M>`.
+#[cfg(feature = "postgres18")]
+fn parse_old_new_row<M: FromRowPositional>(
+    row: &Row,
+    has_old: bool,
+    has_new: bool,
+) -> Result<OldNew<M>, DbError> {
+    let col_count = M::column_count();
+    let mut offset = 0;
+
+    let old = if has_old {
+        let val = M::from_row_at(row, offset)?;
+        offset += col_count;
+        Some(val)
+    } else {
+        None
+    };
+
+    let new = if has_new {
+        Some(M::from_row_at(row, offset)?)
+    } else {
+        None
+    };
+
+    Ok(OldNew { old, new })
 }
 
 // ── Raw SQL helpers ─────────────────────────────────────────────────
@@ -994,7 +1152,8 @@ pub async fn insert_with_async_hooks<M: Table + crate::hooks::AsyncModelHooks>(
     #[cfg(feature = "postgres")]
     let rows = {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("insert", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("insert", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         result?
@@ -1036,7 +1195,8 @@ pub async fn update_with_async_hooks<M: Table + crate::hooks::AsyncModelHooks>(
     #[cfg(feature = "postgres")]
     let rows = {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("update", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("update", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         result?
@@ -1077,7 +1237,8 @@ pub async fn delete_with_async_hooks<M: Table + crate::hooks::AsyncModelHooks>(
     #[cfg(feature = "postgres")]
     let rows = {
         let q = builder.build_pg();
-        let timer = crate::telemetry::start_query("delete", M::table_name(), &q.sql, q.params.len());
+        let timer =
+            crate::telemetry::start_query("delete", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
         result?

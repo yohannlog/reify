@@ -121,10 +121,7 @@ async fn pg_copy_in_large_batch() {
     assert_eq!(rows_affected, 1000);
 
     let count = db
-        .query_one(
-            "SELECT COUNT(*)::bigint AS c FROM copy_products",
-            &[],
-        )
+        .query_one("SELECT COUNT(*)::bigint AS c FROM copy_products", &[])
         .await
         .expect("count");
     assert_eq!(count.get("c"), Some(&Value::I64(1000)));

@@ -1,5 +1,5 @@
 use quote::quote;
-use syn::{parse::Parse, Attribute, Data, DeriveInput, Fields, Lit};
+use syn::{Attribute, Data, DeriveInput, Fields, Lit, parse::Parse};
 
 use crate::helpers::{
     parse_column_attrs, parse_sql_type_string, rust_type_to_sql_type, to_snake_case,

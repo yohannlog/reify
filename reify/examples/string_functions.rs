@@ -4,7 +4,7 @@
 //!
 //! Run with: cargo run --example string_functions
 
-use reify::{func, query::Dialect, Expr, Table, TrimWhere};
+use reify::{Expr, Table, TrimWhere, func, query::Dialect};
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "products")]

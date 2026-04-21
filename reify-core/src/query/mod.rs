@@ -164,6 +164,35 @@ pub(crate) fn write_returning(sql: &mut String, returning: &Option<Vec<&'static 
     }
 }
 
+/// Which row state to return in PostgreSQL 18+ `RETURNING` clause.
+#[cfg(feature = "postgres18")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturningOldNew {
+    /// `RETURNING old.*` — previous row state (DELETE, UPDATE).
+    Old,
+    /// `RETURNING new.*` — new row state (INSERT, UPDATE).
+    New,
+    /// `RETURNING old.*, new.*` — both states (UPDATE only).
+    OldNew,
+}
+
+/// Append a `RETURNING old.*`, `new.*`, or both clause (PostgreSQL 18+).
+#[cfg(feature = "postgres18")]
+pub(crate) fn write_returning_old_new(sql: &mut String, mode: ReturningOldNew, table_name: &str) {
+    sql.push_str(" RETURNING ");
+    match mode {
+        ReturningOldNew::Old => {
+            sql.push_str("old.*");
+        }
+        ReturningOldNew::New => {
+            sql.push_str("new.*");
+        }
+        ReturningOldNew::OldNew => {
+            sql.push_str("old.*, new.*");
+        }
+    }
+}
+
 /// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params.
 ///
 /// Call this on the SQL string returned by `build()` when targeting PostgreSQL.
@@ -376,7 +405,11 @@ impl Expr {
                 Dialect::Postgres => format!("EXTRACT({} FROM {})", part.as_str(), qi(c)),
                 Dialect::Generic => {
                     // SQLite: strftime returns text, cast to integer
-                    format!("CAST(strftime('{}', {}) AS INTEGER)", part.strftime_format(), qi(c))
+                    format!(
+                        "CAST(strftime('{}', {}) AS INTEGER)",
+                        part.strftime_format(),
+                        qi(c)
+                    )
                 }
             },
             Expr::Trim(c, chars, where_) => {
@@ -392,14 +425,25 @@ impl Expr {
                         // SQLite doesn't support LEADING/TRAILING directly
                         // LTRIM/RTRIM for leading/trailing, TRIM for both
                         match where_ {
-                            TrimWhere::Both => format!("TRIM({}, '{}')", qi(c), ch.replace('\'', "''")),
-                            TrimWhere::Leading => format!("LTRIM({}, '{}')", qi(c), ch.replace('\'', "''")),
-                            TrimWhere::Trailing => format!("RTRIM({}, '{}')", qi(c), ch.replace('\'', "''")),
+                            TrimWhere::Both => {
+                                format!("TRIM({}, '{}')", qi(c), ch.replace('\'', "''"))
+                            }
+                            TrimWhere::Leading => {
+                                format!("LTRIM({}, '{}')", qi(c), ch.replace('\'', "''"))
+                            }
+                            TrimWhere::Trailing => {
+                                format!("RTRIM({}, '{}')", qi(c), ch.replace('\'', "''"))
+                            }
                         }
                     }
                     // PostgreSQL and MySQL use: TRIM(BOTH 'chars' FROM col)
                     (_, None) => format!("TRIM({} FROM {})", where_kw, qi(c)),
-                    (_, Some(ch)) => format!("TRIM({} '{}' FROM {})", where_kw, ch.replace('\'', "''"), qi(c)),
+                    (_, Some(ch)) => format!(
+                        "TRIM({} '{}' FROM {})",
+                        where_kw,
+                        ch.replace('\'', "''"),
+                        qi(c)
+                    ),
                 }
             }
             #[cfg(any(feature = "postgres", feature = "mysql"))]
@@ -514,13 +558,28 @@ mod tests {
 
         // MySQL
         assert_eq!(hour.to_sql_fragment_dialect(Dialect::Mysql), "HOUR(\"ts\")");
-        assert_eq!(minute.to_sql_fragment_dialect(Dialect::Mysql), "MINUTE(\"ts\")");
-        assert_eq!(second.to_sql_fragment_dialect(Dialect::Mysql), "SECOND(\"ts\")");
+        assert_eq!(
+            minute.to_sql_fragment_dialect(Dialect::Mysql),
+            "MINUTE(\"ts\")"
+        );
+        assert_eq!(
+            second.to_sql_fragment_dialect(Dialect::Mysql),
+            "SECOND(\"ts\")"
+        );
 
         // PostgreSQL
-        assert_eq!(hour.to_sql_fragment_dialect(Dialect::Postgres), "EXTRACT(HOUR FROM \"ts\")");
-        assert_eq!(minute.to_sql_fragment_dialect(Dialect::Postgres), "EXTRACT(MINUTE FROM \"ts\")");
-        assert_eq!(second.to_sql_fragment_dialect(Dialect::Postgres), "EXTRACT(SECOND FROM \"ts\")");
+        assert_eq!(
+            hour.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(HOUR FROM \"ts\")"
+        );
+        assert_eq!(
+            minute.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(MINUTE FROM \"ts\")"
+        );
+        assert_eq!(
+            second.to_sql_fragment_dialect(Dialect::Postgres),
+            "EXTRACT(SECOND FROM \"ts\")"
+        );
 
         // SQLite
         assert_eq!(

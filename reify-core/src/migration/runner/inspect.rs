@@ -95,8 +95,9 @@ impl MigrationRunner {
                                 }
 
                                 // Default
-                                let struct_default =
-                                    def.and_then(|d| d.default.as_ref().map(|dv| dv.as_sql().to_string()));
+                                let struct_default = def.and_then(|d| {
+                                    d.default.as_ref().map(|dv| dv.as_sql().to_string())
+                                });
                                 if struct_default != db_col.column_default {
                                     diffs.push(ColumnDiff::DefaultChanged {
                                         column: col_name.to_string(),

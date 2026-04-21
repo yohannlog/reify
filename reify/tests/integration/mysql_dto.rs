@@ -13,8 +13,8 @@
 #![cfg(feature = "integration-tests")]
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use reify::{MysqlDb, Table, fetch, insert, raw_execute};
 use reify::mysql_async::Opts;
+use reify::{MysqlDb, Table, fetch, insert, raw_execute};
 
 use crate::mysql_url;
 

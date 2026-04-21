@@ -236,7 +236,10 @@ fn update_returning_cols_postgres() {
         .filter(User::id.eq(42i64))
         .returning_cols(&[User::id])
         .build();
-    assert_eq!(sql, "UPDATE \"users\" SET \"role\" = ? WHERE \"id\" = ? RETURNING \"id\"");
+    assert_eq!(
+        sql,
+        "UPDATE \"users\" SET \"role\" = ? WHERE \"id\" = ? RETURNING \"id\""
+    );
     assert_eq!(params, vec![Value::String("admin".into()), Value::I64(42)]);
 }
 
@@ -262,8 +265,105 @@ fn delete_returning_cols_postgres() {
         .filter(User::id.eq(42i64))
         .returning_cols(&[User::id])
         .build();
-    assert_eq!(sql, "DELETE FROM \"users\" WHERE \"id\" = ? RETURNING \"id\"");
+    assert_eq!(
+        sql,
+        "DELETE FROM \"users\" WHERE \"id\" = ? RETURNING \"id\""
+    );
     assert_eq!(params, vec![Value::I64(42)]);
+}
+
+// ── PostgreSQL 18+ RETURNING old/new ─────────────────────────────
+
+#[cfg(feature = "postgres18")]
+#[test]
+fn update_returning_old_new_all_postgres18() {
+    let (sql, _) = User::update()
+        .set(User::role, "admin")
+        .filter(User::id.eq(1i64))
+        .returning_old_new_all()
+        .build();
+    assert_eq!(
+        sql,
+        "UPDATE \"users\" SET \"role\" = ? WHERE \"id\" = ? RETURNING old.*, new.*"
+    );
+}
+
+#[cfg(feature = "postgres18")]
+#[test]
+fn update_returning_old_all_postgres18() {
+    let (sql, _) = User::update()
+        .set(User::role, "admin")
+        .filter(User::id.eq(1i64))
+        .returning_old_all()
+        .build();
+    assert_eq!(
+        sql,
+        "UPDATE \"users\" SET \"role\" = ? WHERE \"id\" = ? RETURNING old.*"
+    );
+}
+
+#[cfg(feature = "postgres18")]
+#[test]
+fn update_returning_new_all_postgres18() {
+    let (sql, _) = User::update()
+        .set(User::role, "admin")
+        .filter(User::id.eq(1i64))
+        .returning_new_all()
+        .build();
+    assert_eq!(
+        sql,
+        "UPDATE \"users\" SET \"role\" = ? WHERE \"id\" = ? RETURNING new.*"
+    );
+}
+
+#[cfg(feature = "postgres18")]
+#[test]
+fn delete_returning_old_all_postgres18() {
+    let (sql, _) = User::delete()
+        .filter(User::id.eq(42i64))
+        .returning_old_all()
+        .build();
+    assert_eq!(
+        sql,
+        "DELETE FROM \"users\" WHERE \"id\" = ? RETURNING old.*"
+    );
+}
+
+#[cfg(feature = "postgres18")]
+#[test]
+fn insert_returning_new_all_postgres18() {
+    let user = User {
+        id: 0,
+        email: "test@example.com".into(),
+        role: Some("user".into()),
+    };
+    let (sql, _) = User::insert(&user).returning_new_all().build();
+    assert_eq!(
+        sql,
+        "INSERT INTO \"users\" (\"id\", \"email\", \"role\") VALUES (?, ?, ?) RETURNING new.*"
+    );
+}
+
+#[cfg(feature = "postgres18")]
+#[test]
+fn insert_many_returning_new_all_postgres18() {
+    let users = vec![
+        User {
+            id: 0,
+            email: "a@example.com".into(),
+            role: None,
+        },
+        User {
+            id: 0,
+            email: "b@example.com".into(),
+            role: Some("admin".into()),
+        },
+    ];
+    let (sql, _) = User::insert_many(&users).returning_new_all().build();
+    assert_eq!(
+        sql,
+        "INSERT INTO \"users\" (\"id\", \"email\", \"role\") VALUES (?, ?, ?), (?, ?, ?) RETURNING new.*"
+    );
 }
 
 // ── try_build / unfiltered ──────────────────────────────────────────

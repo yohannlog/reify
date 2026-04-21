@@ -1285,7 +1285,10 @@ mod tests {
         assert_eq!(defs[2].sql_type, SqlType::Text);
         assert!(defs[2].nullable);
         assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
-        assert_eq!(defs[3].default, Some(crate::schema::DefaultValue::Expr("NOW()")));
+        assert_eq!(
+            defs[3].default,
+            Some(crate::schema::DefaultValue::Expr("NOW()"))
+        );
         assert_eq!(defs[4].sql_type, SqlType::Jsonb);
         assert_eq!(defs[5].sql_type, SqlType::Text);
         assert!(defs[5].nullable);

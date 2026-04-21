@@ -54,6 +54,8 @@ pub struct InsertBuilder<M: Table> {
     on_conflict: Option<OnConflict>,
     #[cfg(feature = "postgres")]
     returning: Option<Vec<&'static str>>,
+    #[cfg(feature = "postgres18")]
+    returning_old_new: Option<super::ReturningOldNew>,
     _model: PhantomData<M>,
 }
 
@@ -67,6 +69,8 @@ impl<M: Table> InsertBuilder<M> {
             on_conflict: None,
             #[cfg(feature = "postgres")]
             returning: None,
+            #[cfg(feature = "postgres18")]
+            returning_old_new: None,
             _model: PhantomData,
         }
     }
@@ -87,6 +91,15 @@ impl<M: Table> InsertBuilder<M> {
     #[cfg(feature = "postgres")]
     pub fn returning_cols<T>(mut self, cols: &[Column<M, T>]) -> Self {
         self.returning = Some(cols.iter().map(|c| c.name).collect());
+        self
+    }
+
+    /// Append `RETURNING new.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns the inserted row state (INSERT has no `old` state).
+    #[cfg(feature = "postgres18")]
+    pub fn returning_new_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::New);
         self
     }
 
@@ -162,6 +175,11 @@ impl<M: Table> InsertBuilder<M> {
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
 
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
+
         trace_query("insert", M::table_name(), &sql, &self.values);
         (sql, self.values.clone())
     }
@@ -187,6 +205,20 @@ impl<M: Table> InsertBuilder<M> {
     {
         crate::db::insert_returning(db, self).await
     }
+
+    /// Execute this INSERT … RETURNING new.* and return `OldNew<M>` results (PostgreSQL 18+).
+    ///
+    /// Requires `.returning_new_all()` to be called first.
+    #[cfg(feature = "postgres18")]
+    pub async fn fetch_new(
+        &self,
+        db: &impl crate::db::Database,
+    ) -> Result<Vec<crate::db::OldNew<M>>, crate::db::DbError>
+    where
+        M: crate::db::FromRowPositional,
+    {
+        crate::db::insert_returning_new(db, self).await
+    }
 }
 
 // ── InsertManyBuilder ────────────────────────────────────────────────
@@ -200,6 +232,8 @@ pub struct InsertManyBuilder<M: Table> {
     on_conflict: Option<OnConflict>,
     #[cfg(feature = "postgres")]
     returning: Option<Vec<&'static str>>,
+    #[cfg(feature = "postgres18")]
+    returning_old_new: Option<super::ReturningOldNew>,
     _model: PhantomData<M>,
 }
 
@@ -226,6 +260,8 @@ impl<M: Table> InsertManyBuilder<M> {
             on_conflict: None,
             #[cfg(feature = "postgres")]
             returning: None,
+            #[cfg(feature = "postgres18")]
+            returning_old_new: None,
             _model: PhantomData,
         })
     }
@@ -234,6 +270,15 @@ impl<M: Table> InsertManyBuilder<M> {
     #[cfg(feature = "postgres")]
     pub fn returning(mut self, cols: &[&'static str]) -> Self {
         self.returning = Some(cols.to_vec());
+        self
+    }
+
+    /// Append `RETURNING new.*` clause (PostgreSQL 18+).
+    ///
+    /// Returns the inserted row states (INSERT has no `old` state).
+    #[cfg(feature = "postgres18")]
+    pub fn returning_new_all(mut self) -> Self {
+        self.returning_old_new = Some(super::ReturningOldNew::New);
         self
     }
 
@@ -351,6 +396,11 @@ impl<M: Table> InsertManyBuilder<M> {
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
 
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
+
         trace_query("insert_many", M::table_name(), &sql, &params);
         Ok((sql, params))
     }
@@ -407,6 +457,11 @@ impl<M: Table> InsertManyBuilder<M> {
 
         #[cfg(feature = "postgres")]
         write_returning(&mut sql, &self.returning);
+
+        #[cfg(feature = "postgres18")]
+        if let Some(mode) = self.returning_old_new {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        }
 
         trace_query("insert_many_chunk", M::table_name(), &sql, &params);
         (sql, params)
@@ -508,6 +563,20 @@ impl<M: Table> InsertManyBuilder<M> {
         M: crate::db::FromRow,
     {
         crate::db::insert_many_returning(db, self).await
+    }
+
+    /// Execute this batch INSERT … RETURNING new.* and return `OldNew<M>` results (PostgreSQL 18+).
+    ///
+    /// Requires `.returning_new_all()` to be called first.
+    #[cfg(feature = "postgres18")]
+    pub async fn fetch_new(
+        &self,
+        db: &impl crate::db::Database,
+    ) -> Result<Vec<crate::db::OldNew<M>>, crate::db::DbError>
+    where
+        M: crate::db::FromRowPositional,
+    {
+        crate::db::insert_many_returning_new(db, self).await
     }
 
     /// Execute a batch INSERT, automatically chunking to stay within the
@@ -696,7 +765,10 @@ mod tests {
             "SQL should contain $15 placeholders: {}",
             q.sql
         );
-        assert!(!q.sql.contains('?'), "SQL should not contain ? placeholders");
+        assert!(
+            !q.sql.contains('?'),
+            "SQL should not contain ? placeholders"
+        );
         assert_eq!(q.params.len(), 15);
     }
 

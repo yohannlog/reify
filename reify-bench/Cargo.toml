@@ -21,6 +21,10 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+reify = { path = "../reify", features = ["sqlite"] }
+reify-core = { path = "../reify-core" }
+rusqlite = { version = "0.39", features = ["bundled"] }
+validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.5"
