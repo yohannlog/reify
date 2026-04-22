@@ -30,13 +30,14 @@ impl MigrationRunner {
     /// explicit `down()` that handles data preservation (backup, migration to
     /// another column, etc.).
     pub async fn rollback(&self, db: &impl Database) -> Result<(), MigrationError> {
-        self.ensure_tracking_table(db).await?;
-        MigrationLock::ensure(db, self.dialect).await?;
-        MigrationLock::acquire(db, self.dialect).await?;
+        let dialect = self.resolve_dialect(db);
+        self.ensure_tracking_table(db, dialect).await?;
+        MigrationLock::ensure(db, dialect).await?;
+        MigrationLock::acquire(db, dialect).await?;
 
         // Find the most recently applied manual migration
         let rows = db
-            .query(&select_last_manual_version_sql(self.dialect), &[])
+            .query(&select_last_manual_version_sql(dialect), &[])
             .await?;
 
         let last_version = rows.first().and_then(|r| r.get_string("version"));
@@ -44,6 +45,7 @@ impl MigrationRunner {
         let version = match last_version {
             Some(v) => v,
             None => {
+                MigrationLock::release(db, dialect).await.ok();
                 return Err(MigrationError::Other(
                     "no applied migrations to roll back".into(),
                 ));
@@ -62,6 +64,7 @@ impl MigrationRunner {
             })?;
 
         if !migration.is_reversible() {
+            MigrationLock::release(db, dialect).await.ok();
             return Err(MigrationError::NotReversible(version));
         }
 
@@ -81,7 +84,7 @@ impl MigrationRunner {
         self.hooks.call_before(&plan).await?;
         let stmts_clone = plan.statements.clone();
         let version_clone = version.clone();
-        let delete_sql = delete_migration_sql(self.dialect);
+        let delete_sql = delete_migration_sql(dialect);
         let result = {
             let fut = db.transaction(Box::new(move |txn| {
                 Box::pin(async move {
@@ -108,12 +111,12 @@ impl MigrationRunner {
             Ok(()) => self.hooks.call_after(&plan).await?,
             Err(e) => {
                 self.hooks.call_error(&plan, &e).await;
-                MigrationLock::release(db, self.dialect).await.ok();
+                MigrationLock::release(db, dialect).await.ok();
                 return Err(e);
             }
         }
 
-        MigrationLock::release(db, self.dialect).await.ok();
+        MigrationLock::release(db, dialect).await.ok();
         Ok(())
     }
 
@@ -123,12 +126,13 @@ impl MigrationRunner {
         db: &impl Database,
         target_version: &str,
     ) -> Result<(), MigrationError> {
-        self.ensure_tracking_table(db).await?;
-        MigrationLock::ensure(db, self.dialect).await?;
-        MigrationLock::acquire(db, self.dialect).await?;
+        let dialect = self.resolve_dialect(db);
+        self.ensure_tracking_table(db, dialect).await?;
+        MigrationLock::ensure(db, dialect).await?;
+        MigrationLock::acquire(db, dialect).await?;
 
         let rows = db
-            .query(&select_manual_versions_sql(self.dialect), &[])
+            .query(&select_manual_versions_sql(dialect), &[])
             .await?;
 
         let versions: Vec<String> = rows
@@ -139,6 +143,7 @@ impl MigrationRunner {
         // Guard: ensure target_version is actually in the applied list before
         // starting any rollback — prevents silent no-ops on typos.
         if !versions.iter().any(|v| v == target_version) {
+            MigrationLock::release(db, dialect).await.ok();
             return Err(MigrationError::Other(format!(
                 "target version '{target_version}' is not in the list of applied migrations"
             )));
@@ -158,7 +163,7 @@ impl MigrationRunner {
                     ))
                 })?;
             if !migration.is_reversible() {
-                MigrationLock::release(db, self.dialect).await.ok();
+                MigrationLock::release(db, dialect).await.ok();
                 return Err(MigrationError::NotReversible(version.clone()));
             }
             if version == target_version {
@@ -198,7 +203,7 @@ impl MigrationRunner {
             self.hooks.call_before(&plan).await?;
             let stmts_clone = plan.statements.clone();
             let version_clone = version.clone();
-            let delete_sql = delete_migration_sql(self.dialect);
+            let delete_sql = delete_migration_sql(dialect);
             let result = {
                 let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
@@ -225,7 +230,7 @@ impl MigrationRunner {
                 Ok(()) => self.hooks.call_after(&plan).await?,
                 Err(e) => {
                     self.hooks.call_error(&plan, &e).await;
-                    MigrationLock::release(db, self.dialect).await.ok();
+                    MigrationLock::release(db, dialect).await.ok();
                     return Err(e);
                 }
             }
@@ -235,7 +240,7 @@ impl MigrationRunner {
             }
         }
 
-        MigrationLock::release(db, self.dialect).await.ok();
+        MigrationLock::release(db, dialect).await.ok();
         Ok(())
     }
 
@@ -249,14 +254,15 @@ impl MigrationRunner {
         db: &impl Database,
         since: &str,
     ) -> Result<(), MigrationError> {
-        self.ensure_tracking_table(db).await?;
-        MigrationLock::ensure(db, self.dialect).await?;
-        MigrationLock::acquire(db, self.dialect).await?;
+        let dialect = self.resolve_dialect(db);
+        self.ensure_tracking_table(db, dialect).await?;
+        MigrationLock::ensure(db, dialect).await?;
+        MigrationLock::acquire(db, dialect).await?;
 
         // Fetch manual migrations applied at or after `since`, newest first.
         let rows = db
             .query(
-                &select_manual_versions_since_sql(self.dialect),
+                &select_manual_versions_since_sql(dialect),
                 &[Value::String(since.into())],
             )
             .await?;
@@ -267,6 +273,7 @@ impl MigrationRunner {
             .collect();
 
         if versions.is_empty() {
+            MigrationLock::release(db, dialect).await.ok();
             return Err(MigrationError::Other(format!(
                 "no applied migrations found at or after '{since}'"
             )));
@@ -284,7 +291,7 @@ impl MigrationRunner {
                     ))
                 })?;
             if !migration.is_reversible() {
-                MigrationLock::release(db, self.dialect).await.ok();
+                MigrationLock::release(db, dialect).await.ok();
                 return Err(MigrationError::NotReversible(version.clone()));
             }
         }
@@ -320,7 +327,7 @@ impl MigrationRunner {
             self.hooks.call_before(&plan).await?;
             let stmts_clone = plan.statements.clone();
             let version_clone = version.clone();
-            let delete_sql = delete_migration_sql(self.dialect);
+            let delete_sql = delete_migration_sql(dialect);
             let result = {
                 let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
@@ -347,13 +354,13 @@ impl MigrationRunner {
                 Ok(()) => self.hooks.call_after(&plan).await?,
                 Err(e) => {
                     self.hooks.call_error(&plan, &e).await;
-                    MigrationLock::release(db, self.dialect).await.ok();
+                    MigrationLock::release(db, dialect).await.ok();
                     return Err(e);
                 }
             }
         }
 
-        MigrationLock::release(db, self.dialect).await.ok();
+        MigrationLock::release(db, dialect).await.ok();
         Ok(())
     }
 }

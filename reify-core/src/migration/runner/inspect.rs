@@ -4,6 +4,7 @@ use crate::db::Database;
 use crate::migration::diff::{ColumnDiff, SchemaDiff, TableDiff, normalize_sql_type};
 use crate::migration::error::MigrationError;
 use crate::migration::plan::{MigrationPlan, MigrationStatus};
+use crate::query::Dialect;
 use std::collections::HashSet;
 
 impl MigrationRunner {
@@ -26,10 +27,17 @@ impl MigrationRunner {
     /// | UNIQUE constraint mismatch | `ColumnDiff::UniqueChanged` |
     /// | Default value mismatch | `ColumnDiff::DefaultChanged` |
     pub async fn diff(&self, db: &impl Database) -> Result<SchemaDiff, MigrationError> {
+        let dialect = self.resolve_dialect(db);
+        self.diff_with_dialect(db, dialect).await
+    }
+
+    /// Compare all registered `Table` types against the live database schema
+    /// using the specified dialect.
+    pub(super) async fn diff_with_dialect(&self, db: &impl Database, dialect: Dialect) -> Result<SchemaDiff, MigrationError> {
         let mut table_diffs = Vec::new();
 
         for entry in &self.tables {
-            let db_cols = self.existing_column_details(db, entry.table_name).await?;
+            let db_cols = self.existing_column_details_with_dialect(db, entry.table_name, dialect).await?;
 
             let table_diff = match db_cols {
                 // ── Table does not exist yet ──────────────────────
@@ -62,9 +70,9 @@ impl MigrationRunner {
                                 let def = entry.column_defs.iter().find(|d| d.name == *col_name);
 
                                 // Type check: use metadata sql_type, falling back to TEXT.
-                                // Use the runner's dialect for accurate type comparison.
+                                // Use the resolved dialect for accurate type comparison.
                                 let raw_type = def
-                                    .map(|d| d.sql_type.to_sql(self.dialect))
+                                    .map(|d| d.sql_type.to_sql(dialect))
                                     .unwrap_or(std::borrow::Cow::Borrowed("TEXT"));
                                 let struct_type = normalize_sql_type(&raw_type);
                                 if struct_type != db_col.data_type {
@@ -139,8 +147,9 @@ impl MigrationRunner {
 
     /// Return the status of all registered migrations.
     pub async fn status(&self, db: &impl Database) -> Result<Vec<MigrationStatus>, MigrationError> {
-        self.ensure_tracking_table(db).await?;
-        let applied = self.applied_timestamps(db).await?;
+        let dialect = self.resolve_dialect(db);
+        self.ensure_tracking_table(db, dialect).await?;
+        let applied = self.applied_timestamps(db, dialect).await?;
 
         let mut statuses = Vec::new();
 
@@ -209,25 +218,26 @@ impl MigrationRunner {
     /// If the tracking table does not exist yet, it is treated as empty
     /// (all migrations are pending).
     pub async fn dry_run(&self, db: &impl Database) -> Result<Vec<MigrationPlan>, MigrationError> {
+        let dialect = self.resolve_dialect(db);
         // Read applied versions without creating the tracking table.
         // If the table doesn't exist the query will fail — treat that as "no
         // migrations applied yet" rather than a hard error.
         let applied: HashSet<String> = db
-            .query(&select_versions_sql(self.dialect), &[])
+            .query(&select_versions_sql(dialect), &[])
             .await
             .unwrap_or_default()
             .into_iter()
             .filter_map(|r| r.get_string("version"))
             .collect();
 
-        let mut plans = self.auto_diff_plans(db, &applied).await?;
+        let mut plans = self.auto_diff_plans(db, &applied, dialect).await?;
         plans.extend(self.view_plans(&applied));
         plans.extend(self.mat_view_plans(&applied));
         plans.extend(self.manual_plans(&applied));
 
         // Enrich auto-diff plans with structural schema diffs.
-        // diff() performs a direct information_schema comparison — read-only.
-        let schema_diff = self.diff(db).await?;
+        // diff_with_dialect() performs a direct information_schema comparison — read-only.
+        let schema_diff = self.diff_with_dialect(db, dialect).await?;
         for plan in &mut plans {
             // Only auto-table plans carry a schema_diff; views and manual plans do not.
             let table_name = if let Some(rest) = plan.version.strip_prefix("auto__") {

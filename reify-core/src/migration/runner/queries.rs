@@ -14,8 +14,9 @@ impl MigrationRunner {
     pub(super) async fn ensure_tracking_table(
         &self,
         db: &impl Database,
+        dialect: Dialect,
     ) -> Result<(), MigrationError> {
-        db.execute(create_tracking_table_sql(self.dialect), &[])
+        db.execute(create_tracking_table_sql(dialect), &[])
             .await?;
         Ok(())
     }
@@ -23,8 +24,8 @@ impl MigrationRunner {
     /// Return the dialect-appropriate current-schema expression.
     ///
     /// PostgreSQL: `CURRENT_SCHEMA()` — MySQL/MariaDB: `DATABASE()`.
-    pub(super) fn current_schema_expr(&self) -> &'static str {
-        match self.dialect {
+    pub(super) fn current_schema_expr(dialect: Dialect) -> &'static str {
+        match dialect {
             Dialect::Mysql => "DATABASE()",
             _ => "CURRENT_SCHEMA()",
         }
@@ -34,9 +35,10 @@ impl MigrationRunner {
     pub(super) async fn applied_versions(
         &self,
         db: &impl Database,
+        dialect: Dialect,
     ) -> Result<HashSet<String>, MigrationError> {
         let rows = db
-            .query(&select_versions_sql(self.dialect), &[])
+            .query(&select_versions_sql(dialect), &[])
             .await?;
         let versions = rows
             .into_iter()
@@ -51,9 +53,10 @@ impl MigrationRunner {
     pub(super) async fn applied_checksums(
         &self,
         db: &impl Database,
+        dialect: Dialect,
     ) -> Result<HashMap<String, String>, MigrationError> {
         let rows = db
-            .query(&select_checksums_sql(self.dialect), &[])
+            .query(&select_checksums_sql(dialect), &[])
             .await?;
         let map = rows
             .into_iter()
@@ -72,9 +75,10 @@ impl MigrationRunner {
     pub(super) async fn applied_timestamps(
         &self,
         db: &impl Database,
+        dialect: Dialect,
     ) -> Result<HashMap<String, String>, MigrationError> {
         let rows = db
-            .query(&select_timestamps_sql(self.dialect), &[])
+            .query(&select_timestamps_sql(dialect), &[])
             .await?;
         let map = rows
             .into_iter()
@@ -93,14 +97,15 @@ impl MigrationRunner {
     /// Also queries `information_schema.table_constraints` and
     /// `information_schema.key_column_usage` to determine which columns carry a
     /// UNIQUE constraint.
-    pub async fn existing_column_details(
+    pub async fn existing_column_details_with_dialect(
         &self,
         db: &impl Database,
         table: &str,
+        dialect: Dialect,
     ) -> Result<Option<Vec<DbColumnInfo>>, MigrationError> {
         // ── 1. Fetch column metadata ──────────────────────────────────
         // Filter by table_schema to avoid false matches in multi-schema environments.
-        let schema_expr = self.current_schema_expr();
+        let schema_expr = Self::current_schema_expr(dialect);
         let col_rows = db
             .query(
                 &format!(
@@ -167,17 +172,30 @@ impl MigrationRunner {
         Ok(Some(infos))
     }
 
+    /// Fetch detailed column metadata for a table from `information_schema`.
+    ///
+    /// This is a convenience wrapper that auto-detects the dialect from the database.
+    pub async fn existing_column_details(
+        &self,
+        db: &impl Database,
+        table: &str,
+    ) -> Result<Option<Vec<DbColumnInfo>>, MigrationError> {
+        let dialect = self.resolve_dialect(db);
+        self.existing_column_details_with_dialect(db, table, dialect).await
+    }
+
     /// Fetch existing column names for a table from the DB.
     ///
-    /// Delegates to [`existing_column_details`] and extracts just the names,
+    /// Delegates to [`existing_column_details_with_dialect`] and extracts just the names,
     /// avoiding a redundant `information_schema` query when both are needed.
     pub(super) async fn existing_columns(
         &self,
         db: &impl Database,
         table: &str,
+        dialect: Dialect,
     ) -> Result<Option<Vec<String>>, MigrationError> {
         Ok(self
-            .existing_column_details(db, table)
+            .existing_column_details_with_dialect(db, table, dialect)
             .await?
             .map(|cols| cols.into_iter().map(|c| c.name).collect()))
     }
@@ -190,8 +208,9 @@ impl MigrationRunner {
         &self,
         db: &impl Database,
         table: &str,
+        dialect: Dialect,
     ) -> Result<Vec<String>, MigrationError> {
-        let query = match self.dialect {
+        let query = match dialect {
             Dialect::Mysql => {
                 "SELECT DISTINCT index_name FROM information_schema.statistics \
                  WHERE table_name = ? AND table_schema = DATABASE() \
@@ -208,7 +227,7 @@ impl MigrationRunner {
             .await
             .unwrap_or_default();
 
-        let col_name = match self.dialect {
+        let col_name = match dialect {
             Dialect::Mysql => "index_name",
             _ => "indexname",
         };

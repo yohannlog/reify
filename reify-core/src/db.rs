@@ -336,6 +336,15 @@ pub trait Database: Send + Sync {
         &'a self,
         f: TransactionFn<'a>,
     ) -> impl std::future::Future<Output = Result<(), DbError>> + Send;
+
+    /// Returns the SQL dialect for this database connection.
+    ///
+    /// Used by `MigrationRunner` to auto-detect the correct DDL syntax.
+    /// Adapters override this to return their native dialect; the default
+    /// is `Dialect::Generic` for maximum compatibility.
+    fn dialect(&self) -> crate::query::Dialect {
+        crate::query::Dialect::Generic
+    }
 }
 
 // ── DynDatabase — dyn-compatible companion ──────────────────────────
@@ -359,6 +368,8 @@ pub trait DynDatabase: Send + Sync {
     fn query_one<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> BoxFuture<'a, Row>;
 
     fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> BoxFuture<'a, ()>;
+
+    fn dialect(&self) -> crate::query::Dialect;
 }
 
 impl<T: Database> DynDatabase for T {
@@ -385,6 +396,10 @@ impl<T: Database> DynDatabase for T {
     fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> BoxFuture<'a, ()> {
         Box::pin(Database::transaction(self, f))
     }
+
+    fn dialect(&self) -> crate::query::Dialect {
+        Database::dialect(self)
+    }
 }
 
 impl Database for Box<dyn DynDatabase> {
@@ -407,6 +422,9 @@ impl Database for Box<dyn DynDatabase> {
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         DynDatabase::transaction(self.as_ref(), f).await
     }
+    fn dialect(&self) -> crate::query::Dialect {
+        DynDatabase::dialect(self.as_ref())
+    }
 }
 
 impl Database for dyn DynDatabase + '_ {
@@ -428,6 +446,9 @@ impl Database for dyn DynDatabase + '_ {
     }
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         DynDatabase::transaction(self, f).await
+    }
+    fn dialect(&self) -> crate::query::Dialect {
+        DynDatabase::dialect(self)
     }
 }
 

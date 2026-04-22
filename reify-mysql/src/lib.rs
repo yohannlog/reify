@@ -413,6 +413,10 @@ impl Database for MysqlDb {
             }
         }
     }
+
+    fn dialect(&self) -> reify_core::query::Dialect {
+        reify_core::query::Dialect::Mysql
+    }
 }
 
 // ── MysqlTransaction — dedicated connection for transaction scope ───

@@ -45,31 +45,45 @@ pub struct MigrationRunner {
     pub(super) views: Vec<ViewEntry>,
     pub(super) mat_views: Vec<MatViewEntry>,
     pub(super) manual: Vec<Box<dyn Migration>>,
-    /// SQL dialect used for backend-specific DDL and DML.
-    pub(super) dialect: Dialect,
+    /// SQL dialect override. When `None`, dialect is auto-detected from the
+    /// database connection at runtime (Drizzle-style ergonomics).
+    pub(super) dialect_override: Option<Dialect>,
     /// Lifecycle hooks — called around each plan execution.
     pub(super) hooks: MigrationHooks,
 }
 
 impl MigrationRunner {
-    /// Create a new, empty runner targeting the generic (PostgreSQL-compatible) dialect.
+    /// Create a new, empty runner with auto-detected dialect.
+    ///
+    /// The SQL dialect is automatically detected from the database connection
+    /// when `run()` / `dry_run()` is called. Use `with_dialect()` to override.
     pub fn new() -> Self {
         Self {
             tables: Vec::new(),
             views: Vec::new(),
             mat_views: Vec::new(),
             manual: Vec::new(),
-            dialect: Dialect::default(),
+            dialect_override: None,
             hooks: MigrationHooks::default(),
         }
     }
 
-    /// Set the SQL dialect for this runner.
+    /// Resolve the effective dialect for this run.
     ///
-    /// Must be called before `run()` / `dry_run()`. Affects DDL for system
-    /// tables, `CURRENT_SCHEMA()` vs `DATABASE()`, and upsert syntax.
+    /// If `with_dialect()` was called, that dialect is used (explicit override).
+    /// Otherwise, the dialect is auto-detected from the database connection.
+    /// This enables Drizzle-style ergonomics where the dialect is intrinsic to
+    /// the connection — no need to specify it twice.
+    pub(super) fn resolve_dialect(&self, db: &impl crate::db::Database) -> Dialect {
+        self.dialect_override.unwrap_or_else(|| db.dialect())
+    }
+
+    /// Set the SQL dialect for this runner (explicit override).
+    ///
+    /// By default, the dialect is auto-detected from the database connection.
+    /// Use this method to override when needed (e.g., testing with a mock DB).
     pub fn with_dialect(mut self, dialect: Dialect) -> Self {
-        self.dialect = dialect;
+        self.dialect_override = Some(dialect);
         self
     }
 
@@ -347,13 +361,14 @@ impl MigrationRunner {
     {
         use crate::migration::lock::MigrationLock;
 
-        self.ensure_tracking_table(db).await?;
-        MigrationLock::ensure(db, self.dialect).await?;
-        MigrationLock::acquire(db, self.dialect).await?;
+        let dialect = self.resolve_dialect(db);
+        self.ensure_tracking_table(db, dialect).await?;
+        MigrationLock::ensure(db, dialect).await?;
+        MigrationLock::acquire(db, dialect).await?;
 
-        let result = self.run_interactive_inner(db, confirm).await;
+        let result = self.run_interactive_inner(db, confirm, dialect).await;
 
-        MigrationLock::release(db, self.dialect).await.ok();
+        MigrationLock::release(db, dialect).await.ok();
 
         result
     }

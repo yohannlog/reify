@@ -696,6 +696,10 @@ impl Database for PostgresDb {
             }
         }
     }
+
+    fn dialect(&self) -> reify_core::query::Dialect {
+        reify_core::query::Dialect::Postgres
+    }
 }
 
 // ── PgTransaction — dedicated connection for transaction scope ──────
