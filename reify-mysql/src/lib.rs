@@ -176,6 +176,7 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
             // MySQL UNSIGNED BIGINT can exceed i64::MAX. Return such values
             // as a decimal string (lossless) so callers can parse them as
             // u64, BigDecimal, etc. without silent clamping.
+            // TODO: handle unsigned integer properly (determine type ?)
             if *v > i64::MAX as u64 {
                 Value::String(v.to_string())
             } else {

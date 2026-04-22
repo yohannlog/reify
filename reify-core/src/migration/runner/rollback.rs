@@ -1,5 +1,8 @@
 use super::MigrationRunner;
-use super::entries::TRACKING_TABLE;
+use super::entries::{
+    delete_migration_sql, select_last_manual_version_sql, select_manual_versions_since_sql,
+    select_manual_versions_sql,
+};
 use crate::db::Database;
 use crate::migration::context::MigrationContext;
 use crate::migration::error::MigrationError;
@@ -9,10 +12,23 @@ use crate::value::Value;
 use tokio::time::timeout as tokio_timeout;
 
 impl MigrationRunner {
-    /// Roll back the last applied migration.
+    /// Roll back the last applied **manual** migration.
     ///
     /// Returns `MigrationError::NotReversible` if the migration declared
     /// `is_reversible() = false`.
+    ///
+    /// # Auto-migrations are not rollbackable
+    ///
+    /// Migrations registered via [`add_table`](MigrationRunner::add_table) (auto-diff)
+    /// are **excluded** from rollback. This is intentional:
+    ///
+    /// - `ADD COLUMN` rollback would require `DROP COLUMN`, which loses data.
+    /// - `CREATE TABLE` rollback would require `DROP TABLE`, which loses all rows.
+    /// - The runner cannot know if the column/table contains valuable data.
+    ///
+    /// If you need to undo an auto-migration, write a manual migration with an
+    /// explicit `down()` that handles data preservation (backup, migration to
+    /// another column, etc.).
     pub async fn rollback(&self, db: &impl Database) -> Result<(), MigrationError> {
         self.ensure_tracking_table(db).await?;
         MigrationLock::ensure(db, self.dialect).await?;
@@ -20,14 +36,7 @@ impl MigrationRunner {
 
         // Find the most recently applied manual migration
         let rows = db
-            .query(
-                &format!(
-                    "SELECT \"version\" FROM {TRACKING_TABLE} \
-                     WHERE \"version\" NOT LIKE 'auto__%' \
-                     ORDER BY \"applied_at\" DESC LIMIT 1;"
-                ),
-                &[],
-            )
+            .query(&select_last_manual_version_sql(self.dialect), &[])
             .await?;
 
         let last_version = rows.first().and_then(|r| r.get_string("version"));
@@ -72,17 +81,15 @@ impl MigrationRunner {
         self.hooks.call_before(&plan).await?;
         let stmts_clone = plan.statements.clone();
         let version_clone = version.clone();
+        let delete_sql = delete_migration_sql(self.dialect);
         let result = {
             let fut = db.transaction(Box::new(move |txn| {
                 Box::pin(async move {
                     for stmt in &stmts_clone {
                         txn.execute(stmt, &[]).await?;
                     }
-                    txn.execute(
-                        &format!("DELETE FROM {TRACKING_TABLE} WHERE \"version\" = ?;"),
-                        &[Value::String(version_clone.into())],
-                    )
-                    .await?;
+                    txn.execute(&delete_sql, &[Value::String(version_clone.into())])
+                        .await?;
                     Ok(())
                 })
             }));
@@ -121,14 +128,7 @@ impl MigrationRunner {
         MigrationLock::acquire(db, self.dialect).await?;
 
         let rows = db
-            .query(
-                &format!(
-                    "SELECT \"version\" FROM {TRACKING_TABLE} \
-                     WHERE \"version\" NOT LIKE 'auto__%' \
-                     ORDER BY \"applied_at\" DESC;"
-                ),
-                &[],
-            )
+            .query(&select_manual_versions_sql(self.dialect), &[])
             .await?;
 
         let versions: Vec<String> = rows
@@ -198,17 +198,15 @@ impl MigrationRunner {
             self.hooks.call_before(&plan).await?;
             let stmts_clone = plan.statements.clone();
             let version_clone = version.clone();
+            let delete_sql = delete_migration_sql(self.dialect);
             let result = {
                 let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
                         for stmt in &stmts_clone {
                             txn.execute(stmt, &[]).await?;
                         }
-                        txn.execute(
-                            &format!("DELETE FROM {TRACKING_TABLE} WHERE \"version\" = ?;"),
-                            &[Value::String(version_clone.into())],
-                        )
-                        .await?;
+                        txn.execute(&delete_sql, &[Value::String(version_clone.into())])
+                            .await?;
                         Ok(())
                     })
                 }));
@@ -258,13 +256,7 @@ impl MigrationRunner {
         // Fetch manual migrations applied at or after `since`, newest first.
         let rows = db
             .query(
-                &format!(
-                    "SELECT \"version\", CAST(\"applied_at\" AS TEXT) AS \"applied_at\" \
-                     FROM {TRACKING_TABLE} \
-                     WHERE \"version\" NOT LIKE 'auto__%' \
-                       AND CAST(\"applied_at\" AS TEXT) >= ? \
-                     ORDER BY \"applied_at\" DESC;"
-                ),
+                &select_manual_versions_since_sql(self.dialect),
                 &[Value::String(since.into())],
             )
             .await?;
@@ -328,17 +320,15 @@ impl MigrationRunner {
             self.hooks.call_before(&plan).await?;
             let stmts_clone = plan.statements.clone();
             let version_clone = version.clone();
+            let delete_sql = delete_migration_sql(self.dialect);
             let result = {
                 let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
                         for stmt in &stmts_clone {
                             txn.execute(stmt, &[]).await?;
                         }
-                        txn.execute(
-                            &format!("DELETE FROM {TRACKING_TABLE} WHERE \"version\" = ?;"),
-                            &[Value::String(version_clone.into())],
-                        )
-                        .await?;
+                        txn.execute(&delete_sql, &[Value::String(version_clone.into())])
+                            .await?;
                         Ok(())
                     })
                 }));

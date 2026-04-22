@@ -1,5 +1,5 @@
 use super::MigrationRunner;
-use super::entries::TRACKING_TABLE;
+use super::entries::select_versions_sql;
 use crate::db::Database;
 use crate::migration::diff::{ColumnDiff, SchemaDiff, TableDiff, normalize_sql_type};
 use crate::migration::error::MigrationError;
@@ -62,8 +62,9 @@ impl MigrationRunner {
                                 let def = entry.column_defs.iter().find(|d| d.name == *col_name);
 
                                 // Type check: use metadata sql_type, falling back to TEXT.
+                                // Use the runner's dialect for accurate type comparison.
                                 let raw_type = def
-                                    .map(|d| d.sql_type.to_sql(crate::query::Dialect::Generic))
+                                    .map(|d| d.sql_type.to_sql(self.dialect))
                                     .unwrap_or(std::borrow::Cow::Borrowed("TEXT"));
                                 let struct_type = normalize_sql_type(&raw_type);
                                 if struct_type != db_col.data_type {
@@ -212,7 +213,7 @@ impl MigrationRunner {
         // If the table doesn't exist the query will fail — treat that as "no
         // migrations applied yet" rather than a hard error.
         let applied: HashSet<String> = db
-            .query(&format!("SELECT \"version\" FROM {TRACKING_TABLE}"), &[])
+            .query(&select_versions_sql(self.dialect), &[])
             .await
             .unwrap_or_default()
             .into_iter()

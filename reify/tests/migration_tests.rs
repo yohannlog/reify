@@ -214,14 +214,19 @@ async fn runner_emits_create_table_for_new_tables() {
 async fn runner_emits_add_column_for_new_fields() {
     let db = MockDb::new();
     db.push_rows(vec![]); // applied_checksums → empty
-    // users table exists but missing "role"
+    // existing_column_details: users table exists but missing "role"
     db.push_rows(vec![
-        Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
         Row::new(
-            vec!["column_name".into()],
-            vec![Value::String("email".into())],
+            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+            vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
+        ),
+        Row::new(
+            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+            vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
         ),
     ]);
+    db.push_rows(vec![]); // unique constraints query
+    db.push_rows(vec![]); // existing_indexes query
 
     MigrationRunner::new()
         .add_table::<User>()
@@ -240,17 +245,23 @@ async fn runner_emits_add_column_for_new_fields() {
 async fn runner_skips_table_when_all_columns_present() {
     let db = MockDb::new();
     db.push_rows(vec![]); // applied_checksums → empty
+    // existing_column_details: all columns present
     db.push_rows(vec![
-        Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
         Row::new(
-            vec!["column_name".into()],
-            vec![Value::String("email".into())],
+            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+            vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
         ),
         Row::new(
-            vec!["column_name".into()],
-            vec![Value::String("role".into())],
+            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+            vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+        ),
+        Row::new(
+            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+            vec![Value::String("role".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
         ),
     ]);
+    db.push_rows(vec![]); // unique constraints query
+    db.push_rows(vec![]); // existing_indexes query
 
     MigrationRunner::new()
         .add_table::<User>()

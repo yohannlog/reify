@@ -1,11 +1,10 @@
 use super::MigrationRunner;
-use super::entries::TRACKING_TABLE;
+use super::entries::{insert_migration_sql, upsert_migration_sql};
 use crate::db::Database;
 use crate::migration::context::MigrationContext;
 use crate::migration::error::MigrationError;
 use crate::migration::lock::MigrationLock;
 use crate::migration::plan::compute_checksum;
-use crate::query::Dialect;
 use crate::value::Value;
 use std::collections::HashSet;
 use tokio::time::timeout as tokio_timeout;
@@ -80,6 +79,10 @@ impl MigrationRunner {
             .chain(view_plans)
             .chain(mat_view_plans)
             .chain(manual_plans);
+        // Use upsert to handle edge cases where a migration is re-run
+        // (e.g., after a partial failure or manual intervention).
+        let upsert_sql = upsert_migration_sql(self.dialect);
+
         for plan in all_plans {
             self.hooks.call_before(&plan).await?;
             let stmts = plan.statements.clone();
@@ -87,6 +90,7 @@ impl MigrationRunner {
             let description = plan.description.clone();
             let comment = plan.comment.clone();
             let checksum = plan.checksum.clone();
+            let upsert_sql = upsert_sql.clone();
             let result = {
                 let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
@@ -94,17 +98,13 @@ impl MigrationRunner {
                             txn.execute(stmt, &[]).await?;
                         }
                         txn.execute(
-                            &format!(
-                                "INSERT INTO {TRACKING_TABLE} \
-                                 (\"version\", \"description\", \"checksum\", \"comment\") \
-                                 VALUES (?, ?, ?, ?);"
-                            ),
+                            &upsert_sql,
                             &[
-                                Value::String(version.into()),
-                                Value::String(description.into()),
-                                Value::String(checksum.into()),
+                                Value::String(version),
+                                Value::String(description),
+                                Value::String(checksum),
                                 match comment {
-                                    Some(c) => Value::String(c.into()),
+                                    Some(c) => Value::String(c),
                                     None => Value::Null,
                                 },
                             ],
@@ -193,28 +193,7 @@ impl MigrationRunner {
         let manual_plans = self.manual_plans(&skip);
 
         // Build the dialect-appropriate upsert SQL once, outside the loop.
-        let upsert_sql: &'static str = match self.dialect {
-            Dialect::Mysql => {
-                "INSERT INTO \"_reify_migrations\" \
-                 (\"version\", \"description\", \"checksum\", \"comment\") \
-                 VALUES (?, ?, ?, ?) \
-                 ON DUPLICATE KEY UPDATE \
-                 \"description\" = VALUES(\"description\"), \
-                 \"checksum\" = VALUES(\"checksum\"), \
-                 \"comment\" = VALUES(\"comment\"), \
-                 \"applied_at\" = CURRENT_TIMESTAMP;"
-            }
-            _ => {
-                "INSERT INTO \"_reify_migrations\" \
-                 (\"version\", \"description\", \"checksum\", \"comment\") \
-                 VALUES (?, ?, ?, ?) \
-                 ON CONFLICT (\"version\") DO UPDATE \
-                 SET \"description\" = EXCLUDED.\"description\", \
-                     \"checksum\" = EXCLUDED.\"checksum\", \
-                     \"comment\" = EXCLUDED.\"comment\", \
-                     \"applied_at\" = NOW();"
-            }
-        };
+        let upsert_sql = upsert_migration_sql(self.dialect);
 
         let all_plans = auto_plans
             .into_iter()
@@ -228,6 +207,7 @@ impl MigrationRunner {
             let description = plan.description.clone();
             let comment = plan.comment.clone();
             let checksum = plan.checksum.clone();
+            let upsert_sql = upsert_sql.clone();
             let result = {
                 let fut = db.transaction(Box::new(move |txn| {
                     Box::pin(async move {
@@ -235,7 +215,7 @@ impl MigrationRunner {
                             txn.execute(stmt, &[]).await?;
                         }
                         txn.execute(
-                            upsert_sql,
+                            &upsert_sql,
                             &[
                                 Value::String(version),
                                 Value::String(description),

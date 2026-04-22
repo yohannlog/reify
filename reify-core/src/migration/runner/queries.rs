@@ -1,5 +1,5 @@
 use super::MigrationRunner;
-use super::entries::{TRACKING_TABLE, create_tracking_table_sql};
+use super::entries::{create_tracking_table_sql, select_checksums_sql, select_timestamps_sql, select_versions_sql};
 use crate::db::Database;
 use crate::migration::diff::{DbColumnInfo, normalize_sql_type};
 use crate::migration::error::MigrationError;
@@ -36,7 +36,7 @@ impl MigrationRunner {
         db: &impl Database,
     ) -> Result<HashSet<String>, MigrationError> {
         let rows = db
-            .query(&format!("SELECT \"version\" FROM {TRACKING_TABLE}"), &[])
+            .query(&select_versions_sql(self.dialect), &[])
             .await?;
         let versions = rows
             .into_iter()
@@ -53,10 +53,7 @@ impl MigrationRunner {
         db: &impl Database,
     ) -> Result<HashMap<String, String>, MigrationError> {
         let rows = db
-            .query(
-                &format!("SELECT \"version\", \"checksum\" FROM {TRACKING_TABLE}"),
-                &[],
-            )
+            .query(&select_checksums_sql(self.dialect), &[])
             .await?;
         let map = rows
             .into_iter()
@@ -77,13 +74,7 @@ impl MigrationRunner {
         db: &impl Database,
     ) -> Result<HashMap<String, String>, MigrationError> {
         let rows = db
-            .query(
-                &format!(
-                    "SELECT \"version\", CAST(\"applied_at\" AS TEXT) AS \"applied_at\" \
-                     FROM {TRACKING_TABLE}"
-                ),
-                &[],
-            )
+            .query(&select_timestamps_sql(self.dialect), &[])
             .await?;
         let map = rows
             .into_iter()
@@ -176,37 +167,55 @@ impl MigrationRunner {
         Ok(Some(infos))
     }
 
-    /// Fetch existing column names for a table from the DB (information_schema).
+    /// Fetch existing column names for a table from the DB.
     ///
-    /// Filters by the dialect-appropriate current-schema expression to avoid
-    /// false matches in multi-schema / multi-database environments.
+    /// Delegates to [`existing_column_details`] and extracts just the names,
+    /// avoiding a redundant `information_schema` query when both are needed.
     pub(super) async fn existing_columns(
         &self,
         db: &impl Database,
         table: &str,
     ) -> Result<Option<Vec<String>>, MigrationError> {
-        let schema_expr = self.current_schema_expr();
+        Ok(self
+            .existing_column_details(db, table)
+            .await?
+            .map(|cols| cols.into_iter().map(|c| c.name).collect()))
+    }
+
+    /// Fetch existing index names for a table from the database.
+    ///
+    /// Uses `pg_indexes` for PostgreSQL/Generic, `information_schema.statistics`
+    /// for MySQL. Returns an empty vec if the table doesn't exist.
+    pub(super) async fn existing_indexes(
+        &self,
+        db: &impl Database,
+        table: &str,
+    ) -> Result<Vec<String>, MigrationError> {
+        let query = match self.dialect {
+            Dialect::Mysql => {
+                "SELECT DISTINCT index_name FROM information_schema.statistics \
+                 WHERE table_name = ? AND table_schema = DATABASE() \
+                 AND index_name != 'PRIMARY';"
+            }
+            _ => {
+                "SELECT indexname FROM pg_indexes \
+                 WHERE tablename = ? AND schemaname = CURRENT_SCHEMA();"
+            }
+        };
+
         let rows = db
-            .query(
-                &format!(
-                    "SELECT column_name FROM information_schema.columns \
-                     WHERE table_name = ? \
-                       AND table_schema = {schema_expr} \
-                     ORDER BY ordinal_position;"
-                ),
-                &[Value::String(table.into())],
-            )
+            .query(query, &[Value::String(table.into())])
             .await
-            .map_err(MigrationError::Db)?;
+            .unwrap_or_default();
 
-        if rows.is_empty() {
-            return Ok(None); // table absent
-        }
+        let col_name = match self.dialect {
+            Dialect::Mysql => "index_name",
+            _ => "indexname",
+        };
 
-        let cols = rows
+        Ok(rows
             .into_iter()
-            .filter_map(|r| r.get_string("column_name"))
-            .collect();
-        Ok(Some(cols))
+            .filter_map(|r| r.get_string(col_name))
+            .collect())
     }
 }

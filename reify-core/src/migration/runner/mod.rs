@@ -1,5 +1,5 @@
 mod apply;
-mod entries;
+pub(crate) mod entries;
 mod hooks;
 mod inspect;
 mod plans;
@@ -120,13 +120,12 @@ impl MigrationRunner {
             }
         };
 
-        let create_sql = create_table_sql::<T>(&column_defs, Dialect::Generic);
-
         self.tables.push(TableEntry {
             table_name: T::table_name(),
             column_names: T::column_names(),
             column_defs,
-            create_sql,
+            indexes: T::indexes(),
+            checks: Vec::new(),
         });
         self
     }
@@ -136,13 +135,12 @@ impl MigrationRunner {
     where
         T: Table,
     {
-        let create_sql =
-            create_table_sql_with_checks::<T>(&schema.columns, &schema.checks, Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: T::table_name(),
             column_names: T::column_names(),
             column_defs: schema.columns,
-            create_sql,
+            indexes: schema.indexes,
+            checks: schema.checks,
         });
         self
     }
@@ -155,7 +153,6 @@ impl MigrationRunner {
         self = self.add_table::<T>();
         let audit_defs = T::audit_column_defs();
         let audit_name = T::audit_table_name();
-        let create_sql = create_table_sql_named(audit_name, &audit_defs, Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: audit_name,
             // NOTE: `column_names` is intentionally empty for audit tables.
@@ -164,7 +161,8 @@ impl MigrationRunner {
             // audit schema, register a manual migration instead.
             column_names: &[],
             column_defs: audit_defs,
-            create_sql,
+            indexes: Vec::new(), // Audit tables have no auto-managed indexes
+            checks: Vec::new(),
         });
         self
     }
@@ -181,12 +179,12 @@ impl MigrationRunner {
         self = self.add_table_with_schema(schema);
         let audit_defs = T::audit_column_defs();
         let audit_name = T::audit_table_name();
-        let create_sql = create_table_sql_named(audit_name, &audit_defs, Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: audit_name,
             column_names: &[],
             column_defs: audit_defs,
-            create_sql,
+            indexes: Vec::new(), // Audit tables have no auto-managed indexes
+            checks: Vec::new(),
         });
         self
     }

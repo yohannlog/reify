@@ -287,47 +287,27 @@ where
     })
 }
 
-/// Convenience for column-level range decoding: map a `DbError` to a
-/// logged warning + `Value::Null` so one malformed row doesn't abort the
-/// entire result set, but the error is still visible in logs.
-fn range_value_or_null<T, F>(raw: &[u8], ctor: fn(Range<T>) -> Value, parse_element: F) -> Value
-where
-    F: Fn(&[u8]) -> Option<T>,
-{
-    match range_from_pg(raw, parse_element) {
-        Ok(r) => ctor(r),
-        Err(e) => {
-            tracing::warn!(
-                target: "reify::postgres",
-                error = %e,
-                "Failed to deserialize PostgreSQL range column — returning Null"
-            );
-            Value::Null
-        }
-    }
-}
-
 // ── PostgreSQL row → reify Row conversion ───────────────────────────
 
-fn pg_row_to_row(row: &tokio_postgres::Row) -> Row {
+fn pg_row_to_row(row: &tokio_postgres::Row) -> Result<Row, DbError> {
     let columns: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
-    let values: Vec<Value> = row
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, col)| pg_column_to_value(row, i, col.type_()))
-        .collect();
-    Row::new(columns, values)
+    let mut values = Vec::with_capacity(row.columns().len());
+
+    for (i, col) in row.columns().iter().enumerate() {
+        values.push(pg_column_to_value(row, i, col.type_())?);
+    }
+
+    Ok(Row::new(columns, values))
 }
 
 fn pg_column_to_value(
     row: &tokio_postgres::Row,
     idx: usize,
     ty: &tokio_postgres::types::Type,
-) -> Value {
+) -> Result<Value, DbError> {
     use tokio_postgres::types::Type;
 
-    match *ty {
+    Ok(match *ty {
         Type::BOOL => row
             .try_get::<_, Option<bool>>(idx)
             .ok()
@@ -407,43 +387,58 @@ fn pg_column_to_value(
             .map(Value::Jsonb)
             .unwrap_or(Value::Null),
         Type::INT4_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => range_value_or_null(raw, Value::Int4Range, |b| {
-                use bytes::Buf;
-                if b.len() == 4 {
-                    Some((&b[..]).get_i32())
-                } else {
-                    None
-                }
-            }),
+            Ok(Some(raw)) => {
+                let r = range_from_pg(raw, |b| {
+                    use bytes::Buf;
+                    if b.len() == 4 {
+                        Some((&b[..]).get_i32())
+                    } else {
+                        None
+                    }
+                })?;
+                Value::Int4Range(r)
+            }
             _ => Value::Null,
         },
         Type::INT8_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => range_value_or_null(raw, Value::Int8Range, |b| {
-                use bytes::Buf;
-                if b.len() == 8 {
-                    Some((&b[..]).get_i64())
-                } else {
-                    None
-                }
-            }),
+            Ok(Some(raw)) => {
+                let r = range_from_pg(raw, |b| {
+                    use bytes::Buf;
+                    if b.len() == 8 {
+                        Some((&b[..]).get_i64())
+                    } else {
+                        None
+                    }
+                })?;
+                Value::Int8Range(r)
+            }
             _ => Value::Null,
         },
         Type::TS_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => range_value_or_null(raw, Value::TsRange, |b| {
-                postgres_types::FromSql::from_sql(&Type::TIMESTAMP, b).ok()
-            }),
+            Ok(Some(raw)) => {
+                let r = range_from_pg(raw, |b| {
+                    postgres_types::FromSql::from_sql(&Type::TIMESTAMP, b).ok()
+                })?;
+                Value::TsRange(r)
+            }
             _ => Value::Null,
         },
         Type::TSTZ_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => range_value_or_null(raw, Value::TstzRange, |b| {
-                postgres_types::FromSql::from_sql(&Type::TIMESTAMPTZ, b).ok()
-            }),
+            Ok(Some(raw)) => {
+                let r = range_from_pg(raw, |b| {
+                    postgres_types::FromSql::from_sql(&Type::TIMESTAMPTZ, b).ok()
+                })?;
+                Value::TstzRange(r)
+            }
             _ => Value::Null,
         },
         Type::DATE_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
-            Ok(Some(raw)) => range_value_or_null(raw, Value::DateRange, |b| {
-                postgres_types::FromSql::from_sql(&Type::DATE, b).ok()
-            }),
+            Ok(Some(raw)) => {
+                let r = range_from_pg(raw, |b| {
+                    postgres_types::FromSql::from_sql(&Type::DATE, b).ok()
+                })?;
+                Value::DateRange(r)
+            }
             _ => Value::Null,
         },
         Type::BOOL_ARRAY => row
@@ -513,7 +508,7 @@ fn pg_column_to_value(
                 .map(Value::String)
                 .unwrap_or(Value::Null)
         }
-    }
+    })
 }
 
 // ── Error conversion helpers ─────────────────────────────────────────
@@ -592,7 +587,7 @@ async fn pg_query(
     let (sql, param_refs) = prepare_pg_params(sql, params, &mut pg_params);
     debug!(target: "reify::postgres", sql = %sql, "Querying");
     let rows = client.query(&sql, &param_refs[..]).await.map_err(pg_err)?;
-    Ok(rows.iter().map(pg_row_to_row).collect())
+    rows.iter().map(pg_row_to_row).collect()
 }
 
 /// Prepare params and run a query returning exactly one row.
@@ -608,7 +603,7 @@ async fn pg_query_one(
         .query_one(&sql, &param_refs[..])
         .await
         .map_err(pg_err)?;
-    Ok(pg_row_to_row(&row))
+    pg_row_to_row(&row)
 }
 
 // ── Database trait implementation ───────────────────────────────────
@@ -661,7 +656,10 @@ impl Database for PostgresDb {
                 use futures_util::StreamExt;
                 match row_stream.next().await {
                     Some(res) => Some((
-                        res.map(|r| pg_row_to_row(&r)).map_err(pg_err),
+                        match res {
+                            Ok(r) => pg_row_to_row(&r),
+                            Err(e) => Err(pg_err(e)),
+                        },
                         (row_stream, conn),
                     )),
                     None => None,
@@ -757,3 +755,33 @@ impl Database for PgTransaction {
 }
 
 mod copy;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reify_core::range::Range;
+    use reify_core::value::Value;
+
+    #[test]
+    fn test_range_from_pg_corrupt_data() {
+        let corrupt_raw = &[];
+        let result = range_from_pg(corrupt_raw, |b| {
+            if b.len() == 4 { Some(0) } else { None }
+        });
+
+        assert!(matches!(result, Err(DbError::Conversion(_))));
+    }
+
+    #[test]
+    fn test_range_from_pg_element_decode_failure() {
+        let valid_envelope_but_parse_fail = &[
+            0x01 | 0x02 | 0x04,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
+        ];
+
+        let result = range_from_pg::<i32, _>(valid_envelope_but_parse_fail, |_| None);
+
+        assert!(matches!(result, Err(DbError::Conversion(msg)) if msg == "range element decode failed"));
+    }
+}

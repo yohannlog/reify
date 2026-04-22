@@ -152,6 +152,32 @@ mod tests {
         }
     }
 
+    /// Users table with an index on email for testing index creation.
+    struct UsersWithIndex;
+    impl Table for UsersWithIndex {
+        fn table_name() -> &'static str {
+            "users"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "email", "role"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+        fn column_defs() -> Vec<crate::schema::ColumnDef> {
+            Users::column_defs()
+        }
+        fn indexes() -> Vec<crate::schema::IndexDef> {
+            vec![crate::schema::IndexDef {
+                name: None,
+                columns: vec![crate::schema::IndexColumnDef::asc("email")],
+                unique: false,
+                kind: crate::schema::IndexKind::BTree,
+                predicate: None,
+            }]
+        }
+    }
+
     // ── Manual migration fixture ─────────────────────────────────────
 
     struct AddUserCity;
@@ -207,19 +233,24 @@ mod tests {
         let db = MockDb::new();
         db.push_query_result(vec![]); // applied_versions → empty
 
-        // existing_columns returns all three columns → no diff
+        // existing_column_details: column metadata query
         let existing = vec![
-            Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
             Row::new(
-                vec!["column_name".into()],
-                vec![Value::String("email".into())],
+                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+                vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
             ),
             Row::new(
-                vec!["column_name".into()],
-                vec![Value::String("role".into())],
+                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+                vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+            ),
+            Row::new(
+                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+                vec![Value::String("role".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
             ),
         ];
         db.push_query_result(existing);
+        db.push_query_result(vec![]); // unique constraints query
+        db.push_query_result(vec![]); // existing_indexes query
 
         let runner = MigrationRunner::new().add_table::<Users>();
         let plans = runner.dry_run(&db).await.unwrap();
@@ -232,15 +263,20 @@ mod tests {
         let db = MockDb::new();
         db.push_query_result(vec![]); // applied_versions → empty
 
-        // Table exists but missing "role"
+        // existing_column_details: Table exists but missing "role"
         let existing = vec![
-            Row::new(vec!["column_name".into()], vec![Value::String("id".into())]),
             Row::new(
-                vec!["column_name".into()],
-                vec![Value::String("email".into())],
+                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+                vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
+            ),
+            Row::new(
+                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
+                vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
             ),
         ];
         db.push_query_result(existing);
+        db.push_query_result(vec![]); // unique constraints query
+        db.push_query_result(vec![]); // existing_indexes query
 
         let runner = MigrationRunner::new().add_table::<Users>();
         let plans = runner.dry_run(&db).await.unwrap();
@@ -1291,4 +1327,481 @@ mod tests {
             "CREATE TABLE users should not run when before_each aborts: {sql:?}"
         );
     }
+
+    // ── Dialect-aware SQL generation tests ────────────────────────────
+
+    #[test]
+    fn tracking_table_sql_uses_backticks_for_mysql() {
+        use super::runner::entries::{quote_col, tracking_table};
+        use crate::query::Dialect;
+
+        assert_eq!(tracking_table(Dialect::Mysql), "`_reify_migrations`");
+        assert_eq!(tracking_table(Dialect::Postgres), "\"_reify_migrations\"");
+        assert_eq!(tracking_table(Dialect::Generic), "\"_reify_migrations\"");
+
+        assert_eq!(quote_col("version", Dialect::Mysql), "`version`");
+        assert_eq!(quote_col("version", Dialect::Postgres), "\"version\"");
+    }
+
+    #[test]
+    fn select_versions_sql_uses_dialect_quoting() {
+        use super::runner::entries::select_versions_sql;
+        use crate::query::Dialect;
+
+        let mysql_sql = select_versions_sql(Dialect::Mysql);
+        assert!(mysql_sql.contains("`_reify_migrations`"));
+        assert!(mysql_sql.contains("`version`"));
+
+        let pg_sql = select_versions_sql(Dialect::Postgres);
+        assert!(pg_sql.contains("\"_reify_migrations\""));
+        assert!(pg_sql.contains("\"version\""));
+    }
+
+    #[test]
+    fn insert_migration_sql_uses_dialect_quoting() {
+        use super::runner::entries::insert_migration_sql;
+        use crate::query::Dialect;
+
+        let mysql_sql = insert_migration_sql(Dialect::Mysql);
+        assert!(mysql_sql.contains("`_reify_migrations`"));
+        assert!(mysql_sql.contains("`version`"));
+        assert!(mysql_sql.contains("`description`"));
+
+        let pg_sql = insert_migration_sql(Dialect::Postgres);
+        assert!(pg_sql.contains("\"_reify_migrations\""));
+        assert!(pg_sql.contains("\"version\""));
+    }
+
+    #[test]
+    fn upsert_migration_sql_uses_dialect_syntax() {
+        use super::runner::entries::upsert_migration_sql;
+        use crate::query::Dialect;
+
+        let mysql_sql = upsert_migration_sql(Dialect::Mysql);
+        assert!(mysql_sql.contains("ON DUPLICATE KEY UPDATE"));
+        assert!(mysql_sql.contains("`_reify_migrations`"));
+
+        let pg_sql = upsert_migration_sql(Dialect::Postgres);
+        assert!(pg_sql.contains("ON CONFLICT"));
+        assert!(pg_sql.contains("EXCLUDED"));
+        assert!(pg_sql.contains("\"_reify_migrations\""));
+    }
+
+    // ── Index DDL tests ───────────────────────────────────────────────
+
+    #[test]
+    fn create_index_sql_basic() {
+        use crate::migration::ddl::create_index_sql;
+        use crate::query::Dialect;
+        use crate::schema::{IndexColumnDef, IndexDef, IndexKind};
+
+        let idx = IndexDef {
+            name: None,
+            columns: vec![IndexColumnDef::asc("email")],
+            unique: false,
+            kind: IndexKind::BTree,
+            predicate: None,
+        };
+
+        let sql = create_index_sql("users", &idx, Dialect::Postgres);
+        assert!(sql.contains("CREATE INDEX"));
+        assert!(sql.contains("\"idx_email\""));
+        assert!(sql.contains("ON \"users\""));
+        assert!(sql.contains("\"email\" ASC"));
+        assert!(sql.contains("USING btree"));
+    }
+
+    #[test]
+    fn create_index_sql_unique() {
+        use crate::migration::ddl::create_index_sql;
+        use crate::query::Dialect;
+        use crate::schema::{IndexColumnDef, IndexDef, IndexKind};
+
+        let idx = IndexDef {
+            name: Some("users_email_unique".into()),
+            columns: vec![IndexColumnDef::asc("email")],
+            unique: true,
+            kind: IndexKind::BTree,
+            predicate: None,
+        };
+
+        let sql = create_index_sql("users", &idx, Dialect::Postgres);
+        assert!(sql.contains("CREATE UNIQUE INDEX"));
+        assert!(sql.contains("\"users_email_unique\""));
+    }
+
+    #[test]
+    fn create_index_sql_composite() {
+        use crate::migration::ddl::create_index_sql;
+        use crate::query::Dialect;
+        use crate::schema::{IndexColumnDef, IndexDef, IndexKind};
+
+        let idx = IndexDef {
+            name: None,
+            columns: vec![
+                IndexColumnDef::asc("tenant_id"),
+                IndexColumnDef::desc("created_at"),
+            ],
+            unique: false,
+            kind: IndexKind::BTree,
+            predicate: None,
+        };
+
+        let sql = create_index_sql("orders", &idx, Dialect::Postgres);
+        assert!(sql.contains("\"idx_tenant_id_created_at\""));
+        assert!(sql.contains("\"tenant_id\" ASC"));
+        assert!(sql.contains("\"created_at\" DESC"));
+    }
+
+    #[test]
+    fn create_index_sql_partial() {
+        use crate::migration::ddl::create_index_sql;
+        use crate::query::Dialect;
+        use crate::schema::{IndexColumnDef, IndexDef, IndexKind};
+
+        let idx = IndexDef {
+            name: Some("active_users_idx".into()),
+            columns: vec![IndexColumnDef::asc("email")],
+            unique: false,
+            kind: IndexKind::BTree,
+            predicate: Some("deleted_at IS NULL".into()),
+        };
+
+        let sql = create_index_sql("users", &idx, Dialect::Postgres);
+        assert!(sql.contains("WHERE deleted_at IS NULL"));
+    }
+
+    #[test]
+    fn create_index_sql_mysql_dialect() {
+        use crate::migration::ddl::create_index_sql;
+        use crate::query::Dialect;
+        use crate::schema::{IndexColumnDef, IndexDef, IndexKind};
+
+        let idx = IndexDef {
+            name: None,
+            columns: vec![IndexColumnDef::asc("email")],
+            unique: false,
+            kind: IndexKind::BTree,
+            predicate: None,
+        };
+
+        let sql = create_index_sql("users", &idx, Dialect::Mysql);
+        assert!(sql.contains("`idx_email`"));
+        assert!(sql.contains("ON `users`"));
+        assert!(sql.contains("`email` ASC"));
+        assert!(sql.contains("USING BTREE"));
+    }
+
+    #[test]
+    fn drop_index_sql_postgres() {
+        use crate::migration::ddl::drop_index_sql;
+        use crate::query::Dialect;
+
+        let sql = drop_index_sql("users", "idx_email", Dialect::Postgres);
+        assert_eq!(sql, "DROP INDEX IF EXISTS \"idx_email\";");
+    }
+
+    #[test]
+    fn drop_index_sql_mysql() {
+        use crate::migration::ddl::drop_index_sql;
+        use crate::query::Dialect;
+
+        let sql = drop_index_sql("users", "idx_email", Dialect::Mysql);
+        assert_eq!(sql, "DROP INDEX `idx_email` ON `users`;");
+    }
+
+    // ── add_column_sql dialect test ───────────────────────────────────
+
+    #[test]
+    fn add_column_sql_uses_dialect() {
+        use crate::migration::ddl::add_column_sql;
+        use crate::query::Dialect;
+        use crate::schema::{ColumnDef, SqlType, TimestampSource};
+
+        let def = ColumnDef {
+            name: "status",
+            sql_type: SqlType::Text,
+            primary_key: false,
+            auto_increment: false,
+            unique: false,
+            index: false,
+            nullable: true,
+            default: None,
+            computed: None,
+            timestamp_kind: None,
+            timestamp_source: TimestampSource::Vm,
+            check: None,
+            foreign_key: None,
+        };
+
+        let pg_sql = add_column_sql("users", "status", Some(&def), Dialect::Postgres);
+        assert!(pg_sql.contains("ALTER TABLE \"users\""));
+        assert!(pg_sql.contains("ADD COLUMN \"status\""));
+
+        let mysql_sql = add_column_sql("users", "status", Some(&def), Dialect::Mysql);
+        assert!(mysql_sql.contains("ALTER TABLE `users`"));
+        assert!(mysql_sql.contains("ADD COLUMN `status`"));
+    }
+
+    // ── Auto-diff index creation tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn dry_run_new_table_with_index_emits_create_index() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns → table absent
+
+        let runner = MigrationRunner::new().add_table::<UsersWithIndex>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert_eq!(plans.len(), 1);
+        let stmts = &plans[0].statements;
+        assert!(
+            stmts.iter().any(|s| s.contains("CREATE TABLE")),
+            "expected CREATE TABLE in: {stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|s| s.contains("CREATE INDEX")),
+            "expected CREATE INDEX in: {stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|s| s.contains("idx_email")),
+            "expected idx_email in: {stmts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_existing_table_missing_index_emits_create_index() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+
+        // existing_column_details: Table exists with all columns
+        let existing = vec![
+            Row::new(
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("id".into()),
+                    Value::String("bigint".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
+            ),
+            Row::new(
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("email".into()),
+                    Value::String("text".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
+            ),
+            Row::new(
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("role".into()),
+                    Value::String("text".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
+            ),
+        ];
+        db.push_query_result(existing);
+        db.push_query_result(vec![]); // unique constraints query
+        db.push_query_result(vec![]); // existing_indexes → no indexes
+
+        let runner = MigrationRunner::new().add_table::<UsersWithIndex>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert_eq!(plans.len(), 1);
+        let stmts = &plans[0].statements;
+        assert!(
+            stmts.iter().any(|s| s.contains("CREATE INDEX")),
+            "expected CREATE INDEX in: {stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|s| s.contains("idx_email")),
+            "expected idx_email in: {stmts:?}"
+        );
+        // Should NOT contain CREATE TABLE since table exists
+        assert!(
+            !stmts.iter().any(|s| s.contains("CREATE TABLE")),
+            "unexpected CREATE TABLE in: {stmts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_existing_table_with_index_emits_nothing() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+
+        // existing_column_details: Table exists with all columns
+        let existing = vec![
+            Row::new(
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("id".into()),
+                    Value::String("bigint".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
+            ),
+            Row::new(
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("email".into()),
+                    Value::String("text".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
+            ),
+            Row::new(
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("role".into()),
+                    Value::String("text".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
+            ),
+        ];
+        db.push_query_result(existing);
+        db.push_query_result(vec![]); // unique constraints query
+
+        // existing_indexes → index already exists
+        let idx_row = Row::new(
+            vec!["indexname".into()],
+            vec![Value::String("idx_email".into())],
+        );
+        db.push_query_result(vec![idx_row]);
+
+        let runner = MigrationRunner::new().add_table::<UsersWithIndex>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert!(
+            plans.is_empty(),
+            "expected no plans when table and index exist: {plans:?}"
+        );
+    }
+
+    // ── Dialect-aware CREATE TABLE tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn dry_run_mysql_dialect_uses_backticks() {
+        use crate::query::Dialect;
+
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns → table absent
+
+        let runner = MigrationRunner::new()
+            .with_dialect(Dialect::Mysql)
+            .add_table::<Users>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert_eq!(plans.len(), 1);
+        let create_stmt = &plans[0].statements[0];
+        assert!(
+            create_stmt.contains("`users`"),
+            "expected backtick-quoted table name in MySQL: {create_stmt}"
+        );
+        assert!(
+            create_stmt.contains("`id`"),
+            "expected backtick-quoted column name in MySQL: {create_stmt}"
+        );
+        // Should NOT contain double quotes
+        assert!(
+            !create_stmt.contains("\"users\""),
+            "unexpected double-quoted table name in MySQL: {create_stmt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_postgres_dialect_uses_double_quotes() {
+        use crate::query::Dialect;
+
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns → table absent
+
+        let runner = MigrationRunner::new()
+            .with_dialect(Dialect::Postgres)
+            .add_table::<Users>();
+        let plans = runner.dry_run(&db).await.unwrap();
+
+        assert_eq!(plans.len(), 1);
+        let create_stmt = &plans[0].statements[0];
+        assert!(
+            create_stmt.contains("\"users\""),
+            "expected double-quoted table name in Postgres: {create_stmt}"
+        );
+        assert!(
+            create_stmt.contains("\"id\""),
+            "expected double-quoted column name in Postgres: {create_stmt}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_named_with_checks_uses_dialect() {
+        use crate::migration::ddl::create_table_sql_named_with_checks;
+        use crate::query::Dialect;
+        use crate::schema::{ColumnDef, SqlType, TimestampSource};
+
+        let defs = vec![ColumnDef {
+            name: "id",
+            sql_type: SqlType::BigInt,
+            primary_key: true,
+            auto_increment: false,
+            unique: false,
+            index: false,
+            nullable: false,
+            default: None,
+            computed: None,
+            timestamp_kind: None,
+            timestamp_source: TimestampSource::Vm,
+            check: None,
+            foreign_key: None,
+        }];
+        let checks = vec!["id > 0".to_string()];
+
+        let pg_sql = create_table_sql_named_with_checks("test", &defs, &checks, Dialect::Postgres);
+        assert!(pg_sql.contains("\"test\""));
+        assert!(pg_sql.contains("\"id\""));
+        assert!(pg_sql.contains("CHECK (id > 0)"));
+
+        let mysql_sql = create_table_sql_named_with_checks("test", &defs, &checks, Dialect::Mysql);
+        assert!(mysql_sql.contains("`test`"));
+        assert!(mysql_sql.contains("`id`"));
+        assert!(mysql_sql.contains("CHECK (id > 0)"));
+    }
+
 }
