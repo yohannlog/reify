@@ -252,4 +252,109 @@ impl MigrationRunner {
 
         Ok(())
     }
+
+    /// Inner interactive run logic — called after the lock is acquired.
+    ///
+    /// Same as `run_inner` but calls `confirm(&plan)` before each migration.
+    /// Returns `UserAborted` if the callback returns `false`.
+    pub(super) async fn run_interactive_inner<F>(
+        &self,
+        db: &impl Database,
+        confirm: F,
+    ) -> Result<(), MigrationError>
+    where
+        F: Fn(&crate::migration::plan::MigrationPlan) -> bool + Send + Sync,
+    {
+        let applied = self.applied_checksums(db).await?;
+        let applied_versions: HashSet<String> = applied.keys().cloned().collect();
+
+        // Verify checksums for already-applied manual migrations.
+        for m in &self.manual {
+            if let Some(stored) = applied.get(m.version()) {
+                let mut ctx = MigrationContext::new();
+                m.up(&mut ctx);
+                let computed = compute_checksum(&ctx.into_statements());
+                if computed != *stored {
+                    return Err(MigrationError::ChecksumMismatch {
+                        version: m.version().to_string(),
+                        stored: stored.clone(),
+                        computed,
+                    });
+                }
+            }
+        }
+
+        // Collect all pending plans up-front.
+        let auto_plans = self.auto_diff_plans(db, &applied_versions).await?;
+        let view_plans = self.view_plans(&applied_versions);
+        let mat_view_plans = self.mat_view_plans(&applied_versions);
+        let manual_plans = self.manual_plans(&applied_versions);
+
+        let all_plans = auto_plans
+            .into_iter()
+            .chain(view_plans)
+            .chain(mat_view_plans)
+            .chain(manual_plans);
+
+        let upsert_sql = upsert_migration_sql(self.dialect);
+
+        for plan in all_plans {
+            // Interactive confirmation — abort if user declines.
+            if !confirm(&plan) {
+                return Err(MigrationError::UserAborted {
+                    version: plan.version.clone(),
+                });
+            }
+
+            self.hooks.call_before(&plan).await?;
+            let stmts = plan.statements.clone();
+            let version = plan.version.clone();
+            let description = plan.description.clone();
+            let comment = plan.comment.clone();
+            let checksum = plan.checksum.clone();
+            let upsert_sql = upsert_sql.clone();
+            let result = {
+                let fut = db.transaction(Box::new(move |txn| {
+                    Box::pin(async move {
+                        for stmt in &stmts {
+                            txn.execute(stmt, &[]).await?;
+                        }
+                        txn.execute(
+                            &upsert_sql,
+                            &[
+                                Value::String(version),
+                                Value::String(description),
+                                Value::String(checksum),
+                                match comment {
+                                    Some(c) => Value::String(c),
+                                    None => Value::Null,
+                                },
+                            ],
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                }));
+                match plan.timeout {
+                    Some(dur) => tokio_timeout(dur, fut)
+                        .await
+                        .map_err(|_| MigrationError::TimedOut {
+                            version: plan.version.clone(),
+                            timeout_secs: dur.as_secs(),
+                        })
+                        .and_then(|r| r.map_err(MigrationError::Db)),
+                    None => fut.await.map_err(MigrationError::Db),
+                }
+            };
+            match result {
+                Ok(()) => self.hooks.call_after(&plan).await?,
+                Err(e) => {
+                    self.hooks.call_error(&plan, &e).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }

@@ -304,6 +304,59 @@ impl MigrationRunner {
         });
         self
     }
+
+    /// Apply pending migrations interactively, prompting for confirmation before each.
+    ///
+    /// Similar to `run()`, but calls `confirm(&plan)` before executing each migration.
+    /// If the callback returns `false`, the migration is **not** applied and
+    /// `MigrationError::UserAborted` is returned immediately — no subsequent
+    /// migrations are attempted.
+    ///
+    /// This enables Drizzle-style `--strict` mode where users review each SQL
+    /// statement before it touches the database.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::io::{self, Write};
+    ///
+    /// runner.run_interactive(&db, |plan| {
+    ///     println!("{}", plan.display());
+    ///     print!("Apply this migration? [Y/n] ");
+    ///     io::stdout().flush().unwrap();
+    ///
+    ///     let mut input = String::new();
+    ///     io::stdin().read_line(&mut input).unwrap();
+    ///     let input = input.trim().to_lowercase();
+    ///     input.is_empty() || input == "y" || input == "yes"
+    /// }).await?;
+    /// ```
+    ///
+    /// # Lifecycle hooks
+    ///
+    /// `on_before_each` / `on_after_each` / `on_migration_error` hooks are still
+    /// called around each migration, just as with `run()`. The confirm callback
+    /// is invoked **before** `on_before_each`.
+    pub async fn run_interactive<F>(
+        &self,
+        db: &impl crate::db::Database,
+        confirm: F,
+    ) -> Result<(), crate::migration::MigrationError>
+    where
+        F: Fn(&MigrationPlan) -> bool + Send + Sync,
+    {
+        use crate::migration::lock::MigrationLock;
+
+        self.ensure_tracking_table(db).await?;
+        MigrationLock::ensure(db, self.dialect).await?;
+        MigrationLock::acquire(db, self.dialect).await?;
+
+        let result = self.run_interactive_inner(db, confirm).await;
+
+        MigrationLock::release(db, self.dialect).await.ok();
+
+        result
+    }
 }
 
 impl Default for MigrationRunner {

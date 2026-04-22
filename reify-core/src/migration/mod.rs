@@ -1804,4 +1804,87 @@ mod tests {
         assert!(mysql_sql.contains("CHECK (id > 0)"));
     }
 
+    // ── Interactive mode tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_interactive_aborts_on_reject() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns users → absent
+
+        let runner = MigrationRunner::new().add_table::<Users>();
+
+        // Confirm callback always returns false → user rejects
+        let result = runner.run_interactive(&db, |_plan| false).await;
+
+        assert!(
+            matches!(result, Err(MigrationError::UserAborted { ref version }) if version == "auto__users"),
+            "expected UserAborted for auto__users, got: {result:?}"
+        );
+
+        // The CREATE TABLE should NOT have been executed
+        let sql = db.executed_sql();
+        assert!(
+            !sql.iter()
+                .any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
+            "CREATE TABLE users should not run when user aborts: {sql:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_interactive_applies_on_accept() {
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns users → absent
+
+        let runner = MigrationRunner::new().add_table::<Users>();
+
+        // Confirm callback always returns true → user accepts
+        let result = runner.run_interactive(&db, |_plan| true).await;
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        // The CREATE TABLE should have been executed
+        let sql = db.executed_sql();
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("CREATE TABLE IF NOT EXISTS \"users\"")),
+            "CREATE TABLE users should run when user accepts: {sql:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_interactive_stops_at_first_reject() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let db = MockDb::new();
+        db.push_query_result(vec![]); // applied_versions → empty
+        db.push_query_result(vec![]); // existing_columns users → absent
+
+        let runner = MigrationRunner::new()
+            .add_table::<Users>()
+            .add(AddUserCity);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // Accept first, reject second
+        let result = runner
+            .run_interactive(&db, move |_plan| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                count == 0 // true for first, false for second
+            })
+            .await;
+
+        // Should abort on the second migration (AddUserCity)
+        assert!(
+            matches!(result, Err(MigrationError::UserAborted { ref version }) if version == "20240320_000001_add_user_city"),
+            "expected UserAborted for manual migration, got: {result:?}"
+        );
+
+        // Confirm was called twice (once for each pending migration)
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
 }
