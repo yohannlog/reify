@@ -9,7 +9,8 @@ const STALE_LOCK_MINUTES: u32 = 10;
 
 /// DDL for the lock table, parameterised by dialect.
 ///
-/// PostgreSQL uses `TIMESTAMPTZ` and `BOOLEAN`; MySQL uses `DATETIME` and `TINYINT(1)`.
+/// PostgreSQL uses `TIMESTAMPTZ` and `BOOLEAN`; MySQL uses `DATETIME` and `TINYINT(1)`;
+/// SQLite uses `TEXT` for timestamps and `INTEGER` for booleans.
 fn create_lock_table_sql(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Mysql => {
@@ -18,6 +19,14 @@ fn create_lock_table_sql(dialect: Dialect) -> &'static str {
              `locked`    TINYINT(1)  NOT NULL DEFAULT 0,\
              `locked_by` TEXT,\
              `locked_at` DATETIME\
+             );"
+        }
+        Dialect::Sqlite => {
+            "CREATE TABLE IF NOT EXISTS \"_reify_migrations_lock\" (\
+             \"id\"        INTEGER   NOT NULL DEFAULT 1 PRIMARY KEY CHECK (\"id\" = 1),\
+             \"locked\"    INTEGER   NOT NULL DEFAULT 0,\
+             \"locked_by\" TEXT,\
+             \"locked_at\" TEXT\
              );"
         }
         _ => {
@@ -38,6 +47,11 @@ fn acquire_sql(dialect: Dialect) -> String {
             "UPDATE `_reify_migrations_lock` \
              SET `locked` = 1, `locked_by` = ?, `locked_at` = NOW() \
              WHERE `id` = 1 AND (`locked` = 0 OR `locked_at` < NOW() - INTERVAL {STALE_LOCK_MINUTES} MINUTE);"
+        ),
+        Dialect::Sqlite => format!(
+            "UPDATE \"_reify_migrations_lock\" \
+             SET \"locked\" = 1, \"locked_by\" = ?, \"locked_at\" = datetime('now') \
+             WHERE \"id\" = 1 AND (\"locked\" = 0 OR \"locked_at\" < datetime('now', '-{STALE_LOCK_MINUTES} minutes'));"
         ),
         _ => format!(
             "UPDATE \"_reify_migrations_lock\" \
@@ -87,6 +101,9 @@ impl MigrationLock {
         let insert = match dialect {
             Dialect::Mysql => {
                 "INSERT IGNORE INTO `_reify_migrations_lock` (`id`, `locked`) VALUES (1, 0);"
+            }
+            Dialect::Sqlite => {
+                "INSERT INTO \"_reify_migrations_lock\" (\"id\", \"locked\") VALUES (1, 0) ON CONFLICT DO NOTHING;"
             }
             _ => {
                 "INSERT INTO \"_reify_migrations_lock\" (\"id\", \"locked\") VALUES (1, false) ON CONFLICT DO NOTHING;"
@@ -142,13 +159,19 @@ impl MigrationLock {
     /// Release the lock.
     ///
     /// The SQL is dialect-aware: MySQL uses `0` for the `TINYINT(1)` column;
-    /// PostgreSQL and Generic use `false` for the `BOOLEAN` column.
+    /// PostgreSQL and Generic use `false` for the `BOOLEAN` column;
+    /// SQLite uses `0` for the `INTEGER` column.
     pub async fn release(db: &impl Database, dialect: Dialect) -> Result<(), MigrationError> {
         let sql = match dialect {
             Dialect::Mysql => {
                 "UPDATE `_reify_migrations_lock` \
                  SET `locked` = 0, `locked_by` = NULL, `locked_at` = NULL \
                  WHERE `id` = 1;"
+            }
+            Dialect::Sqlite => {
+                "UPDATE \"_reify_migrations_lock\" \
+                 SET \"locked\" = 0, \"locked_by\" = NULL, \"locked_at\" = NULL \
+                 WHERE \"id\" = 1;"
             }
             _ => {
                 "UPDATE \"_reify_migrations_lock\" \

@@ -35,6 +35,14 @@ pub enum MigrationError {
         /// The timeout that was exceeded, in seconds.
         timeout_secs: u64,
     },
+    /// The user declined to apply a migration in interactive mode.
+    ///
+    /// Returned by `run_interactive()` when the confirm callback returns `false`.
+    /// No migrations after this point are applied.
+    UserAborted {
+        /// Migration version string that was declined.
+        version: String,
+    },
     /// Generic migration error.
     Other(String),
 }
@@ -81,6 +89,9 @@ impl std::fmt::Display for MigrationError {
                 "migration '{version}' timed out after {timeout_secs}s — \
                  transaction rolled back, migration is still pending"
             ),
+            MigrationError::UserAborted { version } => {
+                write!(f, "migration '{version}' aborted by user")
+            }
             MigrationError::Other(msg) => write!(f, "migration error: {msg}"),
         }
     }

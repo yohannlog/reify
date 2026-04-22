@@ -76,6 +76,8 @@ pub enum Dialect {
     Postgres,
     /// MySQL / MariaDB — `ON DUPLICATE KEY UPDATE` upsert syntax.
     Mysql,
+    /// SQLite — `?` placeholders, SQLite-specific type mappings and functions.
+    Sqlite,
 }
 
 impl Dialect {
@@ -89,7 +91,7 @@ impl Dialect {
         match self {
             Dialect::Postgres => 65_535,
             Dialect::Mysql => 65_535,
-            Dialect::Generic => 32_766,
+            Dialect::Generic | Dialect::Sqlite => 32_766,
         }
     }
 }
@@ -403,7 +405,7 @@ impl Expr {
             Expr::Extract(part, c) => match dialect {
                 Dialect::Mysql => format!("{}({})", part.as_str(), qi(c)),
                 Dialect::Postgres => format!("EXTRACT({} FROM {})", part.as_str(), qi(c)),
-                Dialect::Generic => {
+                Dialect::Generic | Dialect::Sqlite => {
                     // SQLite: strftime returns text, cast to integer
                     format!(
                         "CAST(strftime('{}', {}) AS INTEGER)",

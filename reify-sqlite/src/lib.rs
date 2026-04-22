@@ -400,6 +400,10 @@ impl Database for SqliteDb {
             }
         }
     }
+
+    fn dialect(&self) -> reify_core::query::Dialect {
+        reify_core::query::Dialect::Sqlite
+    }
 }
 
 // ── SqliteTransaction — dedicated wrapper for transaction scope ─────

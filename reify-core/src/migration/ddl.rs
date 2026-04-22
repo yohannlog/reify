@@ -149,12 +149,27 @@ pub(crate) fn create_table_sql_named(
     column_defs: &[crate::schema::ColumnDef],
     dialect: crate::query::Dialect,
 ) -> String {
+    create_table_sql_named_with_checks(table_name, column_defs, &[], dialect)
+}
+
+/// Generate a `CREATE TABLE IF NOT EXISTS` statement from an explicit table name,
+/// column definitions, and optional table-level CHECK constraints.
+///
+/// This is the dialect-aware version used by `auto_diff_plans()` to generate
+/// CREATE TABLE SQL at runtime with the correct quoting and type syntax.
+pub(crate) fn create_table_sql_named_with_checks(
+    table_name: &str,
+    column_defs: &[crate::schema::ColumnDef],
+    checks: &[String],
+    dialect: crate::query::Dialect,
+) -> String {
+    use crate::ident::quote_ident;
     use crate::schema::TimestampSource;
 
     let mut col_lines: Vec<String> = Vec::new();
 
     for def in column_defs {
-        let mut parts: Vec<String> = vec![format!("    {}", qi(def.name))];
+        let mut parts: Vec<String> = vec![format!("    {}", quote_ident(def.name, dialect))];
 
         let sql_type = def.sql_type.to_sql(dialect);
         parts.push(sql_type.into_owned());
@@ -186,9 +201,14 @@ pub(crate) fn create_table_sql_named(
         col_lines.push(parts.join(" "));
     }
 
+    // Append table-level CHECK constraints
+    for check in checks {
+        col_lines.push(format!("    CHECK ({check})"));
+    }
+
     format!(
         "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
-        qi(table_name),
+        quote_ident(table_name, dialect),
         col_lines.join(",\n")
     )
 }
@@ -239,6 +259,7 @@ pub fn try_add_column_sql(
     def: Option<&crate::schema::ColumnDef>,
     dialect: crate::query::Dialect,
 ) -> Result<String, MissingDefaultError> {
+    use crate::ident::quote_ident;
     use crate::schema::ComputedColumn;
 
     // DB-generated computed column
@@ -247,8 +268,8 @@ pub fn try_add_column_sql(
             let sql_type = d.sql_type.to_sql(dialect);
             return Ok(format!(
                 "ALTER TABLE {} ADD COLUMN {} {} GENERATED ALWAYS AS ({expr}) STORED;",
-                qi(table),
-                qi(column),
+                quote_ident(table, dialect),
+                quote_ident(column, dialect),
                 &*sql_type
             ));
         }
@@ -286,8 +307,8 @@ pub fn try_add_column_sql(
     };
     Ok(format!(
         "ALTER TABLE {} ADD COLUMN {} {sql_type}{null_clause}{default_clause};",
-        qi(table),
-        qi(column)
+        quote_ident(table, dialect),
+        quote_ident(column, dialect)
     ))
 }
 
@@ -314,5 +335,91 @@ fn default_for_type(ty: &str) -> Option<&'static str> {
         "TIMESTAMPTZ" | "TIMESTAMP" | "DATETIME" => Some("NOW()"),
         // UUID, JSONB, BYTEA, arrays, custom types — no safe default
         _ => None,
+    }
+}
+
+// ── Index DDL ───────────────────────────────────────────────────────
+
+use crate::schema::{IndexDef, IndexKind};
+
+/// Generate a `CREATE INDEX` (or `CREATE UNIQUE INDEX`) statement.
+///
+/// The index name is auto-generated as `idx_{table}_{col1}_{col2}_...` if not
+/// explicitly set in the `IndexDef`.
+///
+/// # Dialect differences
+///
+/// - **PostgreSQL**: supports `USING btree/hash/gin/gist` and partial indexes (`WHERE ...`).
+/// - **MySQL**: supports `USING BTREE/HASH`; partial indexes are ignored.
+/// - **SQLite**: supports `WHERE` for partial indexes; index type is ignored.
+pub fn create_index_sql(table: &str, index: &IndexDef, dialect: crate::query::Dialect) -> String {
+    use crate::ident::quote_ident;
+
+    let col_names: Vec<&str> = index.columns.iter().map(|c| c.name).collect();
+
+    // Auto-generate index name if not provided
+    let index_name = index.name.clone().unwrap_or_else(|| {
+        let prefix = if index.unique { "uidx" } else { "idx" };
+        format!("{}_{}", prefix, col_names.join("_"))
+    });
+
+    let unique = if index.unique { "UNIQUE " } else { "" };
+
+    // Column list with sort directions
+    let cols: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| format!("{} {}", quote_ident(c.name, dialect), c.direction))
+        .collect();
+    let cols_str = cols.join(", ");
+
+    // Index type (USING clause)
+    let using = match (dialect, &index.kind) {
+        (crate::query::Dialect::Mysql, IndexKind::BTree) => " USING BTREE",
+        (crate::query::Dialect::Mysql, IndexKind::Hash) => " USING HASH",
+        (crate::query::Dialect::Mysql, _) => "", // GIN/GiST not supported
+        (_, IndexKind::BTree) => " USING btree",
+        (_, IndexKind::Hash) => " USING hash",
+        (_, IndexKind::Gin) => " USING gin",
+        (_, IndexKind::Gist) => " USING gist",
+    };
+
+    // Partial index predicate (WHERE clause)
+    let predicate = match (&index.predicate, dialect) {
+        (Some(pred), crate::query::Dialect::Mysql) => {
+            // MySQL doesn't support partial indexes — log warning and skip
+            tracing::warn!(
+                index = %index_name,
+                "MySQL does not support partial indexes; WHERE clause ignored"
+            );
+            String::new()
+        }
+        (Some(pred), _) => format!(" WHERE {pred}"),
+        (None, _) => String::new(),
+    };
+
+    format!(
+        "CREATE {unique}INDEX {}{using} ON {} ({cols_str}){predicate};",
+        quote_ident(&index_name, dialect),
+        quote_ident(table, dialect),
+    )
+}
+
+/// Generate a `DROP INDEX` statement.
+///
+/// # Dialect differences
+///
+/// - **PostgreSQL/SQLite**: `DROP INDEX IF EXISTS "index_name";`
+/// - **MySQL**: `DROP INDEX `index_name` ON `table`;`
+pub fn drop_index_sql(table: &str, index_name: &str, dialect: crate::query::Dialect) -> String {
+    use crate::ident::quote_ident;
+
+    match dialect {
+        crate::query::Dialect::Mysql => format!(
+            "DROP INDEX {} ON {};",
+            quote_ident(index_name, dialect),
+            quote_ident(table, dialect)
+        ),
+        _ => format!("DROP INDEX IF EXISTS {};", quote_ident(index_name, dialect)),
     }
 }

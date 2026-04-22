@@ -1,5 +1,5 @@
 mod apply;
-mod entries;
+pub(crate) mod entries;
 mod hooks;
 mod inspect;
 mod plans;
@@ -45,31 +45,45 @@ pub struct MigrationRunner {
     pub(super) views: Vec<ViewEntry>,
     pub(super) mat_views: Vec<MatViewEntry>,
     pub(super) manual: Vec<Box<dyn Migration>>,
-    /// SQL dialect used for backend-specific DDL and DML.
-    pub(super) dialect: Dialect,
+    /// SQL dialect override. When `None`, dialect is auto-detected from the
+    /// database connection at runtime (Drizzle-style ergonomics).
+    pub(super) dialect_override: Option<Dialect>,
     /// Lifecycle hooks — called around each plan execution.
     pub(super) hooks: MigrationHooks,
 }
 
 impl MigrationRunner {
-    /// Create a new, empty runner targeting the generic (PostgreSQL-compatible) dialect.
+    /// Create a new, empty runner with auto-detected dialect.
+    ///
+    /// The SQL dialect is automatically detected from the database connection
+    /// when `run()` / `dry_run()` is called. Use `with_dialect()` to override.
     pub fn new() -> Self {
         Self {
             tables: Vec::new(),
             views: Vec::new(),
             mat_views: Vec::new(),
             manual: Vec::new(),
-            dialect: Dialect::default(),
+            dialect_override: None,
             hooks: MigrationHooks::default(),
         }
     }
 
-    /// Set the SQL dialect for this runner.
+    /// Resolve the effective dialect for this run.
     ///
-    /// Must be called before `run()` / `dry_run()`. Affects DDL for system
-    /// tables, `CURRENT_SCHEMA()` vs `DATABASE()`, and upsert syntax.
+    /// If `with_dialect()` was called, that dialect is used (explicit override).
+    /// Otherwise, the dialect is auto-detected from the database connection.
+    /// This enables Drizzle-style ergonomics where the dialect is intrinsic to
+    /// the connection — no need to specify it twice.
+    pub(super) fn resolve_dialect(&self, db: &impl crate::db::Database) -> Dialect {
+        self.dialect_override.unwrap_or_else(|| db.dialect())
+    }
+
+    /// Set the SQL dialect for this runner (explicit override).
+    ///
+    /// By default, the dialect is auto-detected from the database connection.
+    /// Use this method to override when needed (e.g., testing with a mock DB).
     pub fn with_dialect(mut self, dialect: Dialect) -> Self {
-        self.dialect = dialect;
+        self.dialect_override = Some(dialect);
         self
     }
 
@@ -120,13 +134,12 @@ impl MigrationRunner {
             }
         };
 
-        let create_sql = create_table_sql::<T>(&column_defs, Dialect::Generic);
-
         self.tables.push(TableEntry {
             table_name: T::table_name(),
             column_names: T::column_names(),
             column_defs,
-            create_sql,
+            indexes: T::indexes(),
+            checks: Vec::new(),
         });
         self
     }
@@ -136,13 +149,12 @@ impl MigrationRunner {
     where
         T: Table,
     {
-        let create_sql =
-            create_table_sql_with_checks::<T>(&schema.columns, &schema.checks, Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: T::table_name(),
             column_names: T::column_names(),
             column_defs: schema.columns,
-            create_sql,
+            indexes: schema.indexes,
+            checks: schema.checks,
         });
         self
     }
@@ -155,7 +167,6 @@ impl MigrationRunner {
         self = self.add_table::<T>();
         let audit_defs = T::audit_column_defs();
         let audit_name = T::audit_table_name();
-        let create_sql = create_table_sql_named(audit_name, &audit_defs, Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: audit_name,
             // NOTE: `column_names` is intentionally empty for audit tables.
@@ -164,7 +175,8 @@ impl MigrationRunner {
             // audit schema, register a manual migration instead.
             column_names: &[],
             column_defs: audit_defs,
-            create_sql,
+            indexes: Vec::new(), // Audit tables have no auto-managed indexes
+            checks: Vec::new(),
         });
         self
     }
@@ -181,12 +193,12 @@ impl MigrationRunner {
         self = self.add_table_with_schema(schema);
         let audit_defs = T::audit_column_defs();
         let audit_name = T::audit_table_name();
-        let create_sql = create_table_sql_named(audit_name, &audit_defs, Dialect::Generic);
         self.tables.push(TableEntry {
             table_name: audit_name,
             column_names: &[],
             column_defs: audit_defs,
-            create_sql,
+            indexes: Vec::new(), // Audit tables have no auto-managed indexes
+            checks: Vec::new(),
         });
         self
     }
@@ -305,6 +317,60 @@ impl MigrationRunner {
             query,
         });
         self
+    }
+
+    /// Apply pending migrations interactively, prompting for confirmation before each.
+    ///
+    /// Similar to `run()`, but calls `confirm(&plan)` before executing each migration.
+    /// If the callback returns `false`, the migration is **not** applied and
+    /// `MigrationError::UserAborted` is returned immediately — no subsequent
+    /// migrations are attempted.
+    ///
+    /// This enables Drizzle-style `--strict` mode where users review each SQL
+    /// statement before it touches the database.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::io::{self, Write};
+    ///
+    /// runner.run_interactive(&db, |plan| {
+    ///     println!("{}", plan.display());
+    ///     print!("Apply this migration? [Y/n] ");
+    ///     io::stdout().flush().unwrap();
+    ///
+    ///     let mut input = String::new();
+    ///     io::stdin().read_line(&mut input).unwrap();
+    ///     let input = input.trim().to_lowercase();
+    ///     input.is_empty() || input == "y" || input == "yes"
+    /// }).await?;
+    /// ```
+    ///
+    /// # Lifecycle hooks
+    ///
+    /// `on_before_each` / `on_after_each` / `on_migration_error` hooks are still
+    /// called around each migration, just as with `run()`. The confirm callback
+    /// is invoked **before** `on_before_each`.
+    pub async fn run_interactive<F>(
+        &self,
+        db: &impl crate::db::Database,
+        confirm: F,
+    ) -> Result<(), crate::migration::MigrationError>
+    where
+        F: Fn(&MigrationPlan) -> bool + Send + Sync,
+    {
+        use crate::migration::lock::MigrationLock;
+
+        let dialect = self.resolve_dialect(db);
+        self.ensure_tracking_table(db, dialect).await?;
+        MigrationLock::ensure(db, dialect).await?;
+        MigrationLock::acquire(db, dialect).await?;
+
+        let result = self.run_interactive_inner(db, confirm, dialect).await;
+
+        MigrationLock::release(db, dialect).await.ok();
+
+        result
     }
 }
 

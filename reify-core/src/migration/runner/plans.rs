@@ -1,9 +1,12 @@
 use super::MigrationRunner;
 use crate::db::Database;
 use crate::migration::context::MigrationContext;
-use crate::migration::ddl::add_column_sql;
+use crate::migration::ddl::{add_column_sql, create_index_sql, create_table_sql_with_checks};
+use crate::migration::diff::ColumnDiff;
 use crate::migration::error::MigrationError;
 use crate::migration::plan::{MigrationPlan, compute_checksum};
+use crate::query::Dialect;
+use crate::table::Table;
 use std::collections::HashSet;
 
 impl MigrationRunner {
@@ -12,6 +15,7 @@ impl MigrationRunner {
         &self,
         db: &impl Database,
         applied: &HashSet<String>,
+        dialect: Dialect,
     ) -> Result<Vec<MigrationPlan>, MigrationError> {
         let mut plans = Vec::new();
 
@@ -23,7 +27,7 @@ impl MigrationRunner {
                 // Still check for new columns even if the table was created before.
                 // Each distinct set of new columns gets its own versioned plan so
                 // successive ADD COLUMN waves don't collide on the same version key.
-                let existing = self.existing_columns(db, entry.table_name).await?;
+                let existing = self.existing_columns(db, entry.table_name, dialect).await?;
                 if let Some(existing_cols) = existing {
                     let mut new_cols: Vec<&str> = entry
                         .column_names
@@ -47,7 +51,7 @@ impl MigrationRunner {
                                         entry.table_name,
                                         col,
                                         def,
-                                        crate::query::Dialect::Generic,
+                                        dialect,
                                     )
                                 })
                                 .collect();
@@ -71,11 +75,22 @@ impl MigrationRunner {
                 continue;
             }
 
-            let existing = self.existing_columns(db, entry.table_name).await?;
-            match existing {
+            // Fetch column details once — reuse for both ADD COLUMN logic and warnings.
+            let details = self.existing_column_details_with_dialect(db, entry.table_name, dialect).await?;
+            match details {
                 None => {
-                    // Table doesn't exist → CREATE TABLE
-                    let stmts = vec![entry.create_sql.clone()];
+                    // Table doesn't exist → CREATE TABLE + CREATE INDEX for all indexes
+                    // Generate CREATE TABLE SQL with the resolved dialect
+                    let create_sql = crate::migration::ddl::create_table_sql_named_with_checks(
+                        entry.table_name,
+                        &entry.column_defs,
+                        &entry.checks,
+                        dialect,
+                    );
+                    let mut stmts = vec![create_sql];
+                    for idx in &entry.indexes {
+                        stmts.push(create_index_sql(entry.table_name, idx, dialect));
+                    }
                     let checksum = compute_checksum(&stmts);
                     plans.push(MigrationPlan {
                         version,
@@ -87,25 +102,42 @@ impl MigrationRunner {
                         timeout: None,
                     });
                 }
-                Some(existing_cols) => {
+                Some(ref db_cols) => {
                     // Table exists → ADD COLUMN for new fields
+                    let existing_col_names: Vec<&str> =
+                        db_cols.iter().map(|c| c.name.as_str()).collect();
                     let mut stmts = Vec::new();
                     for col in entry.column_names {
-                        if !existing_cols.iter().any(|c| c == col) {
+                        if !existing_col_names.iter().any(|c| *c == *col) {
                             let def = entry.column_defs.iter().find(|d| d.name == *col);
                             stmts.push(add_column_sql(
                                 entry.table_name,
                                 col,
                                 def,
-                                crate::query::Dialect::Generic,
+                                dialect,
                             ));
                         }
                     }
+
+                    // Check for missing indexes
+                    let existing_indexes = self.existing_indexes(db, entry.table_name, dialect).await?;
+                    for idx in &entry.indexes {
+                        let idx_name = idx.name.clone().unwrap_or_else(|| {
+                            let col_names: Vec<&str> =
+                                idx.columns.iter().map(|c| c.name).collect();
+                            let prefix = if idx.unique { "uidx" } else { "idx" };
+                            format!("{}_{}", prefix, col_names.join("_"))
+                        });
+                        if !existing_indexes.iter().any(|n| n == &idx_name) {
+                            stmts.push(create_index_sql(entry.table_name, idx, dialect));
+                        }
+                    }
+
                     if !stmts.is_empty() {
                         let checksum = compute_checksum(&stmts);
                         plans.push(MigrationPlan {
                             version,
-                            description: format!("Add new columns to {}", entry.table_name),
+                            description: format!("Add new columns/indexes to {}", entry.table_name),
                             comment: None,
                             statements: stmts,
                             checksum,
@@ -113,12 +145,79 @@ impl MigrationRunner {
                             timeout: None,
                         });
                     }
+
+                    // Warn about non-additive diffs that auto-migration cannot handle.
+                    // These require manual migrations — log them so users know.
+                    Self::warn_non_additive_diffs(entry, db_cols, dialect);
                 }
             }
         }
 
         Ok(plans)
     }
+
+    /// Log warnings for schema diffs that auto-migration cannot handle.
+    fn warn_non_additive_diffs(
+        entry: &super::entries::TableEntry,
+        db_cols: &[crate::migration::diff::DbColumnInfo],
+        dialect: Dialect,
+    ) {
+        use crate::migration::diff::ColumnDiff;
+
+        for col_name in entry.column_names {
+            if let Some(db_col) = db_cols.iter().find(|c| c.name == *col_name) {
+                let def = entry.column_defs.iter().find(|d| d.name == *col_name);
+
+                // Type mismatch
+                let struct_type = def
+                    .map(|d| {
+                        crate::migration::diff::normalize_sql_type(&d.sql_type.to_sql(dialect))
+                    })
+                    .unwrap_or_else(|| "text".to_string());
+                if struct_type != db_col.data_type {
+                    let diff = ColumnDiff::TypeChanged {
+                        column: col_name.to_string(),
+                        from: db_col.data_type.clone(),
+                        to: struct_type,
+                    };
+                    tracing::warn!(table = entry.table_name, "{}", diff.display());
+                }
+
+                // Nullability mismatch
+                let struct_nullable = def.map(|d| d.nullable).unwrap_or(false);
+                if struct_nullable != db_col.is_nullable {
+                    let diff = ColumnDiff::NullableChanged {
+                        column: col_name.to_string(),
+                        from: db_col.is_nullable,
+                        to: struct_nullable,
+                    };
+                    tracing::warn!(table = entry.table_name, "{}", diff.display());
+                }
+
+                // Unique mismatch
+                let struct_unique = def.map(|d| d.unique).unwrap_or(false);
+                if struct_unique != db_col.is_unique {
+                    let diff = ColumnDiff::UniqueChanged {
+                        column: col_name.to_string(),
+                        from: db_col.is_unique,
+                        to: struct_unique,
+                    };
+                    tracing::warn!(table = entry.table_name, "{}", diff.display());
+                }
+            }
+        }
+
+        // Columns in DB but not in struct → Removed
+        for db_col in db_cols {
+            if !entry.column_names.iter().any(|n| *n == db_col.name) {
+                let diff = ColumnDiff::Removed {
+                    column: db_col.name.clone(),
+                };
+                tracing::warn!(table = entry.table_name, "{}", diff.display());
+            }
+        }
+    }
+
 
     /// Build the list of view plans (CREATE OR REPLACE VIEW).
     pub(super) fn view_plans(&self, applied: &HashSet<String>) -> Vec<MigrationPlan> {
