@@ -91,19 +91,88 @@ impl MigrationRunner {
         Ok(map)
     }
 
-    /// Fetch detailed column metadata for a table from `information_schema`.
+    /// Fetch detailed column metadata for a table.
     ///
     /// Returns `None` when the table does not exist in the database.
-    /// Also queries `information_schema.table_constraints` and
-    /// `information_schema.key_column_usage` to determine which columns carry a
-    /// UNIQUE constraint.
+    /// Uses `information_schema` for PostgreSQL/MySQL, `PRAGMA table_info` for SQLite.
     pub async fn existing_column_details_with_dialect(
         &self,
         db: &impl Database,
         table: &str,
         dialect: Dialect,
     ) -> Result<Option<Vec<DbColumnInfo>>, MigrationError> {
-        // ── 1. Fetch column metadata ──────────────────────────────────
+        match dialect {
+            Dialect::Sqlite => self.existing_column_details_sqlite(db, table).await,
+            _ => self.existing_column_details_information_schema(db, table, dialect).await,
+        }
+    }
+
+    /// SQLite-specific column metadata via `PRAGMA table_info`.
+    async fn existing_column_details_sqlite(
+        &self,
+        db: &impl Database,
+        table: &str,
+    ) -> Result<Option<Vec<DbColumnInfo>>, MigrationError> {
+        // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+        let col_rows = db
+            .query(&format!("PRAGMA table_info(\"{table}\");"), &[])
+            .await
+            .map_err(MigrationError::Db)?;
+
+        if col_rows.is_empty() {
+            return Ok(None); // table absent
+        }
+
+        // Fetch unique indexes to determine which columns have UNIQUE constraints
+        let unique_rows = db
+            .query(
+                "SELECT il.name AS index_name, ii.name AS column_name \
+                 FROM sqlite_master sm \
+                 JOIN pragma_index_list(sm.name) il ON 1=1 \
+                 JOIN pragma_index_info(il.name) ii ON 1=1 \
+                 WHERE sm.type = 'table' AND sm.name = ? AND il.\"unique\" = 1;",
+                &[Value::String(table.into())],
+            )
+            .await
+            .unwrap_or_default();
+
+        let unique_cols: std::collections::HashSet<String> = unique_rows
+            .into_iter()
+            .filter_map(|r| r.get_string("column_name"))
+            .collect();
+
+        let infos = col_rows
+            .into_iter()
+            .filter_map(|r| {
+                let name = r.get_string("name")?;
+                let data_type = r.get_string("type").map(|s| normalize_sql_type(&s))?;
+                // notnull = 1 means NOT NULL, so is_nullable = (notnull == 0)
+                let is_nullable = r
+                    .get_string("notnull")
+                    .map(|s| s == "0")
+                    .unwrap_or(true);
+                let column_default = r.get_string("dflt_value");
+                let is_unique = unique_cols.contains(&name);
+                Some(DbColumnInfo {
+                    name,
+                    data_type,
+                    is_nullable,
+                    column_default,
+                    is_unique,
+                })
+            })
+            .collect();
+
+        Ok(Some(infos))
+    }
+
+    /// PostgreSQL/MySQL column metadata via `information_schema`.
+    async fn existing_column_details_information_schema(
+        &self,
+        db: &impl Database,
+        table: &str,
+        dialect: Dialect,
+    ) -> Result<Option<Vec<DbColumnInfo>>, MigrationError> {
         // Filter by table_schema to avoid false matches in multi-schema environments.
         let schema_expr = Self::current_schema_expr(dialect);
         let col_rows = db
@@ -124,7 +193,7 @@ impl MigrationRunner {
             return Ok(None); // table absent
         }
 
-        // ── 2. Fetch unique-constrained column names ──────────────────
+        // Fetch unique-constrained column names
         let unique_rows = db
             .query(
                 &format!(
@@ -147,7 +216,6 @@ impl MigrationRunner {
             .filter_map(|r| r.get_string("column_name"))
             .collect();
 
-        // ── 3. Build DbColumnInfo list ────────────────────────────────
         let infos = col_rows
             .into_iter()
             .filter_map(|r| {
@@ -202,35 +270,37 @@ impl MigrationRunner {
 
     /// Fetch existing index names for a table from the database.
     ///
-    /// Uses `pg_indexes` for PostgreSQL/Generic, `information_schema.statistics`
-    /// for MySQL. Returns an empty vec if the table doesn't exist.
+    /// Uses `pg_indexes` for PostgreSQL, `information_schema.statistics`
+    /// for MySQL, `sqlite_master` for SQLite. Returns an empty vec if the table doesn't exist.
     pub(super) async fn existing_indexes(
         &self,
         db: &impl Database,
         table: &str,
         dialect: Dialect,
     ) -> Result<Vec<String>, MigrationError> {
-        let query = match dialect {
-            Dialect::Mysql => {
+        let (query, col_name) = match dialect {
+            Dialect::Mysql => (
                 "SELECT DISTINCT index_name FROM information_schema.statistics \
                  WHERE table_name = ? AND table_schema = DATABASE() \
-                 AND index_name != 'PRIMARY';"
-            }
-            _ => {
+                 AND index_name != 'PRIMARY';",
+                "index_name",
+            ),
+            Dialect::Sqlite => (
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = ? AND name NOT LIKE 'sqlite_%';",
+                "name",
+            ),
+            _ => (
                 "SELECT indexname FROM pg_indexes \
-                 WHERE tablename = ? AND schemaname = CURRENT_SCHEMA();"
-            }
+                 WHERE tablename = ? AND schemaname = CURRENT_SCHEMA();",
+                "indexname",
+            ),
         };
 
         let rows = db
             .query(query, &[Value::String(table.into())])
             .await
             .unwrap_or_default();
-
-        let col_name = match dialect {
-            Dialect::Mysql => "index_name",
-            _ => "indexname",
-        };
 
         Ok(rows
             .into_iter()

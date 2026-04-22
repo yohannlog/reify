@@ -104,6 +104,11 @@ pub(crate) fn upsert_migration_sql(dialect: Dialect) -> String {
              ON DUPLICATE KEY UPDATE \
              {d} = VALUES({d}), {c} = VALUES({c}), {m} = VALUES({m}), {a} = CURRENT_TIMESTAMP;"
         ),
+        Dialect::Sqlite => format!(
+            "INSERT INTO {t} ({v}, {d}, {c}, {m}) VALUES (?, ?, ?, ?) \
+             ON CONFLICT ({v}) DO UPDATE SET \
+             {d} = excluded.{d}, {c} = excluded.{c}, {m} = excluded.{m}, {a} = CURRENT_TIMESTAMP;"
+        ),
         _ => format!(
             "INSERT INTO {t} ({v}, {d}, {c}, {m}) VALUES (?, ?, ?, ?) \
              ON CONFLICT ({v}) DO UPDATE SET \
@@ -114,7 +119,7 @@ pub(crate) fn upsert_migration_sql(dialect: Dialect) -> String {
 
 /// DDL for the migration tracking table, parameterised by dialect.
 ///
-/// PostgreSQL uses `TIMESTAMPTZ`; MySQL/MariaDB uses `DATETIME`.
+/// PostgreSQL uses `TIMESTAMPTZ`; MySQL/MariaDB uses `DATETIME`; SQLite uses `TEXT`.
 pub(crate) fn create_tracking_table_sql(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Mysql => {
@@ -124,6 +129,15 @@ pub(crate) fn create_tracking_table_sql(dialect: Dialect) -> &'static str {
              `applied_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,\
              `checksum`    TEXT         NOT NULL DEFAULT '',\
              `comment`     TEXT\
+             );"
+        }
+        Dialect::Sqlite => {
+            "CREATE TABLE IF NOT EXISTS \"_reify_migrations\" (\
+             \"version\"     TEXT        NOT NULL PRIMARY KEY,\
+             \"description\" TEXT        NOT NULL,\
+             \"applied_at\"  TEXT        NOT NULL DEFAULT (datetime('now')),\
+             \"checksum\"    TEXT        NOT NULL DEFAULT '',\
+             \"comment\"     TEXT\
              );"
         }
         _ => {
