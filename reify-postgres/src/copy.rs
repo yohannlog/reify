@@ -69,7 +69,7 @@ fn sql_type_to_pg(ty: &SqlType) -> Type {
         SqlType::Float => Type::FLOAT4,
         SqlType::Double => Type::FLOAT8,
         SqlType::Boolean => Type::BOOL,
-        SqlType::Text | SqlType::Varchar(_) | SqlType::Char(_) => Type::TEXT,
+        SqlType::Text | SqlType::Varchar(_) | SqlType::Char(_) | SqlType::Binary(_) => Type::TEXT,
         SqlType::Bytea => Type::BYTEA,
         SqlType::Uuid => Type::UUID,
         SqlType::Timestamptz => Type::TIMESTAMPTZ,
@@ -95,6 +95,7 @@ fn sql_type_to_pg(ty: &SqlType) -> Type {
             }
         }
         SqlType::Decimal(_, _) => Type::NUMERIC,
+        SqlType::Vector(_) => Type::TEXT,
     }
 }
 

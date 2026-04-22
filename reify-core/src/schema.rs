@@ -35,6 +35,11 @@ pub enum SqlType {
     Varchar(u32),
     /// `CHAR(n)` — fixed-length string.
     Char(u32),
+    /// `BINARY(n)` — fixed-length binary string (MySQL/MariaDB only).
+    ///
+    /// Stores exactly `n` bytes, padding with `0x00` if shorter.
+    /// Not supported on PostgreSQL (use `Bytea`) or SQLite (use `Blob`).
+    Binary(u32),
     /// `DECIMAL(precision, scale)` / `NUMERIC(precision, scale)`.
     ///
     /// Renders as `NUMERIC(p,s)` on PostgreSQL, `DECIMAL(p,s)` elsewhere.
@@ -68,6 +73,12 @@ pub enum SqlType {
     ///
     /// Generated automatically by `#[derive(Table)]` for `Vec<T>` fields.
     Array(Box<SqlType>),
+    /// MariaDB 11+ vector type: `VECTOR(dimensions)`.
+    ///
+    /// Used for storing embeddings and similarity search.
+    /// Only available on MariaDB 11.4+ with the vector plugin.
+    /// Falls back to `TEXT` on other dialects.
+    Vector(u32),
 }
 
 impl SqlType {
@@ -93,6 +104,7 @@ impl SqlType {
             SqlType::Text => Cow::Borrowed("TEXT"),
             SqlType::Varchar(len) => Cow::Owned(format!("VARCHAR({len})")),
             SqlType::Char(len) => Cow::Owned(format!("CHAR({len})")),
+            SqlType::Binary(len) => Cow::Owned(format!("BINARY({len})")),
             SqlType::Decimal(p, s) => match dialect {
                 Dialect::Postgres => Cow::Owned(format!("NUMERIC({p},{s})")),
                 _ => Cow::Owned(format!("DECIMAL({p},{s})")),
@@ -135,6 +147,10 @@ impl SqlType {
             SqlType::Custom(s) => Cow::Borrowed(s),
             SqlType::Array(inner) => match dialect {
                 Dialect::Postgres => Cow::Owned(format!("{}[]", inner.to_sql(dialect))),
+                _ => Cow::Borrowed("TEXT"),
+            },
+            SqlType::Vector(dims) => match dialect {
+                Dialect::Mysql => Cow::Owned(format!("VECTOR({dims})")),
                 _ => Cow::Borrowed("TEXT"),
             },
         }
@@ -624,6 +640,169 @@ impl<T, S: TimestampState> ColumnBuilder<T, S> {
         self
     }
 
+    /// Set the column type to `JSONB` (PostgreSQL) / `JSON` (MySQL).
+    ///
+    /// **PostgreSQL/MySQL only.** Not available when targeting SQLite
+    /// (use `text()` instead — SQLite stores JSON as plain text).
+    ///
+    /// ```ignore
+    /// .column(User::metadata, |c| c.jsonb())
+    /// ```
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    pub fn jsonb(mut self) -> Self {
+        self.def.sql_type = SqlType::Jsonb;
+        self
+    }
+
+    /// Set the column type to a PostgreSQL array: `element_type[]`.
+    ///
+    /// **PostgreSQL only.** Not available when targeting SQLite or MySQL
+    /// (arrays are a PostgreSQL-specific feature).
+    ///
+    /// ```ignore
+    /// .column(Post::tags, |c| c.array(SqlType::Text))
+    /// // → tags TEXT[]
+    /// ```
+    #[cfg(feature = "postgres")]
+    pub fn array(mut self, element_type: SqlType) -> Self {
+        self.def.sql_type = SqlType::Array(Box::new(element_type));
+        self
+    }
+
+    /// Set the column type to `UUID`.
+    ///
+    /// **PostgreSQL only.** Renders as native `UUID` type.
+    /// For MySQL use `char_type(36)`, for SQLite use `text()`.
+    ///
+    /// ```ignore
+    /// .column(User::id, |c| c.uuid().primary_key())
+    /// ```
+    #[cfg(feature = "postgres")]
+    pub fn uuid(mut self) -> Self {
+        self.def.sql_type = SqlType::Uuid;
+        self
+    }
+
+    /// Set the column type to `TIMESTAMPTZ` (timestamp with time zone).
+    ///
+    /// **PostgreSQL/MySQL only.** Renders as `TIMESTAMPTZ` on PostgreSQL,
+    /// `DATETIME` on MySQL. For SQLite use `text()` with ISO 8601 strings.
+    ///
+    /// ```ignore
+    /// .column(Event::created_at, |c| c.timestamptz())
+    /// ```
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    pub fn timestamptz(mut self) -> Self {
+        self.def.sql_type = SqlType::Timestamptz;
+        self
+    }
+
+    /// Set the column type to binary data (`BLOB`).
+    ///
+    /// Renders as `BYTEA` on PostgreSQL, `LONGBLOB` on MySQL, `BLOB` on SQLite.
+    /// Alias: `.bytea()` (PostgreSQL-only).
+    pub fn blob(mut self) -> Self {
+        self.def.sql_type = SqlType::Bytea;
+        self
+    }
+
+    /// Set the column type to `BYTEA` (PostgreSQL binary data).
+    ///
+    /// **PostgreSQL only.** For cross-dialect code, use `.blob()` instead.
+    #[cfg(feature = "postgres")]
+    pub fn bytea(mut self) -> Self {
+        self.def.sql_type = SqlType::Bytea;
+        self
+    }
+
+    /// Set the column type to `BINARY(length)` (fixed-length binary string).
+    ///
+    /// **MySQL/MariaDB only.** Stores exactly `length` bytes, padding with `0x00`.
+    /// For variable-length binary data, use `.blob()` instead.
+    ///
+    /// ```ignore
+    /// .column(Hash::sha256, |c| c.binary(32))
+    /// // → sha256 BINARY(32)
+    /// ```
+    #[cfg(feature = "mysql")]
+    pub fn binary(mut self, length: u32) -> Self {
+        self.def.sql_type = SqlType::Binary(length);
+        self
+    }
+
+    /// Set the column type to `VECTOR(dimensions)` for embedding storage.
+    ///
+    /// **MariaDB 11+ only.** Used for vector similarity search with the
+    /// MariaDB vector plugin. Stores fixed-dimension float vectors.
+    ///
+    /// ```ignore
+    /// .column(Document::embedding, |c| c.vector(1536))
+    /// // → embedding VECTOR(1536)
+    /// ```
+    #[cfg(feature = "mariadb")]
+    pub fn vector(mut self, dimensions: u32) -> Self {
+        self.def.sql_type = SqlType::Vector(dimensions);
+        self
+    }
+
+    /// Set the column type to `TEXT`.
+    ///
+    /// Universal — works on all dialects.
+    pub fn text(mut self) -> Self {
+        self.def.sql_type = SqlType::Text;
+        self
+    }
+
+    /// Set the column type to `BOOLEAN`.
+    ///
+    /// Renders as `BOOLEAN` on PostgreSQL/MySQL, stored as `INTEGER` (0/1) on SQLite.
+    pub fn boolean(mut self) -> Self {
+        self.def.sql_type = SqlType::Boolean;
+        self
+    }
+
+    /// Set the column type to `SMALLINT`.
+    pub fn smallint(mut self) -> Self {
+        self.def.sql_type = SqlType::SmallInt;
+        self
+    }
+
+    /// Set the column type to `INTEGER`.
+    pub fn integer(mut self) -> Self {
+        self.def.sql_type = SqlType::Integer;
+        self
+    }
+
+    /// Set the column type to `BIGINT`.
+    pub fn bigint(mut self) -> Self {
+        self.def.sql_type = SqlType::BigInt;
+        self
+    }
+
+    /// Set the column type to `REAL` / `FLOAT`.
+    pub fn float(mut self) -> Self {
+        self.def.sql_type = SqlType::Float;
+        self
+    }
+
+    /// Set the column type to `DOUBLE PRECISION`.
+    pub fn double(mut self) -> Self {
+        self.def.sql_type = SqlType::Double;
+        self
+    }
+
+    /// Set the column type to `DATE`.
+    pub fn date(mut self) -> Self {
+        self.def.sql_type = SqlType::Date;
+        self
+    }
+
+    /// Set the column type to `TIME`.
+    pub fn time(mut self) -> Self {
+        self.def.sql_type = SqlType::Time;
+        self
+    }
+
     /// Add a foreign-key constraint to this column.
     ///
     /// ```ignore
@@ -810,18 +989,29 @@ impl IndexBuilder {
     }
 
     /// Shorthand: set index kind to Hash.
+    ///
+    /// **PostgreSQL only.** Hash indexes are not supported by MySQL or SQLite.
+    #[cfg(feature = "postgres")]
     pub fn hash(mut self) -> Self {
         self.def.kind = IndexKind::Hash;
         self
     }
 
-    /// Shorthand: set index kind to GIN.
+    /// Shorthand: set index kind to GIN (Generalized Inverted Index).
+    ///
+    /// **PostgreSQL only.** GIN indexes are used for full-text search, JSONB,
+    /// and array containment queries.
+    #[cfg(feature = "postgres")]
     pub fn gin(mut self) -> Self {
         self.def.kind = IndexKind::Gin;
         self
     }
 
-    /// Shorthand: set index kind to GiST.
+    /// Shorthand: set index kind to GiST (Generalized Search Tree).
+    ///
+    /// **PostgreSQL only.** GiST indexes are used for geometric types,
+    /// range types, and full-text search.
+    #[cfg(feature = "postgres")]
     pub fn gist(mut self) -> Self {
         self.def.kind = IndexKind::Gist;
         self
@@ -829,10 +1019,13 @@ impl IndexBuilder {
 
     /// Set a partial-index predicate (PostgreSQL `WHERE ...` clause).
     ///
+    /// **PostgreSQL only.** Partial indexes are not supported by MySQL or SQLite.
+    ///
     /// ```ignore
     /// .predicate("status = 'active'")
     /// .predicate("deleted_at IS NULL")
     /// ```
+    #[cfg(feature = "postgres")]
     pub fn predicate(mut self, pred: impl Into<String>) -> Self {
         self.def.predicate = Some(pred.into());
         self
