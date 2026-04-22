@@ -14,12 +14,15 @@ rust-version = "1.90.0"
 [features]
 default = []
 postgres = ["dep:chrono", "dep:uuid", "dep:serde_json"]
+# PostgreSQL 18+ — adds uuidv7() support
 postgres18 = ["postgres"]
 mysql = ["dep:chrono"]
 # MariaDB 10.x — baseline MySQL-compatible features
 mariadb10 = ["mysql"]
 # MariaDB 11+ — adds VECTOR type support
-mariadb = ["mariadb10"]
+mariadb11 = ["mariadb10"]
+# MariaDB 12+ (latest) — adds uuidv7() support
+mariadb = ["mariadb11"]
 metrics = ["dep:metrics"]
 
 [dependencies]

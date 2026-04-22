@@ -683,6 +683,30 @@ impl<T, S: TimestampState> ColumnBuilder<T, S> {
         self
     }
 
+    /// Set the column type to `UUID` with `DEFAULT uuidv7()`.
+    ///
+    /// **PostgreSQL 18+ / MariaDB 12+ only.** Generates time-sortable UUIDs
+    /// using the database's native `uuidv7()` function.
+    ///
+    /// ```ignore
+    /// .column(User::id, |c| c.uuid_v7().primary_key())
+    /// // PostgreSQL: id UUID DEFAULT uuidv7() PRIMARY KEY
+    /// // MariaDB:    id CHAR(36) DEFAULT (uuidv7()) PRIMARY KEY
+    /// ```
+    #[cfg(any(feature = "postgres18", feature = "mariadb"))]
+    pub fn uuid_v7(mut self) -> Self {
+        #[cfg(feature = "postgres18")]
+        {
+            self.def.sql_type = SqlType::Uuid;
+        }
+        #[cfg(all(feature = "mariadb", not(feature = "postgres18")))]
+        {
+            self.def.sql_type = SqlType::Char(36);
+        }
+        self.def.default = Some(DefaultValue::Expr("uuidv7()"));
+        self
+    }
+
     /// Set the column type to `TIMESTAMPTZ` (timestamp with time zone).
     ///
     /// **PostgreSQL/MySQL only.** Renders as `TIMESTAMPTZ` on PostgreSQL,
