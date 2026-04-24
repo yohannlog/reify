@@ -159,14 +159,39 @@ impl<M: Table> DeleteBuilder<M> {
 
     /// Build the SQL string and parameter list.
     ///
-    /// If the model has a `#[column(soft_delete)]` column and `.force()` was not called,
-    /// this emits `UPDATE table SET deleted_at = CURRENT_TIMESTAMP WHERE …`.
-    /// Otherwise, emits `DELETE FROM table WHERE …`.
+    /// Priority order:
+    /// 1. If `#[table(sql_delete = "...")]` is set, use that custom SQL
+    /// 2. If the model has a `#[column(soft_delete)]` column and `.force()` was not called,
+    ///    emit `UPDATE table SET deleted_at = CURRENT_TIMESTAMP WHERE …`
+    /// 3. Otherwise, emit `DELETE FROM table WHERE …`
     ///
     /// Returns `Err(BuildError::MissingFilter)` if no `.filter()` or
-    /// `.unfiltered()` has been called.
+    /// `.unfiltered()` has been called (unless using custom sql_delete).
     #[allow(unused_mut)]
     pub fn try_build(&self) -> Result<(String, Vec<Value>), BuildError> {
+        // Custom SQL override takes precedence
+        if let Some(custom_sql) = M::sql_delete() {
+            let mut params = Vec::new();
+            let mut sql = custom_sql.to_string();
+
+            // Append WHERE conditions if any
+            if !self.conditions.is_empty() {
+                // If custom SQL already has WHERE, use AND; otherwise add WHERE
+                let has_where = custom_sql.to_uppercase().contains(" WHERE ");
+                if has_where {
+                    sql.push_str(" AND ");
+                } else {
+                    sql.push_str(" WHERE ");
+                }
+                write_joined(&mut sql, &self.conditions, " AND ", |buf, c| {
+                    c.write_sql(buf, &mut params);
+                });
+            }
+
+            trace_query("delete(custom)", M::table_name(), &sql, &params);
+            return Ok((sql, params));
+        }
+
         if !self.unfiltered && self.conditions.is_empty() {
             return Err(BuildError::MissingFilter {
                 operation: "DELETE",

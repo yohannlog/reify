@@ -1,0 +1,19 @@
+error[E0599]: no function or associated item named `update` found for struct `AuditLog` in the current scope
+  --> tests/compile_fail/immutable_no_update.rs:15:23
+   |
+ 7 | pub struct AuditLog {
+   | ------------------- function or associated item `update` not found for this struct
+...
+15 |     let _ = AuditLog::update();
+   |                       ^^^^^^ function or associated item not found in `AuditLog`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+   = note: the following traits define an item `update`, perhaps you need to implement one of them:
+           candidate #1: `digest::Update`
+           candidate #2: `digest::digest::Digest`
+           candidate #3: `digest::digest::DynDigest`
+           candidate #4: `digest::mac::Mac`
+help: there is an associated function `sql_update` with a similar name
+   |
+15 |     let _ = AuditLog::sql_update();
+   |                       ++++

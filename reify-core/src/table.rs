@@ -156,4 +156,68 @@ pub trait Table: Sized {
     fn soft_delete_column() -> Option<&'static str> {
         None
     }
+
+    /// Custom SQL for DELETE operations (Hibernate-style `@SQLDelete`).
+    ///
+    /// When set via `#[table(sql_delete = "...")]`, the `DeleteBuilder` uses this
+    /// SQL template instead of generating `DELETE FROM table WHERE ...`.
+    ///
+    /// Use `?` placeholders for parameters. The builder appends filter conditions
+    /// after the custom SQL.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Table)]
+    /// #[table(
+    ///     name = "users",
+    ///     sql_delete = "UPDATE users SET deleted_at = NOW(), deleted_by = current_user WHERE id = ?"
+    /// )]
+    /// pub struct User { /* ... */ }
+    /// ```
+    fn sql_delete() -> Option<&'static str> {
+        None
+    }
+
+    /// Custom SQL for UPDATE operations (Hibernate-style `@SQLUpdate`).
+    ///
+    /// When set via `#[table(sql_update = "...")]`, the `UpdateBuilder` uses this
+    /// SQL template instead of generating `UPDATE table SET ... WHERE ...`.
+    ///
+    /// Use `?` placeholders for parameters.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Table)]
+    /// #[table(
+    ///     name = "audit_log",
+    ///     sql_update = "CALL update_audit_log(?, ?, ?)"
+    /// )]
+    /// pub struct AuditLog { /* ... */ }
+    /// ```
+    fn sql_update() -> Option<&'static str> {
+        None
+    }
+
+    /// Custom SQL for INSERT operations (Hibernate-style `@SQLInsert`).
+    ///
+    /// When set via `#[table(sql_insert = "...")]`, the `InsertBuilder` uses this
+    /// SQL template instead of generating `INSERT INTO table (...) VALUES (...)`.
+    ///
+    /// Use `?` placeholders for parameters.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Table)]
+    /// #[table(
+    ///     name = "events",
+    ///     sql_insert = "CALL insert_event(?, ?, ?)"
+    /// )]
+    /// pub struct Event { /* ... */ }
+    /// ```
+    fn sql_insert() -> Option<&'static str> {
+        None
+    }
 }

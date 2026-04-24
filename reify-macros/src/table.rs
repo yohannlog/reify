@@ -30,6 +30,15 @@ pub(crate) struct TableAttr {
     /// Extra derives requested via `#[table(dto(derives(Serialize, Deserialize)))]`.
     #[allow(dead_code)]
     pub dto_extra_derives: Vec<syn::Path>,
+    /// Custom SQL for DELETE operations (Hibernate-style @SQLDelete).
+    pub sql_delete: Option<String>,
+    /// Custom SQL for UPDATE operations (Hibernate-style @SQLUpdate).
+    pub sql_update: Option<String>,
+    /// Custom SQL for INSERT operations (Hibernate-style @SQLInsert).
+    pub sql_insert: Option<String>,
+    /// Immutable/read-only entity (Hibernate-style @Immutable).
+    /// When true, `update()` and `delete()` methods are not generated.
+    pub immutable: bool,
 }
 
 pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -562,6 +571,20 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         None => quote! { None },
     };
 
+    // Custom SQL overrides (Hibernate-style @SQLDelete/@SQLUpdate/@SQLInsert)
+    let sql_delete_impl = match &table_attr.sql_delete {
+        Some(sql) => quote! { Some(#sql) },
+        None => quote! { None },
+    };
+    let sql_update_impl = match &table_attr.sql_update {
+        Some(sql) => quote! { Some(#sql) },
+        None => quote! { None },
+    };
+    let sql_insert_impl = match &table_attr.sql_insert {
+        Some(sql) => quote! { Some(#sql) },
+        None => quote! { None },
+    };
+
     let expanded = quote! {
         impl reify_core::Table for #struct_name {
             fn table_name() -> &'static str {
@@ -604,6 +627,18 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             fn soft_delete_column() -> Option<&'static str> {
                 #soft_delete_impl
             }
+
+            fn sql_delete() -> Option<&'static str> {
+                #sql_delete_impl
+            }
+
+            fn sql_update() -> Option<&'static str> {
+                #sql_update_impl
+            }
+
+            fn sql_insert() -> Option<&'static str> {
+                #sql_insert_impl
+            }
         }
 
         impl reify_core::db::FromRow for #struct_name {
@@ -627,13 +662,22 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             pub fn insert_many(models: &[#struct_name]) -> reify_core::InsertManyBuilder<#struct_name> {
                 reify_core::InsertManyBuilder::new(models)
             }
+        }
+    };
 
-            pub fn update() -> reify_core::UpdateBuilder<#struct_name> {
-                reify_core::UpdateBuilder::new()
-            }
+    // Mutable methods (update/delete) — only generated for non-immutable tables
+    let mutable_methods = if table_attr.immutable {
+        quote! {}
+    } else {
+        quote! {
+            impl #struct_name {
+                pub fn update() -> reify_core::UpdateBuilder<#struct_name> {
+                    reify_core::UpdateBuilder::new()
+                }
 
-            pub fn delete() -> reify_core::DeleteBuilder<#struct_name> {
-                reify_core::DeleteBuilder::new()
+                pub fn delete() -> reify_core::DeleteBuilder<#struct_name> {
+                    reify_core::DeleteBuilder::new()
+                }
             }
         }
     };
@@ -883,7 +927,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     #[cfg(not(feature = "dto"))]
     let dto_impl = quote! {};
 
-    Ok(quote! { #expanded #audit_impl #dto_impl })
+    Ok(quote! { #expanded #mutable_methods #audit_impl #dto_impl })
 }
 
 fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
@@ -897,6 +941,10 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
         let mut audit = false;
         let mut dto_skip = Vec::new();
         let mut dto_extra_derives: Vec<syn::Path> = Vec::new();
+        let mut sql_delete = None;
+        let mut sql_update = None;
+        let mut sql_insert = None;
+        let mut immutable = false;
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
@@ -981,6 +1029,14 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                     name,
                     predicate,
                 });
+            } else if meta.path.is_ident("sql_delete") {
+                sql_delete = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("sql_update") {
+                sql_update = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("sql_insert") {
+                sql_insert = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("immutable") {
+                immutable = true;
             } else {
                 let ident = meta
                     .path
@@ -988,7 +1044,7 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                     .map(|i| i.to_string())
                     .unwrap_or_else(|| "?".to_string());
                 return Err(meta.error(format!(
-                    "unknown `table` attribute `{ident}`; expected one of: name, audit, dto, index"
+                    "unknown `table` attribute `{ident}`; expected one of: name, audit, dto, index, sql_delete, sql_update, sql_insert, immutable"
                 )));
             }
             Ok(())
@@ -1001,6 +1057,10 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                 audit,
                 dto_skip,
                 dto_extra_derives,
+                sql_delete,
+                sql_update,
+                sql_insert,
+                immutable,
             });
         }
     }
