@@ -1,4 +1,4 @@
-error: unknown `column` attribute `priamry_key`; expected one of: primary_key, auto_increment, unique, index, default, sql_type, computed, computed_rust, creation_timestamp, update_timestamp, source, check, references, on_delete, on_update, validate
+error: unknown `column` attribute `priamry_key`; expected one of: primary_key, auto_increment, unique, index, default, sql_type, computed, computed_rust, creation_timestamp, update_timestamp, source, check, references, on_delete, on_update, validate, name
   --> tests/compile_fail/column_unknown_attr.rs:11:14
    |
 11 |     #[column(priamry_key)]

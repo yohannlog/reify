@@ -88,18 +88,41 @@ fn writable_columns_exclude_db_timestamps() {
     assert_eq!(cols, vec!["id", "name"]);
 }
 
-// ── into_values() injects Utc::now() for VM-source timestamps ──────
+// ── into_values() returns actual field values (no injection) ───────
 
 #[test]
-fn vm_timestamp_into_values_produces_timestamptz() {
+fn vm_timestamp_into_values_returns_actual_values() {
+    let epoch = chrono::DateTime::default();
     let article = Article {
         id: 0,
         title: "Test".into(),
-        created_at: chrono::DateTime::default(),
-        updated_at: chrono::DateTime::default(),
+        created_at: epoch,
+        updated_at: epoch,
     };
     let values = article.into_values();
-    // created_at and updated_at should be recent Utc::now(), not the default epoch
+    // into_values() should return the actual field values, not inject Utc::now()
+    assert!(matches!(values[2], Value::Timestamptz(_)));
+    assert!(matches!(values[3], Value::Timestamptz(_)));
+
+    // Verify the values are the epoch (what we set), not recent timestamps
+    if let Value::Timestamptz(ts) = &values[2] {
+        assert_eq!(*ts, epoch, "into_values() should return actual field value");
+    }
+}
+
+// ── insert_values() injects Utc::now() for VM-source timestamps ─────
+
+#[test]
+fn vm_timestamp_insert_values_injects_now() {
+    let epoch = chrono::DateTime::default();
+    let article = Article {
+        id: 0,
+        title: "Test".into(),
+        created_at: epoch,
+        updated_at: epoch,
+    };
+    let values = article.insert_values();
+    // insert_values() should inject Utc::now() for VM-source timestamps
     assert!(matches!(values[2], Value::Timestamptz(_)));
     assert!(matches!(values[3], Value::Timestamptz(_)));
 

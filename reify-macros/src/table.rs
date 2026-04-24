@@ -1,9 +1,9 @@
 use quote::quote;
-use syn::{Attribute, Data, DeriveInput, Fields, Lit, parse::Parse};
+use syn::{parse::Parse, Attribute, Data, DeriveInput, Fields, Lit};
 
 use crate::helpers::{
     parse_column_attrs, parse_sql_type_string, rust_type_to_sql_type, to_snake_case,
-    unwrap_option_type,
+    unwrap_option_type, MetaExt,
 };
 
 // ── Parsed index from #[table(index(...))] ──────────────────────────
@@ -88,8 +88,10 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     let mut col_types = Vec::new();
     let mut value_conversions = Vec::new();
     let mut into_value_conversions: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut insert_value_conversions: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut single_col_indexes: Vec<String> = Vec::new();
     let mut update_ts_vm_cols: Vec<String> = Vec::new();
+    let mut creation_ts_vm_cols: Vec<String> = Vec::new();
 
     let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
@@ -105,13 +107,16 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     for field in fields.iter() {
         let ident = field.ident.as_ref().unwrap();
         let ty = &field.ty;
-        let name_str = ident.to_string();
+        let rust_name = ident.to_string();
+
+        let col_attrs = parse_column_attrs(&field.attrs)?;
+
+        // Use custom column name if specified, otherwise use Rust field name
+        let name_str = col_attrs.name.clone().unwrap_or_else(|| rust_name.clone());
 
         col_names.push(name_str.clone());
         col_idents.push(ident.clone());
         col_types.push(ty.clone());
-
-        let col_attrs = parse_column_attrs(&field.attrs)?;
 
         // H4: validate attribute without dto feature is a compile error
         #[cfg(not(feature = "dto"))]
@@ -208,26 +213,34 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             }
         }
 
-        if col_attrs.update_timestamp && col_attrs.timestamp_source.as_deref() != Some("db") {
+        let is_vm_source = col_attrs.timestamp_source.as_deref() != Some("db");
+
+        if col_attrs.update_timestamp && is_vm_source {
             update_ts_vm_cols.push(name_str.clone());
         }
+        if col_attrs.creation_timestamp && is_vm_source {
+            creation_ts_vm_cols.push(name_str.clone());
+        }
 
-        let is_vm_timestamp = (col_attrs.creation_timestamp || col_attrs.update_timestamp)
-            && col_attrs.timestamp_source.as_deref() != Some("db");
+        // as_values / into_values: always return the actual field value.
+        // These are used for reads, comparisons, serialization — NOT for INSERT.
+        value_conversions.push(quote! {
+            reify_core::value::IntoValue::into_value(self.#ident.clone())
+        });
+        into_value_conversions.push(quote! {
+            reify_core::value::IntoValue::into_value(self.#ident)
+        });
 
+        // insert_values: inject Utc::now() for VM-source timestamps.
+        let is_vm_timestamp =
+            (col_attrs.creation_timestamp || col_attrs.update_timestamp) && is_vm_source;
         if is_vm_timestamp {
-            value_conversions.push(quote! {
-                reify_core::value::IntoValue::into_value(chrono::Utc::now())
-            });
-            into_value_conversions.push(quote! {
+            insert_value_conversions.push(quote! {
                 reify_core::value::IntoValue::into_value(chrono::Utc::now())
             });
         } else {
-            value_conversions.push(quote! {
+            insert_value_conversions.push(quote! {
                 reify_core::value::IntoValue::into_value(self.#ident.clone())
-            });
-            into_value_conversions.push(quote! {
-                reify_core::value::IntoValue::into_value(self.#ident)
             });
         }
 
@@ -235,24 +248,25 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         let is_nullable = is_option;
 
         // Validate that `creation_timestamp`/`update_timestamp` are only
-        // applied to temporal types. The macro can only inspect the
+        // applied to datetime types. The macro can only inspect the
         // textual form of the type; a type alias resolving to a non-temporal
         // type will slip through, but the common mistake (annotating a
         // `String` or `i64`) is caught here.
+        //
+        // NaiveDate and NaiveTime are excluded: `Utc::now()` returns
+        // `DateTime<Utc>`, not a date-only or time-only value, so VM-source
+        // timestamps would fail at runtime. DB-source could work but the
+        // semantics are confusing (a "creation timestamp" that's just a date?).
         if col_attrs.creation_timestamp || col_attrs.update_timestamp {
             let ty_str = quote!(#inner_ty).to_string().replace(' ', "");
-            let is_temporal = matches!(
+            let is_datetime = matches!(
                 ty_str.as_str(),
                 "chrono::DateTime<chrono::Utc>"
                     | "DateTime<Utc>"
                     | "chrono::NaiveDateTime"
                     | "NaiveDateTime"
-                    | "chrono::NaiveDate"
-                    | "NaiveDate"
-                    | "chrono::NaiveTime"
-                    | "NaiveTime"
             );
-            if !is_temporal {
+            if !is_datetime {
                 let which = if col_attrs.creation_timestamp {
                     "creation_timestamp"
                 } else {
@@ -261,7 +275,9 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 return Err(syn::Error::new_spanned(
                     field,
                     format!(
-                        "`#[column({which})]` requires a temporal type (chrono::DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime); got `{ty_str}`"
+                        "`#[column({which})]` requires a datetime type \
+                         (chrono::DateTime<Utc> or NaiveDateTime); got `{ty_str}`. \
+                         NaiveDate and NaiveTime are not supported for timestamps."
                     ),
                 ));
             }
@@ -530,6 +546,14 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
             fn update_timestamp_columns() -> Vec<&'static str> {
                 vec![#(#update_ts_vm_cols),*]
+            }
+
+            fn creation_timestamp_columns() -> Vec<&'static str> {
+                vec![#(#creation_ts_vm_cols),*]
+            }
+
+            fn insert_values(&self) -> Vec<reify_core::Value> {
+                vec![#(#insert_value_conversions),*]
             }
         }
 
@@ -827,21 +851,14 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    table_name = Some(s.value());
-                }
+                table_name = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("audit") {
                 audit = true;
             } else if meta.path.is_ident("dto") {
                 meta.parse_nested_meta(|inner| {
                     if inner.path.is_ident("skip") {
-                        let value = inner.value()?;
-                        let lit: Lit = value.parse()?;
-                        if let Lit::Str(s) = lit {
-                            dto_skip.extend(s.value().split(',').map(|s| s.trim().to_string()));
-                        }
+                        let val = inner.parse_str_value()?;
+                        dto_skip.extend(val.split(',').map(|s| s.trim().to_string()));
                     } else if inner.path.is_ident("derives") {
                         // M1: parse `derives(Serialize, Deserialize, PartialEq, ...)`
                         let content;
@@ -893,17 +910,9 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                     } else if inner.path.is_ident("unique") {
                         unique = true;
                     } else if inner.path.is_ident("name") {
-                        let value = inner.value()?;
-                        let lit: Lit = value.parse()?;
-                        if let Lit::Str(s) = lit {
-                            name = Some(s.value());
-                        }
+                        name = Some(inner.parse_str_value()?);
                     } else if inner.path.is_ident("predicate") {
-                        let value = inner.value()?;
-                        let lit: Lit = value.parse()?;
-                        if let Lit::Str(s) = lit {
-                            predicate = Some(s.value());
-                        }
+                        predicate = Some(inner.parse_str_value()?);
                     } else {
                         let ident = inner
                             .path

@@ -79,6 +79,31 @@ pub enum SqlType {
     /// Only available on MariaDB 11.4+ with the vector plugin.
     /// Falls back to `TEXT` on other dialects.
     Vector(u32),
+    /// `POINT` — 2D geometric point.
+    ///
+    /// PostgreSQL native `POINT` type. MySQL `POINT` geometry type.
+    /// Falls back to `TEXT` on SQLite.
+    Point,
+    /// `INET` — IP address (IPv4 or IPv6).
+    ///
+    /// PostgreSQL native type. Falls back to `VARCHAR(45)` on MySQL
+    /// (enough for IPv6) and `TEXT` on SQLite.
+    Inet,
+    /// `CIDR` — Network address with prefix length.
+    ///
+    /// PostgreSQL native type. Falls back to `VARCHAR(49)` on MySQL
+    /// and `TEXT` on SQLite.
+    Cidr,
+    /// `MACADDR` — MAC address (6 bytes).
+    ///
+    /// PostgreSQL native type. Falls back to `CHAR(17)` on MySQL
+    /// (XX:XX:XX:XX:XX:XX format) and `TEXT` on SQLite.
+    MacAddr,
+    /// `INTERVAL` — Time interval.
+    ///
+    /// PostgreSQL native type. Falls back to `TEXT` on MySQL/SQLite
+    /// (no native interval support).
+    Interval,
 }
 
 impl SqlType {
@@ -151,6 +176,30 @@ impl SqlType {
             },
             SqlType::Vector(dims) => match dialect {
                 Dialect::Mysql => Cow::Owned(format!("VECTOR({dims})")),
+                _ => Cow::Borrowed("TEXT"),
+            },
+            SqlType::Point => match dialect {
+                Dialect::Postgres => Cow::Borrowed("POINT"),
+                Dialect::Mysql => Cow::Borrowed("POINT"),
+                _ => Cow::Borrowed("TEXT"),
+            },
+            SqlType::Inet => match dialect {
+                Dialect::Postgres => Cow::Borrowed("INET"),
+                Dialect::Mysql => Cow::Borrowed("VARCHAR(45)"),
+                _ => Cow::Borrowed("TEXT"),
+            },
+            SqlType::Cidr => match dialect {
+                Dialect::Postgres => Cow::Borrowed("CIDR"),
+                Dialect::Mysql => Cow::Borrowed("VARCHAR(49)"),
+                _ => Cow::Borrowed("TEXT"),
+            },
+            SqlType::MacAddr => match dialect {
+                Dialect::Postgres => Cow::Borrowed("MACADDR"),
+                Dialect::Mysql => Cow::Borrowed("CHAR(17)"),
+                _ => Cow::Borrowed("TEXT"),
+            },
+            SqlType::Interval => match dialect {
+                Dialect::Postgres => Cow::Borrowed("INTERVAL"),
                 _ => Cow::Borrowed("TEXT"),
             },
         }

@@ -1,5 +1,7 @@
 use quote::quote;
-use syn::{Attribute, DeriveInput, Lit, Path};
+use syn::{Attribute, DeriveInput, Path};
+
+use crate::helpers::MetaExt;
 
 #[derive(Debug)]
 enum RelKind {
@@ -19,7 +21,21 @@ struct ParsedRelation {
 
 pub(crate) fn impl_relations(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let struct_name = &input.ident;
-    let relations = parse_relations_attr(&input.attrs)?;
+
+    // Extract field names for validation
+    let field_names: Vec<String> = match &input.data {
+        syn::Data::Struct(data) => match &data.fields {
+            syn::Fields::Named(named) => named
+                .named
+                .iter()
+                .map(|f| f.ident.as_ref().unwrap().to_string())
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+
+    let relations = parse_relations_attr(&input.attrs, struct_name, &field_names)?;
 
     if relations.is_empty() {
         return Ok(quote! {});
@@ -81,7 +97,11 @@ pub(crate) fn impl_relations(input: &DeriveInput) -> syn::Result<proc_macro2::To
     })
 }
 
-fn parse_relations_attr(attrs: &[Attribute]) -> syn::Result<Vec<ParsedRelation>> {
+fn parse_relations_attr(
+    attrs: &[Attribute],
+    struct_name: &syn::Ident,
+    field_names: &[String],
+) -> syn::Result<Vec<ParsedRelation>> {
     let mut result = Vec::new();
 
     for attr in attrs {
@@ -107,23 +127,11 @@ fn parse_relations_attr(attrs: &[Attribute]) -> syn::Result<Vec<ParsedRelation>>
 
             rel_meta.parse_nested_meta(|inner| {
                 if inner.path.is_ident("foreign_key") {
-                    let value = inner.value()?;
-                    let lit: Lit = value.parse()?;
-                    if let Lit::Str(s) = lit {
-                        foreign_key = Some(s.value());
-                    }
+                    foreign_key = Some(inner.parse_str_value()?);
                 } else if inner.path.is_ident("local_key") {
-                    let value = inner.value()?;
-                    let lit: Lit = value.parse()?;
-                    if let Lit::Str(s) = lit {
-                        local_key = Some(s.value());
-                    }
+                    local_key = Some(inner.parse_str_value()?);
                 } else if inner.path.is_ident("name") {
-                    let value = inner.value()?;
-                    let lit: Lit = value.parse()?;
-                    if let Lit::Str(s) = lit {
-                        name = Some(s.value());
-                    }
+                    name = Some(inner.parse_str_value()?);
                 } else if inner.path.is_ident("model") {
                     let value = inner.value()?;
                     target = Some(value.parse::<Path>()?);
@@ -146,6 +154,28 @@ fn parse_relations_attr(attrs: &[Attribute]) -> syn::Result<Vec<ParsedRelation>>
             let target = target.ok_or_else(|| rel_meta.error("missing target type"))?;
             let foreign_key =
                 foreign_key.ok_or_else(|| rel_meta.error(r#"missing `foreign_key = "col"`"#))?;
+
+            // Validate that `belongs_to` foreign_key exists as a field on this struct.
+            // For `has_many`/`has_one`, the foreign_key is on the *target* struct,
+            // so we can't validate it here (would require cross-crate type info).
+            // We validate `local_key` for all relation kinds when explicitly provided.
+            if matches!(kind, RelKind::BelongsTo) && !field_names.contains(&foreign_key) {
+                return Err(rel_meta.error(format!(
+                    "`belongs_to` foreign_key `{foreign_key}` does not exist on `{struct_name}`; \
+                     available fields: {}",
+                    field_names.join(", ")
+                )));
+            }
+
+            if let Some(ref lk) = local_key {
+                if !field_names.contains(lk) {
+                    return Err(rel_meta.error(format!(
+                        "`local_key = \"{lk}\"` does not exist on `{struct_name}`; \
+                         available fields: {}",
+                        field_names.join(", ")
+                    )));
+                }
+            }
 
             result.push(ParsedRelation {
                 kind,

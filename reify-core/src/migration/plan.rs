@@ -11,7 +11,15 @@ pub fn compute_checksum(statements: &[String]) -> String {
         hasher.update(stmt.as_bytes());
         hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    // `sha2 0.11`'s `finalize()` returns a `hybrid_array::Array` that
+    // does not implement `LowerHex`. Format each byte manually.
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest.iter() {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// The result of a dry-run: what *would* be executed, without applying it.

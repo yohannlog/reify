@@ -10,7 +10,7 @@
 //! All sub-cases run inside a single `#[tokio::test]` to avoid parallel
 //! DDL races on shared table names.
 
-#![cfg(feature = "integration-tests")]
+#![cfg(feature = "mysql-integration-tests")]
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use reify::mysql_async::Opts;

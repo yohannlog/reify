@@ -33,10 +33,55 @@ cargo test
 
 - Add tests for new functionality
 - Ensure all existing tests pass: `cargo test`
-- For database-specific features, add integration tests in `reify/tests/` (all
-  integration tests live at the top level — there is no `integration/`
-  subdirectory).
 - Use `trybuild` for compile-time error tests when adding new macro features
+
+### Unit vs integration tests
+
+- **Unit tests** (SQL-generation, `MockDb`) live directly under
+  `reify/tests/*.rs`. They are picked up automatically by the
+  `unit-tests` / `coverage` CI jobs via `scripts/run-unit-tests.sh`.
+  Adding a new file is enough — no workflow edit required.
+- **Integration tests** (real database round-trips) live under
+  `reify/tests/integration/` and are mounted by
+  `reify/tests/integration.rs`. Each file is gated behind a
+  per-adapter feature flag.
+
+### Running integration tests
+
+The integration suite is split into three sub-features so contributors
+with only one database installed don't need to compile the others:
+
+| Feature | Adapter | Needs Docker? |
+|---|---|---|
+| `sqlite-integration-tests` | SQLite (in-memory) | No |
+| `pg-integration-tests` | PostgreSQL (`PG_URL`) | Yes |
+| `mysql-integration-tests` | MySQL (`MYSQL_URL`) | Yes |
+| `integration-tests` | All three | Yes (PG + MySQL) |
+
+```bash
+# SQLite only — fastest, no Docker:
+cargo test -p reify --features sqlite-integration-tests --test integration
+
+# PostgreSQL only (requires PG_URL):
+PG_URL="postgres://reify:reify@localhost:5432/reify_test" \
+  cargo test -p reify --features pg-integration-tests --test integration
+
+# Full matrix (CI equivalent):
+docker compose up -d
+PG_URL="..." MYSQL_URL="..." \
+  cargo test -p reify --features integration-tests --test integration -- --test-threads=1
+```
+
+`--test-threads=1` is used in CI as a belt-and-braces safety net
+against PostgreSQL catalogue-lock contention during heavy parallel
+DDL. Tables are also **prefixed per file** (`pg_basic_*`,
+`pg_mig_*`, `mysql_basic_*`, …) so each file is isolated; the flag
+can be omitted locally if you accept a marginal flake risk.
+
+If `PG_URL` / `MYSQL_URL` are not set, the corresponding tests
+**skip visibly** with a `SKIP: …` log line on stderr rather than
+silently passing. The `integration-tests` CI job additionally
+fails fast if either variable is empty.
 
 ## Pull Request Process
 

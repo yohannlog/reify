@@ -19,7 +19,7 @@ use chrono::SecondsFormat;
 // so the rest of the module (and the RFC 4231 / NIST KAT tests) needs
 // no change.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 #[cfg(test)]
 use sha2::Digest;
 use sha2::Sha256;
@@ -46,7 +46,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 /// `pub(crate)` — shared with the `paginate` module for cursor signing.
 #[inline]
 pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
         .expect("Hmac<Sha256> accepts keys of any length");
     mac.update(message);
     mac.finalize().into_bytes().into()
@@ -825,6 +825,37 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
                     out.push('"');
                 }
                 out.push(']');
+            }
+            // Complex types — serialize as quoted string representation
+            #[cfg(feature = "postgres")]
+            Value::Point(p) => {
+                out.push('"');
+                out.push_str(&json_escape(&p.to_string()));
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::Inet(i) => {
+                out.push('"');
+                out.push_str(&i.to_string());
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::Cidr(c) => {
+                out.push('"');
+                out.push_str(&c.to_string());
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::MacAddr(m) => {
+                out.push('"');
+                out.push_str(&m.to_string());
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::Interval(i) => {
+                out.push('"');
+                out.push_str(&json_escape(&i.to_string()));
+                out.push('"');
             }
         }
     }

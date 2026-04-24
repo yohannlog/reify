@@ -70,13 +70,16 @@ pub trait Table: Sized {
 
     /// Values for writable columns only (excludes computed and DB-managed timestamp columns).
     ///
+    /// Uses [`insert_values`](Table::insert_values) as the source, so VM-source
+    /// timestamps are injected with `Utc::now()`.
+    ///
     /// Pairs with `writable_column_names()` — same order, same length.
     fn writable_values(&self) -> Vec<Value> {
         let defs = Self::column_defs();
         if defs.is_empty() {
-            return self.as_values();
+            return self.insert_values();
         }
-        let all_values = self.as_values();
+        let all_values = self.insert_values();
         defs.iter()
             .zip(all_values)
             .filter(|(d, _)| d.computed.is_none() && d.timestamp_source != TimestampSource::Db)
@@ -97,6 +100,35 @@ pub trait Table: Sized {
             })
             .map(|d| d.name)
             .collect()
+    }
+
+    /// Column names marked as `creation_timestamp` with `Vm` source.
+    ///
+    /// Used by `InsertBuilder` to auto-inject timestamp values on INSERT.
+    /// Returns an empty vec when no creation-timestamp columns exist.
+    fn creation_timestamp_columns() -> Vec<&'static str> {
+        let defs = Self::column_defs();
+        defs.iter()
+            .filter(|d| {
+                d.timestamp_kind == Some(TimestampKind::Creation)
+                    && d.timestamp_source == TimestampSource::Vm
+            })
+            .map(|d| d.name)
+            .collect()
+    }
+
+    /// Values for INSERT operations, with VM-source timestamps injected.
+    ///
+    /// Unlike [`as_values`](Table::as_values) which returns the struct's actual
+    /// field values, this method injects `Utc::now()` for `creation_timestamp`
+    /// and `update_timestamp` columns with `Vm` source.
+    ///
+    /// Use this for INSERT operations. Use `as_values()` for reads, comparisons,
+    /// and serialization where you want the actual stored values.
+    fn insert_values(&self) -> Vec<Value> {
+        // Default implementation falls back to as_values().
+        // The derive macro overrides this with timestamp injection.
+        self.as_values()
     }
 
     /// Column names that exist in the database (excludes `computed_rust` virtual columns).

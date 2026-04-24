@@ -1,4 +1,4 @@
-#![cfg(feature = "integration-tests")]
+#![cfg(feature = "sqlite-integration-tests")]
 
 use reify::Value;
 use reify::{Database, DbError, SqliteDb, Table, delete, fetch, insert, raw_execute, update};

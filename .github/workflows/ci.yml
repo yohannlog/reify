@@ -78,25 +78,12 @@ jobs:
         with:
           key: ${{ matrix.os }}
       - name: cargo test (unit)
-        # timestamps.rs is excluded — it references unstable features not yet stabilised
-        # builder_type_safety is excluded — trybuild tests run in a dedicated job
-        run: >
-          cargo test -p reify
-          --test array_types
-          --test audit_tests
-          --test batch_upsert
-          --test computed_columns
-          --test cursor_pagination
-          --test derive_enum
-          --test derive_table
-          --test distinct
-          --test func_tests
-          --test group_by
-          --test migration_tests
-          --test range_types
-          --test relations
-          --test sql_injection
-          --test subquery
+        # The list of unit-test binaries lives in
+        # `scripts/run-unit-tests.sh`, so adding a new file under
+        # `reify/tests/` is automatically picked up by CI without
+        # having to edit this workflow. Exclusions (integration,
+        # trybuild, timestamps) are documented in the script.
+        run: bash scripts/run-unit-tests.sh
 
   compile-fail-tests:
     name: Compile-fail Tests (trybuild)
@@ -121,31 +108,28 @@ jobs:
         with:
           tool: cargo-tarpaulin
       - name: Run tarpaulin
-        run: >
-          cargo tarpaulin
-          --all-features
-          --workspace
-          --exclude reify-macros
-          --timeout 120
-          --out xml
-          --output-dir coverage/
-          --exclude-files "reify/tests/compile_fail/*"
-          --exclude-files "reify/tests/builder_type_safety.rs"
-          --test array_types
-          --test audit_tests
-          --test batch_upsert
-          --test computed_columns
-          --test cursor_pagination
-          --test derive_enum
-          --test derive_table
-          --test distinct
-          --test func_tests
-          --test group_by
-          --test migration_tests
-          --test range_types
-          --test relations
-          --test sql_injection
-          --test subquery
+        # Discover the `--test <name>` list from the shared script
+        # (keeps CI and local runs in sync).
+        run: |
+          TESTS="$(
+              for f in reify/tests/*.rs; do
+                  name="$(basename "$f" .rs)"
+                  case "$name" in
+                      builder_type_safety|integration|timestamps) ;;
+                      *) echo "--test $name" ;;
+                  esac
+              done | tr '\n' ' '
+          )"
+          cargo tarpaulin \
+              --all-features \
+              --workspace \
+              --exclude reify-macros \
+              --timeout 120 \
+              --out xml \
+              --output-dir coverage/ \
+              --exclude-files "reify/tests/compile_fail/*" \
+              --exclude-files "reify/tests/builder_type_safety.rs" \
+              $TESTS
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
@@ -190,5 +174,22 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Fail fast if the connection strings haven't been wired up —
+      # otherwise every test would silently `return` via `connect()`'s
+      # `None` branch and the job would pass without actually running
+      # anything.
+      - name: Verify DB URLs are set
+        run: |
+          if [[ -z "${PG_URL:-}" ]]; then
+              echo "::error::PG_URL is not set" && exit 1
+          fi
+          if [[ -z "${MYSQL_URL:-}" ]]; then
+              echo "::error::MYSQL_URL is not set" && exit 1
+          fi
+          echo "PG_URL and MYSQL_URL are both set."
+      # Tables are now prefixed per-file (`pg_basic_*`, `pg_mig_*`,
+      # `mysql_basic_*`, `mysql_mig_*`, …), but `--test-threads=1` is
+      # kept as a belt-and-braces safety net: PG catalogue locks for
+      # DDL can still serialise badly under heavy parallelism.
       - name: cargo test (integration)
         run: cargo test -p reify --features integration-tests --test integration -- --test-threads=1

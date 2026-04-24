@@ -96,6 +96,11 @@ fn sql_type_to_pg(ty: &SqlType) -> Type {
         }
         SqlType::Decimal(_, _) => Type::NUMERIC,
         SqlType::Vector(_) => Type::TEXT,
+        SqlType::Point => Type::POINT,
+        SqlType::Inet => Type::INET,
+        SqlType::Cidr => Type::CIDR,
+        SqlType::MacAddr => Type::MACADDR,
+        SqlType::Interval => Type::INTERVAL,
     }
 }
 
@@ -129,6 +134,11 @@ fn value_to_pg_type(value: &Value) -> Type {
         Value::ArrayF64(_) => Type::FLOAT8_ARRAY,
         Value::ArrayString(_) => Type::TEXT_ARRAY,
         Value::ArrayUuid(_) => Type::UUID_ARRAY,
+        Value::Point(_) => Type::POINT,
+        Value::Inet(_) => Type::INET,
+        Value::Cidr(_) => Type::CIDR,
+        Value::MacAddr(_) => Type::MACADDR,
+        Value::Interval(_) => Type::INTERVAL,
     }
 }
 

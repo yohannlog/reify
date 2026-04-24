@@ -1,6 +1,33 @@
 use quote::quote;
-use syn::parse::Parse;
+use syn::parse::{Parse, ParseStream};
 use syn::{Attribute, Lit};
+
+/// Helper trait to extract a string value from a `meta.value()` call.
+/// Reduces boilerplate in attribute parsing.
+pub(crate) trait MetaExt {
+    /// Parse `= "value"` and return the string, or error if not a string literal.
+    fn parse_str_value(&self) -> syn::Result<String>;
+}
+
+impl MetaExt for syn::meta::ParseNestedMeta<'_> {
+    fn parse_str_value(&self) -> syn::Result<String> {
+        let value = self.value()?;
+        let lit: Lit = value.parse()?;
+        match lit {
+            Lit::Str(s) => Ok(s.value()),
+            _ => Err(syn::Error::new_spanned(lit, "expected a string literal")),
+        }
+    }
+}
+
+/// Parse a string literal from a ParseStream (for use inside parenthesized content).
+pub(crate) fn parse_str_lit(input: ParseStream) -> syn::Result<String> {
+    let lit: Lit = input.parse()?;
+    match lit {
+        Lit::Str(s) => Ok(s.value()),
+        _ => Err(syn::Error::new_spanned(lit, "expected a string literal")),
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct ColumnAttrs {
@@ -24,6 +51,8 @@ pub(crate) struct ColumnAttrs {
     /// Kept alongside the raw token stream so consumers (rustdoc generation,
     /// Option-nullability checks) don't have to re-parse the tokens.
     pub validate_rule_names: Vec<String>,
+    /// Override the column name in the database (e.g. `#[column(name = "user_ip")]`).
+    pub name: Option<String>,
 }
 
 pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs> {
@@ -42,23 +71,11 @@ pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs
             } else if meta.path.is_ident("index") {
                 result.index = true;
             } else if meta.path.is_ident("default") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.default = Some(s.value());
-                }
+                result.default = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("sql_type") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.sql_type = Some(s.value());
-                }
+                result.sql_type = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("computed") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.computed = Some(s.value());
-                }
+                result.computed = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("computed_rust") {
                 result.computed_rust = true;
             } else if meta.path.is_ident("creation_timestamp") {
@@ -66,35 +83,27 @@ pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs
             } else if meta.path.is_ident("update_timestamp") {
                 result.update_timestamp = true;
             } else if meta.path.is_ident("source") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.timestamp_source = Some(s.value());
+                let val = meta.parse_str_value()?;
+                if val != "db" && val != "vm" {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        format!(
+                            "invalid `source` value {:?}; expected \"db\" or \"vm\"",
+                            val
+                        ),
+                    ));
                 }
+                result.timestamp_source = Some(val);
             } else if meta.path.is_ident("check") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.check = Some(s.value());
-                }
+                result.check = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("references") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.references = Some(s.value());
-                }
+                result.references = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("on_delete") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.on_delete = Some(s.value());
-                }
+                result.on_delete = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("on_update") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    result.on_update = Some(s.value());
-                }
+                result.on_update = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("name") {
+                result.name = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("validate") {
                 let content;
                 syn::parenthesized!(content in meta.input);
@@ -162,7 +171,7 @@ ip_v4, ip_v6, custom, nested, skip_on_field_errors",
                     "unknown `column` attribute `{}`; expected one of: \
 primary_key, auto_increment, unique, index, default, sql_type, \
 computed, computed_rust, creation_timestamp, update_timestamp, source, \
-check, references, on_delete, on_update, validate",
+check, references, on_delete, on_update, validate, name",
                     meta.path
                         .get_ident()
                         .map_or("?".to_string(), |i| i.to_string())
@@ -279,6 +288,22 @@ pub(crate) fn rust_type_to_sql_type(ty: &syn::Type) -> proc_macro2::TokenStream 
         "Vec<serde_json::Value>" | "Vec<JsonValue>" => quote! {
             reify_core::schema::SqlType::Array(Box::new(reify_core::schema::SqlType::Jsonb))
         },
+        // ── Complex types (PostgreSQL / MySQL) ───────────────────────────
+        "Point" | "reify::types::Point" | "reify_core::types::Point" => {
+            quote! { reify_core::schema::SqlType::Point }
+        }
+        "Inet" | "reify::types::Inet" | "reify_core::types::Inet" => {
+            quote! { reify_core::schema::SqlType::Inet }
+        }
+        "Cidr" | "reify::types::Cidr" | "reify_core::types::Cidr" => {
+            quote! { reify_core::schema::SqlType::Cidr }
+        }
+        "MacAddr" | "reify::types::MacAddr" | "reify_core::types::MacAddr" => {
+            quote! { reify_core::schema::SqlType::MacAddr }
+        }
+        "Interval" | "reify::types::Interval" | "reify_core::types::Interval" => {
+            quote! { reify_core::schema::SqlType::Interval }
+        }
         _ => quote! { reify_core::schema::SqlType::Text },
     }
 }
@@ -316,6 +341,36 @@ pub(crate) fn parse_sql_type_string(s: &str) -> proc_macro2::TokenStream {
                 return quote! { reify_core::schema::SqlType::Decimal(#p, #sc) };
             }
         }
+    }
+
+    // ── Complex types ────────────────────────────────────────────────
+    match upper.as_str() {
+        "POINT" => return quote! { reify_core::schema::SqlType::Point },
+        "INET" => return quote! { reify_core::schema::SqlType::Inet },
+        "CIDR" => return quote! { reify_core::schema::SqlType::Cidr },
+        "MACADDR" => return quote! { reify_core::schema::SqlType::MacAddr },
+        "INTERVAL" => return quote! { reify_core::schema::SqlType::Interval },
+        "BYTEA" | "BLOB" => return quote! { reify_core::schema::SqlType::Bytea },
+        "UUID" => return quote! { reify_core::schema::SqlType::Uuid },
+        "JSONB" | "JSON" => return quote! { reify_core::schema::SqlType::Jsonb },
+        "TEXT" => return quote! { reify_core::schema::SqlType::Text },
+        "BOOLEAN" | "BOOL" => return quote! { reify_core::schema::SqlType::Boolean },
+        "SMALLINT" | "INT2" => return quote! { reify_core::schema::SqlType::SmallInt },
+        "INTEGER" | "INT" | "INT4" => return quote! { reify_core::schema::SqlType::Integer },
+        "BIGINT" | "INT8" => return quote! { reify_core::schema::SqlType::BigInt },
+        "REAL" | "FLOAT4" | "FLOAT" => return quote! { reify_core::schema::SqlType::Float },
+        "DOUBLE PRECISION" | "FLOAT8" | "DOUBLE" => {
+            return quote! { reify_core::schema::SqlType::Double }
+        }
+        "DATE" => return quote! { reify_core::schema::SqlType::Date },
+        "TIME" => return quote! { reify_core::schema::SqlType::Time },
+        "TIMESTAMP" => return quote! { reify_core::schema::SqlType::Timestamp },
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => {
+            return quote! { reify_core::schema::SqlType::Timestamptz }
+        }
+        "SERIAL" => return quote! { reify_core::schema::SqlType::Serial },
+        "BIGSERIAL" => return quote! { reify_core::schema::SqlType::BigSerial },
+        _ => {}
     }
 
     quote! { reify_core::schema::SqlType::Custom(#s) }

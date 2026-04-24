@@ -127,7 +127,7 @@ pub(crate) fn create_tracking_table_sql(dialect: Dialect) -> &'static str {
              `version`     VARCHAR(512) NOT NULL PRIMARY KEY,\
              `description` TEXT         NOT NULL,\
              `applied_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,\
-             `checksum`    TEXT         NOT NULL DEFAULT '',\
+             `checksum`    VARCHAR(64)  NOT NULL DEFAULT '',\
              `comment`     TEXT\
              );"
         }

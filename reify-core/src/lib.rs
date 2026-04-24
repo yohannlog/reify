@@ -18,6 +18,7 @@ pub mod schema;
 pub mod sql;
 pub mod table;
 pub mod telemetry;
+pub mod types;
 pub mod value;
 pub mod view;
 
@@ -104,6 +105,8 @@ pub use enumeration::{DbEnum, enum_from_value};
 pub use hooks::{AsyncModelHooks, HookError, ModelHooks};
 
 pub use range::{Bound, Range, RangeElement};
+
+pub use types::{Cidr, Inet, Interval, MacAddr, Point};
 
 pub use view::{
     View, ViewDef, ViewQuery, ViewSchema, ViewSchemaDef, create_materialized_view_sql,
