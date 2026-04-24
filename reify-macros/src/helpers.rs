@@ -53,6 +53,10 @@ pub(crate) struct ColumnAttrs {
     pub validate_rule_names: Vec<String>,
     /// Override the column name in the database (e.g. `#[column(name = "user_ip")]`).
     pub name: Option<String>,
+    /// Mark this column as the soft-delete marker.
+    ///
+    /// The column must be `Option<DateTime<Utc>>` or `Option<NaiveDateTime>`.
+    pub soft_delete: bool,
 }
 
 pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs> {
@@ -104,6 +108,8 @@ pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs
                 result.on_update = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("name") {
                 result.name = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("soft_delete") {
+                result.soft_delete = true;
             } else if meta.path.is_ident("validate") {
                 let content;
                 syn::parenthesized!(content in meta.input);
@@ -171,7 +177,7 @@ ip_v4, ip_v6, custom, nested, skip_on_field_errors",
                     "unknown `column` attribute `{}`; expected one of: \
 primary_key, auto_increment, unique, index, default, sql_type, \
 computed, computed_rust, creation_timestamp, update_timestamp, source, \
-check, references, on_delete, on_update, validate, name",
+check, references, on_delete, on_update, validate, name, soft_delete",
                     meta.path
                         .get_ident()
                         .map_or("?".to_string(), |i| i.to_string())

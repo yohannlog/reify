@@ -419,6 +419,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "operation",
@@ -436,6 +437,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             // inserted directly into the audit table.
             check: Some("operation IN ('insert','update','delete')".to_string()),
             foreign_key: None,
+            soft_delete: false,
         },
         // actor_id is TEXT to support i64, UUID, or any string identifier.
         ColumnDef {
@@ -452,6 +454,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         // `changed_at` is bound by the application (RFC 3339 UTC) so it is
         // covered by the HMAC signature. The `NOW()` default remains so
@@ -471,6 +474,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Db,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "row_data",
@@ -486,6 +490,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         // Integrity column — NULL when no HMAC secret is configured.
         ColumnDef {
@@ -502,6 +507,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
     ]
 }

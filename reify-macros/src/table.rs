@@ -92,6 +92,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     let mut single_col_indexes: Vec<String> = Vec::new();
     let mut update_ts_vm_cols: Vec<String> = Vec::new();
     let mut creation_ts_vm_cols: Vec<String> = Vec::new();
+    let mut soft_delete_col: Option<String> = None;
 
     let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
@@ -282,6 +283,42 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 ));
             }
         }
+
+        // Validate soft_delete: must be Option<DateTime<Utc>> or Option<NaiveDateTime>
+        if col_attrs.soft_delete {
+            if !is_nullable {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "`#[column(soft_delete)]` requires an `Option<T>` type; \
+                     the column must be nullable to distinguish active from deleted rows.",
+                ));
+            }
+            let ty_str = quote!(#inner_ty).to_string().replace(' ', "");
+            let is_datetime = matches!(
+                ty_str.as_str(),
+                "chrono::DateTime<chrono::Utc>"
+                    | "DateTime<Utc>"
+                    | "chrono::NaiveDateTime"
+                    | "NaiveDateTime"
+            );
+            if !is_datetime {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    format!(
+                        "`#[column(soft_delete)]` requires a datetime type \
+                         (Option<chrono::DateTime<Utc>> or Option<NaiveDateTime>); got `Option<{ty_str}>`."
+                    ),
+                ));
+            }
+            if soft_delete_col.is_some() {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "only one column can be marked as `soft_delete`; \
+                     another column already has this attribute.",
+                ));
+            }
+            soft_delete_col = Some(name_str.clone());
+        }
         let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
             parse_sql_type_string(custom)
         } else if col_attrs.primary_key && col_attrs.auto_increment {
@@ -390,6 +427,8 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             quote! { None }
         };
 
+        let is_soft_delete = col_attrs.soft_delete;
+
         col_defs_tokens.push(quote! {
             reify_core::schema::ColumnDef {
                 name: #name_str,
@@ -405,6 +444,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 timestamp_source: #timestamp_source_token,
                 check: #check_token,
                 foreign_key: #fk_token,
+                soft_delete: #is_soft_delete,
             }
         });
     }
@@ -517,6 +557,11 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let from_row_field_names = col_idents.iter().collect::<Vec<_>>();
 
+    let soft_delete_impl = match &soft_delete_col {
+        Some(col) => quote! { Some(#col) },
+        None => quote! { None },
+    };
+
     let expanded = quote! {
         impl reify_core::Table for #struct_name {
             fn table_name() -> &'static str {
@@ -554,6 +599,10 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
             fn insert_values(&self) -> Vec<reify_core::Value> {
                 vec![#(#insert_value_conversions),*]
+            }
+
+            fn soft_delete_column() -> Option<&'static str> {
+                #soft_delete_impl
             }
         }
 

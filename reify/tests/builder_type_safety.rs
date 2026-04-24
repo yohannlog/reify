@@ -27,3 +27,15 @@ fn db_enum_unknown_attribute_fails_to_compile() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/db_enum_unknown_attr.rs");
 }
+
+#[test]
+fn soft_delete_non_option_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/soft_delete_non_option.rs");
+}
+
+#[test]
+fn soft_delete_non_datetime_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/soft_delete_non_datetime.rs");
+}

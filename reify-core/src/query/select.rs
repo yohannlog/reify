@@ -7,6 +7,7 @@ use super::{
 use super::{rewrite_placeholders_pg, write_returning};
 use crate::condition::{AggregateCondition, Condition};
 use crate::ident::qi;
+use crate::soft_delete::SoftDeleteFilter;
 use crate::sql::{ToSql, write_joined};
 use crate::table::Table;
 use crate::value::Value;
@@ -40,6 +41,7 @@ pub struct SelectBuilder<M: Table> {
     orders: Vec<Order>,
     limit: Option<u64>,
     offset: Option<u64>,
+    soft_delete_filter: SoftDeleteFilter,
     _model: PhantomData<M>,
 }
 
@@ -59,8 +61,36 @@ impl<M: Table> SelectBuilder<M> {
             orders: Vec::new(),
             limit: None,
             offset: None,
+            soft_delete_filter: SoftDeleteFilter::Default,
             _model: PhantomData,
         }
+    }
+
+    /// Include soft-deleted rows in the results.
+    ///
+    /// By default, models with a `#[column(soft_delete)]` column automatically
+    /// filter out deleted rows. Call this to include them.
+    ///
+    /// ```ignore
+    /// // Include both active and deleted users
+    /// let all_users = User::find().with_deleted().fetch(&db).await?;
+    /// ```
+    pub fn with_deleted(mut self) -> Self {
+        self.soft_delete_filter = SoftDeleteFilter::WithDeleted;
+        self
+    }
+
+    /// Return only soft-deleted rows.
+    ///
+    /// Filters to rows where the soft-delete column IS NOT NULL.
+    ///
+    /// ```ignore
+    /// // Get only deleted users (e.g., for a trash view)
+    /// let deleted_users = User::find().only_deleted().fetch(&db).await?;
+    /// ```
+    pub fn only_deleted(mut self) -> Self {
+        self.soft_delete_filter = SoftDeleteFilter::OnlyDeleted;
+        self
     }
 
     /// Emit `SELECT DISTINCT` instead of `SELECT`.
@@ -217,11 +247,112 @@ impl<M: Table> SelectBuilder<M> {
 
     /// Build the SQL string and parameter list.
     pub fn build(&self) -> (String, Vec<Value>) {
-        let ast = self.build_ast();
+        // Determine if we need to inject a soft-delete filter
+        let soft_delete_condition = self.soft_delete_condition();
+
+        let ast = if soft_delete_condition.is_some() {
+            // Clone conditions and add soft-delete filter
+            let mut conditions = self.conditions.clone();
+            if let Some(cond) = soft_delete_condition {
+                // Prepend soft-delete condition so it appears first in WHERE
+                conditions.insert(0, cond);
+            }
+            self.build_ast_with_conditions(conditions)
+        } else {
+            self.build_ast()
+        };
+
         let mut params = Vec::new();
         let sql = ast.render(&mut params);
         trace_query("select", M::table_name(), &sql, &params);
         (sql, params)
+    }
+
+    /// Compute the soft-delete condition based on filter mode and model config.
+    fn soft_delete_condition(&self) -> Option<Condition> {
+        let col = M::soft_delete_column()?;
+
+        match self.soft_delete_filter {
+            SoftDeleteFilter::Default => {
+                // Check global config
+                if crate::soft_delete::show_deleted() {
+                    None // Global says show deleted, no filter
+                } else {
+                    // Hide deleted rows: WHERE col IS NULL
+                    Some(Condition::IsNull(col))
+                }
+            }
+            SoftDeleteFilter::WithDeleted => None, // No filter, show all
+            SoftDeleteFilter::OnlyDeleted => {
+                // Only deleted: WHERE col IS NOT NULL
+                Some(Condition::IsNotNull(col))
+            }
+        }
+    }
+
+    /// Build AST with custom conditions (used for soft-delete injection).
+    fn build_ast_with_conditions(&self, conditions: Vec<Condition>) -> crate::sql::SqlFragment<'_> {
+        let has_joins = !self.joins.is_empty();
+
+        let columns = if let Some(ref exprs) = self.exprs {
+            exprs.iter().map(|e| e.to_sql_fragment()).collect()
+        } else if has_joins {
+            let mut select_tables = vec![format!("{}.*", qi(M::table_name()))];
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(M::table_name());
+            for j in &self.joins {
+                if seen.insert(j.table) {
+                    select_tables.push(format!("{}.*", qi(j.table)));
+                }
+            }
+            match &self.columns {
+                Some(c) => c.iter().map(|s| qi(s)).collect(),
+                None => select_tables,
+            }
+        } else {
+            match &self.columns {
+                Some(c) => c.iter().map(|s| qi(s)).collect(),
+                None => vec![],
+            }
+        };
+
+        let joins = self
+            .joins
+            .iter()
+            .map(|j| crate::sql::JoinFragment {
+                kind: j.kind,
+                table: j.table.to_string(),
+                on_condition: j.on.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let order_by = self
+            .orders
+            .iter()
+            .map(|o| match o {
+                Order::Asc(c) => crate::sql::OrderFragment {
+                    column: qi(c),
+                    descending: false,
+                },
+                Order::Desc(c) => crate::sql::OrderFragment {
+                    column: qi(c),
+                    descending: true,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        crate::sql::SqlFragment::Select {
+            distinct: self.distinct,
+            columns,
+            from: M::table_name().to_string(),
+            joins: std::borrow::Cow::Owned(joins),
+            conditions: std::borrow::Cow::Owned(conditions),
+            group_by: self.group_by.iter().map(|s| qi(s)).collect(),
+            having: std::borrow::Cow::Borrowed(self.having.as_slice()),
+            order_by: std::borrow::Cow::Owned(order_by),
+            limit: self.limit,
+            offset: self.offset,
+        }
     }
 
     /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).
@@ -249,6 +380,7 @@ impl<M: Table> Clone for SelectBuilder<M> {
             orders: self.orders.clone(),
             limit: self.limit,
             offset: self.offset,
+            soft_delete_filter: self.soft_delete_filter,
             _model: PhantomData,
         }
     }

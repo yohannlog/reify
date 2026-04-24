@@ -12,6 +12,16 @@ use std::fmt::Write;
 use std::marker::PhantomData;
 use tracing::debug;
 
+/// Soft-delete mode for delete operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SoftDeleteMode {
+    /// Use soft delete if the model has a soft-delete column (default).
+    #[default]
+    Auto,
+    /// Force a hard DELETE regardless of soft-delete column.
+    Force,
+}
+
 // ── DeleteBuilder ───────────────────────────────────────────────────
 
 /// A fluent builder for `DELETE` statements.
@@ -30,6 +40,7 @@ use tracing::debug;
 pub struct DeleteBuilder<M: Table> {
     conditions: Vec<Condition>,
     unfiltered: bool,
+    soft_delete_mode: SoftDeleteMode,
     #[cfg(feature = "postgres")]
     returning: Option<Vec<&'static str>>,
     #[cfg(feature = "postgres18")]
@@ -45,12 +56,32 @@ impl<M: Table> DeleteBuilder<M> {
         Self {
             conditions: Vec::new(),
             unfiltered: false,
+            soft_delete_mode: SoftDeleteMode::Auto,
             #[cfg(feature = "postgres")]
             returning: None,
             #[cfg(feature = "postgres18")]
             returning_old_new: None,
             _model: PhantomData,
         }
+    }
+
+    /// Force a hard DELETE, bypassing soft delete.
+    ///
+    /// By default, if the model has a `#[column(soft_delete)]` column,
+    /// `delete()` performs an UPDATE to set the deletion timestamp.
+    /// Call `.force()` to perform an actual DELETE instead.
+    ///
+    /// ```ignore
+    /// // Permanently delete the user (hard delete)
+    /// User::delete()
+    ///     .filter(User::id.eq(42))
+    ///     .force()
+    ///     .execute(&db)
+    ///     .await?;
+    /// ```
+    pub fn force(mut self) -> Self {
+        self.soft_delete_mode = SoftDeleteMode::Force;
+        self
     }
 
     /// Append a `RETURNING` clause (PostgreSQL only).
@@ -110,20 +141,27 @@ impl<M: Table> DeleteBuilder<M> {
         self
     }
 
-    /// Build the `DELETE FROM … WHERE …` SQL string and parameter list.
+    /// Build the `DELETE FROM … WHERE …` or `UPDATE … SET deleted_at = …` SQL string.
+    ///
+    /// If the model has a `#[column(soft_delete)]` column and `.force()` was not called,
+    /// this emits an UPDATE statement instead of DELETE.
     ///
     /// # Panics
     ///
     /// Panics if no `.filter()` or `.unfiltered()` has been called — bare
-    /// `DELETE` without a `WHERE` clause is forbidden to prevent accidental
-    /// full-table deletes. Use [`try_build`](Self::try_build) for a
+    /// DELETE/UPDATE without a WHERE clause is forbidden to prevent accidental
+    /// full-table operations. Use [`try_build`](Self::try_build) for a
     /// non-panicking alternative.
     pub fn build(&self) -> (String, Vec<Value>) {
         self.try_build()
             .expect("DELETE without WHERE is forbidden. Use .filter() or .unfiltered() explicitly.")
     }
 
-    /// Build the `DELETE FROM … WHERE …` SQL string and parameter list.
+    /// Build the SQL string and parameter list.
+    ///
+    /// If the model has a `#[column(soft_delete)]` column and `.force()` was not called,
+    /// this emits `UPDATE table SET deleted_at = CURRENT_TIMESTAMP WHERE …`.
+    /// Otherwise, emits `DELETE FROM table WHERE …`.
     ///
     /// Returns `Err(BuildError::MissingFilter)` if no `.filter()` or
     /// `.unfiltered()` has been called.
@@ -135,9 +173,22 @@ impl<M: Table> DeleteBuilder<M> {
             });
         }
 
+        // Check if we should use soft delete
+        let soft_delete_col = match self.soft_delete_mode {
+            SoftDeleteMode::Force => None,
+            SoftDeleteMode::Auto => M::soft_delete_column(),
+        };
+
         let mut params = Vec::new();
         let mut sql = String::with_capacity(64);
-        let _ = write!(sql, "DELETE FROM {}", qi(M::table_name()));
+
+        if let Some(col) = soft_delete_col {
+            // Soft delete: UPDATE table SET col = CURRENT_TIMESTAMP WHERE ...
+            let _ = write!(sql, "UPDATE {} SET {} = CURRENT_TIMESTAMP", qi(M::table_name()), qi(col));
+        } else {
+            // Hard delete: DELETE FROM table WHERE ...
+            let _ = write!(sql, "DELETE FROM {}", qi(M::table_name()));
+        }
 
         if !self.conditions.is_empty() {
             sql.push_str(" WHERE ");
@@ -147,15 +198,31 @@ impl<M: Table> DeleteBuilder<M> {
         }
 
         #[cfg(feature = "postgres")]
-        write_returning(&mut sql, &self.returning);
-
-        #[cfg(feature = "postgres18")]
-        if let Some(mode) = self.returning_old_new {
-            super::write_returning_old_new(&mut sql, mode, M::table_name());
+        if soft_delete_col.is_none() {
+            // RETURNING only makes sense for hard deletes
+            write_returning(&mut sql, &self.returning);
         }
 
-        trace_query("delete", M::table_name(), &sql, &params);
+        #[cfg(feature = "postgres18")]
+        if soft_delete_col.is_none() {
+            if let Some(mode) = self.returning_old_new {
+                super::write_returning_old_new(&mut sql, mode, M::table_name());
+            }
+        }
+
+        let op = if soft_delete_col.is_some() { "soft_delete" } else { "delete" };
+        trace_query(op, M::table_name(), &sql, &params);
         Ok((sql, params))
+    }
+
+    /// Check if this delete will use soft delete.
+    ///
+    /// Returns `true` if the model has a soft-delete column and `.force()` was not called.
+    pub fn is_soft_delete(&self) -> bool {
+        match self.soft_delete_mode {
+            SoftDeleteMode::Force => false,
+            SoftDeleteMode::Auto => M::soft_delete_column().is_some(),
+        }
     }
 
     /// Build a [`crate::BuiltQuery`] with `$N` placeholders already applied (PostgreSQL only).

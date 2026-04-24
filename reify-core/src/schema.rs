@@ -444,6 +444,13 @@ pub struct ColumnDef {
     ///
     /// Set via `#[column(references = "Table::column")]` on a struct field.
     pub foreign_key: Option<ForeignKeyDef>,
+    /// Whether this column is the soft-delete marker.
+    ///
+    /// Set via `#[column(soft_delete)]` on a struct field. The column must be
+    /// `Option<DateTime<Utc>>` or `Option<NaiveDateTime>`. When set:
+    /// - `Model::find()` auto-injects `WHERE deleted_at IS NULL`
+    /// - `Model::delete()` emits `UPDATE SET deleted_at = NOW()` instead of `DELETE`
+    pub soft_delete: bool,
 }
 
 // ── Type-state for timestamp builder ────────────────────────────────
@@ -504,6 +511,7 @@ impl<T> ColumnBuilder<T, NoTimestamp> {
                 timestamp_source: TimestampSource::Vm,
                 check: None,
                 foreign_key: None,
+                soft_delete: false,
             },
             _type: PhantomData,
             _state: PhantomData,

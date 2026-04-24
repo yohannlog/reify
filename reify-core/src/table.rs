@@ -145,4 +145,15 @@ pub trait Table: Sized {
             .map(|d| d.name)
             .collect()
     }
+
+    /// Column name marked as the soft-delete marker, if any.
+    ///
+    /// When present:
+    /// - `Model::find()` auto-injects `WHERE <col> IS NULL` (unless `.with_deleted()` is called)
+    /// - `Model::delete()` emits `UPDATE SET <col> = CURRENT_TIMESTAMP` instead of `DELETE`
+    ///
+    /// Set via `#[column(soft_delete)]` on a `Option<DateTime<Utc>>` or `Option<NaiveDateTime>` field.
+    fn soft_delete_column() -> Option<&'static str> {
+        None
+    }
 }

@@ -15,6 +15,7 @@ pub mod range;
 pub mod relation;
 pub mod rls;
 pub mod schema;
+pub mod soft_delete;
 pub mod sql;
 pub mod table;
 pub mod telemetry;

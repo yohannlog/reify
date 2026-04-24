@@ -93,6 +93,10 @@ mod pg_arrays;
 #[path = "integration/pg_sql_injection.rs"]
 mod pg_sql_injection;
 
+#[cfg(feature = "pg-integration-tests")]
+#[path = "integration/pg_soft_delete.rs"]
+mod pg_soft_delete;
+
 // ── MySQL ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "mysql-integration-tests")]

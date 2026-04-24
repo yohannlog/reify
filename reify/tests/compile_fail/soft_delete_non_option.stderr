@@ -1,0 +1,6 @@
+error: `#[column(soft_delete)]` requires an `Option<T>` type; the column must be nullable to distinguish active from deleted rows.
+  --> tests/compile_fail/soft_delete_non_option.rs:12:5
+   |
+12 | /     #[column(soft_delete)]
+13 | |     pub deleted_at: DateTime<Utc>, // ERROR: must be Option<DateTime<Utc>>
+   | |_________________________________^
