@@ -70,13 +70,16 @@ pub trait Table: Sized {
 
     /// Values for writable columns only (excludes computed and DB-managed timestamp columns).
     ///
+    /// Uses [`insert_values`](Table::insert_values) as the source, so VM-source
+    /// timestamps are injected with `Utc::now()`.
+    ///
     /// Pairs with `writable_column_names()` — same order, same length.
     fn writable_values(&self) -> Vec<Value> {
         let defs = Self::column_defs();
         if defs.is_empty() {
-            return self.as_values();
+            return self.insert_values();
         }
-        let all_values = self.as_values();
+        let all_values = self.insert_values();
         defs.iter()
             .zip(all_values)
             .filter(|(d, _)| d.computed.is_none() && d.timestamp_source != TimestampSource::Db)
@@ -99,6 +102,35 @@ pub trait Table: Sized {
             .collect()
     }
 
+    /// Column names marked as `creation_timestamp` with `Vm` source.
+    ///
+    /// Used by `InsertBuilder` to auto-inject timestamp values on INSERT.
+    /// Returns an empty vec when no creation-timestamp columns exist.
+    fn creation_timestamp_columns() -> Vec<&'static str> {
+        let defs = Self::column_defs();
+        defs.iter()
+            .filter(|d| {
+                d.timestamp_kind == Some(TimestampKind::Creation)
+                    && d.timestamp_source == TimestampSource::Vm
+            })
+            .map(|d| d.name)
+            .collect()
+    }
+
+    /// Values for INSERT operations, with VM-source timestamps injected.
+    ///
+    /// Unlike [`as_values`](Table::as_values) which returns the struct's actual
+    /// field values, this method injects `Utc::now()` for `creation_timestamp`
+    /// and `update_timestamp` columns with `Vm` source.
+    ///
+    /// Use this for INSERT operations. Use `as_values()` for reads, comparisons,
+    /// and serialization where you want the actual stored values.
+    fn insert_values(&self) -> Vec<Value> {
+        // Default implementation falls back to as_values().
+        // The derive macro overrides this with timestamp injection.
+        self.as_values()
+    }
+
     /// Column names that exist in the database (excludes `computed_rust` virtual columns).
     ///
     /// Includes DB-generated computed columns (they exist in the schema) but
@@ -112,5 +144,80 @@ pub trait Table: Sized {
             .filter(|d| !matches!(d.computed, Some(ComputedColumn::Virtual)))
             .map(|d| d.name)
             .collect()
+    }
+
+    /// Column name marked as the soft-delete marker, if any.
+    ///
+    /// When present:
+    /// - `Model::find()` auto-injects `WHERE <col> IS NULL` (unless `.with_deleted()` is called)
+    /// - `Model::delete()` emits `UPDATE SET <col> = CURRENT_TIMESTAMP` instead of `DELETE`
+    ///
+    /// Set via `#[column(soft_delete)]` on a `Option<DateTime<Utc>>` or `Option<NaiveDateTime>` field.
+    fn soft_delete_column() -> Option<&'static str> {
+        None
+    }
+
+    /// Custom SQL for DELETE operations (Hibernate-style `@SQLDelete`).
+    ///
+    /// When set via `#[table(sql_delete = "...")]`, the `DeleteBuilder` uses this
+    /// SQL template instead of generating `DELETE FROM table WHERE ...`.
+    ///
+    /// Use `?` placeholders for parameters. The builder appends filter conditions
+    /// after the custom SQL.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Table)]
+    /// #[table(
+    ///     name = "users",
+    ///     sql_delete = "UPDATE users SET deleted_at = NOW(), deleted_by = current_user WHERE id = ?"
+    /// )]
+    /// pub struct User { /* ... */ }
+    /// ```
+    fn sql_delete() -> Option<&'static str> {
+        None
+    }
+
+    /// Custom SQL for UPDATE operations (Hibernate-style `@SQLUpdate`).
+    ///
+    /// When set via `#[table(sql_update = "...")]`, the `UpdateBuilder` uses this
+    /// SQL template instead of generating `UPDATE table SET ... WHERE ...`.
+    ///
+    /// Use `?` placeholders for parameters.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Table)]
+    /// #[table(
+    ///     name = "audit_log",
+    ///     sql_update = "CALL update_audit_log(?, ?, ?)"
+    /// )]
+    /// pub struct AuditLog { /* ... */ }
+    /// ```
+    fn sql_update() -> Option<&'static str> {
+        None
+    }
+
+    /// Custom SQL for INSERT operations (Hibernate-style `@SQLInsert`).
+    ///
+    /// When set via `#[table(sql_insert = "...")]`, the `InsertBuilder` uses this
+    /// SQL template instead of generating `INSERT INTO table (...) VALUES (...)`.
+    ///
+    /// Use `?` placeholders for parameters.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Table)]
+    /// #[table(
+    ///     name = "events",
+    ///     sql_insert = "CALL insert_event(?, ?, ?)"
+    /// )]
+    /// pub struct Event { /* ... */ }
+    /// ```
+    fn sql_insert() -> Option<&'static str> {
+        None
     }
 }

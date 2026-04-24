@@ -293,7 +293,7 @@ pub fn try_add_column_sql(
         let explicit = def.and_then(|d| d.default.as_ref().map(|dv| dv.as_sql()));
         match explicit {
             Some(dv) => format!(" DEFAULT {dv}"),
-            None => match default_for_type(&sql_type) {
+            None => match default_for_type(&sql_type, dialect) {
                 Some(dv) => format!(" DEFAULT {dv}"),
                 None => {
                     return Err(MissingDefaultError {
@@ -318,7 +318,13 @@ pub fn try_add_column_sql(
 /// Returns `None` for types where no universally safe default exists (e.g. `UUID`,
 /// `JSONB`, `BYTEA`). In that case the caller must supply an explicit `default` in
 /// the `ColumnDef`, or the database will reject the `ALTER TABLE`.
-fn default_for_type(ty: &str) -> Option<&'static str> {
+///
+/// # MySQL TEXT columns
+///
+/// MySQL (not MariaDB) refuses `DEFAULT ''` on TEXT/BLOB columns. The workaround
+/// is to wrap the literal in parentheses: `DEFAULT ('')`. This is valid SQL and
+/// accepted by all three backends.
+fn default_for_type(ty: &str, dialect: crate::query::Dialect) -> Option<&'static str> {
     let upper = ty.to_uppercase();
     if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") {
         return Some("0");
@@ -331,7 +337,14 @@ fn default_for_type(ty: &str) -> Option<&'static str> {
         | "INT8" => Some("0"),
         "REAL" | "FLOAT4" | "FLOAT8" | "DOUBLE PRECISION" => Some("0"),
         "BOOLEAN" | "BOOL" => Some("FALSE"),
-        "TEXT" => Some("''"),
+        "TEXT" => {
+            // MySQL refuses `DEFAULT ''` on TEXT; use `('')` which works everywhere
+            if dialect == crate::query::Dialect::Mysql {
+                Some("('')")
+            } else {
+                Some("''")
+            }
+        }
         "TIMESTAMPTZ" | "TIMESTAMP" | "DATETIME" => Some("NOW()"),
         // UUID, JSONB, BYTEA, arrays, custom types — no safe default
         _ => None,

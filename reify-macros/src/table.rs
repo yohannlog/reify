@@ -1,9 +1,9 @@
 use quote::quote;
-use syn::{Attribute, Data, DeriveInput, Fields, Lit, parse::Parse};
+use syn::{parse::Parse, Attribute, Data, DeriveInput, Fields, Lit};
 
 use crate::helpers::{
     parse_column_attrs, parse_sql_type_string, rust_type_to_sql_type, to_snake_case,
-    unwrap_option_type,
+    unwrap_option_type, MetaExt,
 };
 
 // ── Parsed index from #[table(index(...))] ──────────────────────────
@@ -30,6 +30,15 @@ pub(crate) struct TableAttr {
     /// Extra derives requested via `#[table(dto(derives(Serialize, Deserialize)))]`.
     #[allow(dead_code)]
     pub dto_extra_derives: Vec<syn::Path>,
+    /// Custom SQL for DELETE operations (Hibernate-style @SQLDelete).
+    pub sql_delete: Option<String>,
+    /// Custom SQL for UPDATE operations (Hibernate-style @SQLUpdate).
+    pub sql_update: Option<String>,
+    /// Custom SQL for INSERT operations (Hibernate-style @SQLInsert).
+    pub sql_insert: Option<String>,
+    /// Immutable/read-only entity (Hibernate-style @Immutable).
+    /// When true, `update()` and `delete()` methods are not generated.
+    pub immutable: bool,
 }
 
 pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -88,8 +97,11 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     let mut col_types = Vec::new();
     let mut value_conversions = Vec::new();
     let mut into_value_conversions: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut insert_value_conversions: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut single_col_indexes: Vec<String> = Vec::new();
     let mut update_ts_vm_cols: Vec<String> = Vec::new();
+    let mut creation_ts_vm_cols: Vec<String> = Vec::new();
+    let mut soft_delete_col: Option<String> = None;
 
     let mut col_defs_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
@@ -105,13 +117,16 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     for field in fields.iter() {
         let ident = field.ident.as_ref().unwrap();
         let ty = &field.ty;
-        let name_str = ident.to_string();
+        let rust_name = ident.to_string();
+
+        let col_attrs = parse_column_attrs(&field.attrs)?;
+
+        // Use custom column name if specified, otherwise use Rust field name
+        let name_str = col_attrs.name.clone().unwrap_or_else(|| rust_name.clone());
 
         col_names.push(name_str.clone());
         col_idents.push(ident.clone());
         col_types.push(ty.clone());
-
-        let col_attrs = parse_column_attrs(&field.attrs)?;
 
         // H4: validate attribute without dto feature is a compile error
         #[cfg(not(feature = "dto"))]
@@ -208,26 +223,34 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             }
         }
 
-        if col_attrs.update_timestamp && col_attrs.timestamp_source.as_deref() != Some("db") {
+        let is_vm_source = col_attrs.timestamp_source.as_deref() != Some("db");
+
+        if col_attrs.update_timestamp && is_vm_source {
             update_ts_vm_cols.push(name_str.clone());
         }
+        if col_attrs.creation_timestamp && is_vm_source {
+            creation_ts_vm_cols.push(name_str.clone());
+        }
 
-        let is_vm_timestamp = (col_attrs.creation_timestamp || col_attrs.update_timestamp)
-            && col_attrs.timestamp_source.as_deref() != Some("db");
+        // as_values / into_values: always return the actual field value.
+        // These are used for reads, comparisons, serialization — NOT for INSERT.
+        value_conversions.push(quote! {
+            reify_core::value::IntoValue::into_value(self.#ident.clone())
+        });
+        into_value_conversions.push(quote! {
+            reify_core::value::IntoValue::into_value(self.#ident)
+        });
 
+        // insert_values: inject Utc::now() for VM-source timestamps.
+        let is_vm_timestamp =
+            (col_attrs.creation_timestamp || col_attrs.update_timestamp) && is_vm_source;
         if is_vm_timestamp {
-            value_conversions.push(quote! {
-                reify_core::value::IntoValue::into_value(chrono::Utc::now())
-            });
-            into_value_conversions.push(quote! {
+            insert_value_conversions.push(quote! {
                 reify_core::value::IntoValue::into_value(chrono::Utc::now())
             });
         } else {
-            value_conversions.push(quote! {
+            insert_value_conversions.push(quote! {
                 reify_core::value::IntoValue::into_value(self.#ident.clone())
-            });
-            into_value_conversions.push(quote! {
-                reify_core::value::IntoValue::into_value(self.#ident)
             });
         }
 
@@ -235,24 +258,25 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         let is_nullable = is_option;
 
         // Validate that `creation_timestamp`/`update_timestamp` are only
-        // applied to temporal types. The macro can only inspect the
+        // applied to datetime types. The macro can only inspect the
         // textual form of the type; a type alias resolving to a non-temporal
         // type will slip through, but the common mistake (annotating a
         // `String` or `i64`) is caught here.
+        //
+        // NaiveDate and NaiveTime are excluded: `Utc::now()` returns
+        // `DateTime<Utc>`, not a date-only or time-only value, so VM-source
+        // timestamps would fail at runtime. DB-source could work but the
+        // semantics are confusing (a "creation timestamp" that's just a date?).
         if col_attrs.creation_timestamp || col_attrs.update_timestamp {
             let ty_str = quote!(#inner_ty).to_string().replace(' ', "");
-            let is_temporal = matches!(
+            let is_datetime = matches!(
                 ty_str.as_str(),
                 "chrono::DateTime<chrono::Utc>"
                     | "DateTime<Utc>"
                     | "chrono::NaiveDateTime"
                     | "NaiveDateTime"
-                    | "chrono::NaiveDate"
-                    | "NaiveDate"
-                    | "chrono::NaiveTime"
-                    | "NaiveTime"
             );
-            if !is_temporal {
+            if !is_datetime {
                 let which = if col_attrs.creation_timestamp {
                     "creation_timestamp"
                 } else {
@@ -261,10 +285,48 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 return Err(syn::Error::new_spanned(
                     field,
                     format!(
-                        "`#[column({which})]` requires a temporal type (chrono::DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime); got `{ty_str}`"
+                        "`#[column({which})]` requires a datetime type \
+                         (chrono::DateTime<Utc> or NaiveDateTime); got `{ty_str}`. \
+                         NaiveDate and NaiveTime are not supported for timestamps."
                     ),
                 ));
             }
+        }
+
+        // Validate soft_delete: must be Option<DateTime<Utc>> or Option<NaiveDateTime>
+        if col_attrs.soft_delete {
+            if !is_nullable {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "`#[column(soft_delete)]` requires an `Option<T>` type; \
+                     the column must be nullable to distinguish active from deleted rows.",
+                ));
+            }
+            let ty_str = quote!(#inner_ty).to_string().replace(' ', "");
+            let is_datetime = matches!(
+                ty_str.as_str(),
+                "chrono::DateTime<chrono::Utc>"
+                    | "DateTime<Utc>"
+                    | "chrono::NaiveDateTime"
+                    | "NaiveDateTime"
+            );
+            if !is_datetime {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    format!(
+                        "`#[column(soft_delete)]` requires a datetime type \
+                         (Option<chrono::DateTime<Utc>> or Option<NaiveDateTime>); got `Option<{ty_str}>`."
+                    ),
+                ));
+            }
+            if soft_delete_col.is_some() {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "only one column can be marked as `soft_delete`; \
+                     another column already has this attribute.",
+                ));
+            }
+            soft_delete_col = Some(name_str.clone());
         }
         let sql_type_token = if let Some(ref custom) = col_attrs.sql_type {
             parse_sql_type_string(custom)
@@ -374,6 +436,8 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             quote! { None }
         };
 
+        let is_soft_delete = col_attrs.soft_delete;
+
         col_defs_tokens.push(quote! {
             reify_core::schema::ColumnDef {
                 name: #name_str,
@@ -389,6 +453,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 timestamp_source: #timestamp_source_token,
                 check: #check_token,
                 foreign_key: #fk_token,
+                soft_delete: #is_soft_delete,
             }
         });
     }
@@ -501,6 +566,25 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let from_row_field_names = col_idents.iter().collect::<Vec<_>>();
 
+    let soft_delete_impl = match &soft_delete_col {
+        Some(col) => quote! { Some(#col) },
+        None => quote! { None },
+    };
+
+    // Custom SQL overrides (Hibernate-style @SQLDelete/@SQLUpdate/@SQLInsert)
+    let sql_delete_impl = match &table_attr.sql_delete {
+        Some(sql) => quote! { Some(#sql) },
+        None => quote! { None },
+    };
+    let sql_update_impl = match &table_attr.sql_update {
+        Some(sql) => quote! { Some(#sql) },
+        None => quote! { None },
+    };
+    let sql_insert_impl = match &table_attr.sql_insert {
+        Some(sql) => quote! { Some(#sql) },
+        None => quote! { None },
+    };
+
     let expanded = quote! {
         impl reify_core::Table for #struct_name {
             fn table_name() -> &'static str {
@@ -531,6 +615,30 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             fn update_timestamp_columns() -> Vec<&'static str> {
                 vec![#(#update_ts_vm_cols),*]
             }
+
+            fn creation_timestamp_columns() -> Vec<&'static str> {
+                vec![#(#creation_ts_vm_cols),*]
+            }
+
+            fn insert_values(&self) -> Vec<reify_core::Value> {
+                vec![#(#insert_value_conversions),*]
+            }
+
+            fn soft_delete_column() -> Option<&'static str> {
+                #soft_delete_impl
+            }
+
+            fn sql_delete() -> Option<&'static str> {
+                #sql_delete_impl
+            }
+
+            fn sql_update() -> Option<&'static str> {
+                #sql_update_impl
+            }
+
+            fn sql_insert() -> Option<&'static str> {
+                #sql_insert_impl
+            }
         }
 
         impl reify_core::db::FromRow for #struct_name {
@@ -554,13 +662,22 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
             pub fn insert_many(models: &[#struct_name]) -> reify_core::InsertManyBuilder<#struct_name> {
                 reify_core::InsertManyBuilder::new(models)
             }
+        }
+    };
 
-            pub fn update() -> reify_core::UpdateBuilder<#struct_name> {
-                reify_core::UpdateBuilder::new()
-            }
+    // Mutable methods (update/delete) — only generated for non-immutable tables
+    let mutable_methods = if table_attr.immutable {
+        quote! {}
+    } else {
+        quote! {
+            impl #struct_name {
+                pub fn update() -> reify_core::UpdateBuilder<#struct_name> {
+                    reify_core::UpdateBuilder::new()
+                }
 
-            pub fn delete() -> reify_core::DeleteBuilder<#struct_name> {
-                reify_core::DeleteBuilder::new()
+                pub fn delete() -> reify_core::DeleteBuilder<#struct_name> {
+                    reify_core::DeleteBuilder::new()
+                }
             }
         }
     };
@@ -810,7 +927,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     #[cfg(not(feature = "dto"))]
     let dto_impl = quote! {};
 
-    Ok(quote! { #expanded #audit_impl #dto_impl })
+    Ok(quote! { #expanded #mutable_methods #audit_impl #dto_impl })
 }
 
 fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
@@ -824,24 +941,21 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
         let mut audit = false;
         let mut dto_skip = Vec::new();
         let mut dto_extra_derives: Vec<syn::Path> = Vec::new();
+        let mut sql_delete = None;
+        let mut sql_update = None;
+        let mut sql_insert = None;
+        let mut immutable = false;
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
-                let value = meta.value()?;
-                let lit: Lit = value.parse()?;
-                if let Lit::Str(s) = lit {
-                    table_name = Some(s.value());
-                }
+                table_name = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("audit") {
                 audit = true;
             } else if meta.path.is_ident("dto") {
                 meta.parse_nested_meta(|inner| {
                     if inner.path.is_ident("skip") {
-                        let value = inner.value()?;
-                        let lit: Lit = value.parse()?;
-                        if let Lit::Str(s) = lit {
-                            dto_skip.extend(s.value().split(',').map(|s| s.trim().to_string()));
-                        }
+                        let val = inner.parse_str_value()?;
+                        dto_skip.extend(val.split(',').map(|s| s.trim().to_string()));
                     } else if inner.path.is_ident("derives") {
                         // M1: parse `derives(Serialize, Deserialize, PartialEq, ...)`
                         let content;
@@ -893,17 +1007,9 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                     } else if inner.path.is_ident("unique") {
                         unique = true;
                     } else if inner.path.is_ident("name") {
-                        let value = inner.value()?;
-                        let lit: Lit = value.parse()?;
-                        if let Lit::Str(s) = lit {
-                            name = Some(s.value());
-                        }
+                        name = Some(inner.parse_str_value()?);
                     } else if inner.path.is_ident("predicate") {
-                        let value = inner.value()?;
-                        let lit: Lit = value.parse()?;
-                        if let Lit::Str(s) = lit {
-                            predicate = Some(s.value());
-                        }
+                        predicate = Some(inner.parse_str_value()?);
                     } else {
                         let ident = inner
                             .path
@@ -923,6 +1029,14 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                     name,
                     predicate,
                 });
+            } else if meta.path.is_ident("sql_delete") {
+                sql_delete = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("sql_update") {
+                sql_update = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("sql_insert") {
+                sql_insert = Some(meta.parse_str_value()?);
+            } else if meta.path.is_ident("immutable") {
+                immutable = true;
             } else {
                 let ident = meta
                     .path
@@ -930,7 +1044,7 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                     .map(|i| i.to_string())
                     .unwrap_or_else(|| "?".to_string());
                 return Err(meta.error(format!(
-                    "unknown `table` attribute `{ident}`; expected one of: name, audit, dto, index"
+                    "unknown `table` attribute `{ident}`; expected one of: name, audit, dto, index, sql_delete, sql_update, sql_insert, immutable"
                 )));
             }
             Ok(())
@@ -943,6 +1057,10 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                 audit,
                 dto_skip,
                 dto_extra_derives,
+                sql_delete,
+                sql_update,
+                sql_insert,
+                immutable,
             });
         }
     }

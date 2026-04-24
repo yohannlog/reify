@@ -21,7 +21,23 @@ sqlite = ["dep:reify-sqlite"]
 dto = ["reify-macros/dto"]
 dto-validation = ["reify-macros/dto-validation", "dto", "dep:validator"]
 metrics = ["reify-core/metrics"]
-integration-tests = ["postgres", "mysql", "sqlite"]
+# Per-adapter integration-test sub-features. Each one only compiles
+# the corresponding adapter + its integration tests, so a contributor
+# with only one DB installed does not need the others.
+#
+# Every sub-feature pulls in `dto` so the DTO-aware test files
+# (`pg_dto.rs`, `mysql_dto.rs`, `sqlite_dto.rs`) compile out of the
+# box — the DTO macro is part of the public API and deserves
+# integration coverage.
+pg-integration-tests = ["postgres", "dto"]
+mysql-integration-tests = ["mysql", "dto"]
+sqlite-integration-tests = ["sqlite", "dto"]
+# Aggregate feature: runs the whole integration matrix.
+integration-tests = [
+    "pg-integration-tests",
+    "mysql-integration-tests",
+    "sqlite-integration-tests",
+]
 
 [dependencies]
 reify-core = { path = "../reify-core", version = "0.1.0", features = ["postgres18"] }

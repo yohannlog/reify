@@ -1,0 +1,13 @@
+error[E0599]: no function or associated item named `delete` found for struct `AuditLog` in the current scope
+  --> tests/compile_fail/immutable_no_delete.rs:15:23
+   |
+ 7 | pub struct AuditLog {
+   | ------------------- function or associated item `delete` not found for this struct
+...
+15 |     let _ = AuditLog::delete();
+   |                       ^^^^^^ function or associated item not found in `AuditLog`
+   |
+help: there is an associated function `sql_delete` with a similar name
+   |
+15 |     let _ = AuditLog::sql_delete();
+   |                       ++++

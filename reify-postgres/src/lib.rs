@@ -142,6 +142,36 @@ impl PgToSql for PgValue<'_> {
             Value::ArrayF64(v) => v.to_sql(ty, out),
             Value::ArrayString(v) => v.to_sql(ty, out),
             Value::ArrayUuid(v) => v.to_sql(ty, out),
+            // Complex types
+            Value::Point(p) => {
+                // PostgreSQL POINT binary format: two f64 in network byte order
+                use bytes::BufMut;
+                out.put_f64(p.x());
+                out.put_f64(p.y());
+                Ok(tokio_postgres::types::IsNull::No)
+            }
+            Value::Inet(inet) => {
+                // Use text representation — postgres-types handles INET natively
+                inet.to_string().to_sql(ty, out)
+            }
+            Value::Cidr(cidr) => {
+                // Use text representation
+                cidr.to_string().to_sql(ty, out)
+            }
+            Value::MacAddr(mac) => {
+                // PostgreSQL MACADDR binary format: 6 bytes
+                use bytes::BufMut;
+                out.put_slice(&mac.octets());
+                Ok(tokio_postgres::types::IsNull::No)
+            }
+            Value::Interval(interval) => {
+                // PostgreSQL INTERVAL binary format: i64 microseconds, i32 days, i32 months
+                use bytes::BufMut;
+                out.put_i64(interval.microseconds());
+                out.put_i32(interval.days());
+                out.put_i32(interval.months());
+                Ok(tokio_postgres::types::IsNull::No)
+            }
         }
     }
 
@@ -179,6 +209,11 @@ impl PgToSql for PgValue<'_> {
                 | Type::TEXT_ARRAY
                 | Type::VARCHAR_ARRAY
                 | Type::UUID_ARRAY
+                | Type::POINT
+                | Type::INET
+                | Type::CIDR
+                | Type::MACADDR
+                | Type::INTERVAL
         )
     }
 
@@ -489,6 +524,51 @@ fn pg_column_to_value(
             .flatten()
             .map(Value::ArrayUuid)
             .unwrap_or(Value::Null),
+        Type::POINT => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) if raw.len() == 16 => {
+                use bytes::Buf;
+                let mut buf = raw;
+                let x = buf.get_f64();
+                let y = buf.get_f64();
+                Value::Point(reify_core::types::Point::new(x, y))
+            }
+            _ => Value::Null,
+        },
+        Type::INET => row
+            .try_get::<_, Option<std::net::IpAddr>>(idx)
+            .ok()
+            .flatten()
+            .map(|ip| Value::Inet(reify_core::types::Inet::new(ip)))
+            .unwrap_or(Value::Null),
+        Type::CIDR => {
+            // CIDR comes as text from postgres-types
+            match row.try_get::<_, Option<String>>(idx) {
+                Ok(Some(s)) => s
+                    .parse::<reify_core::types::Cidr>()
+                    .map(Value::Cidr)
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
+        }
+        Type::MACADDR => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) if raw.len() == 6 => {
+                let mut octets = [0u8; 6];
+                octets.copy_from_slice(raw);
+                Value::MacAddr(reify_core::types::MacAddr::new(octets))
+            }
+            _ => Value::Null,
+        },
+        Type::INTERVAL => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(raw)) if raw.len() == 16 => {
+                use bytes::Buf;
+                let mut buf = raw;
+                let microseconds = buf.get_i64();
+                let days = buf.get_i32();
+                let months = buf.get_i32();
+                Value::Interval(reify_core::types::Interval::new(months, days, microseconds))
+            }
+            _ => Value::Null,
+        },
         _ => {
             // Unknown PostgreSQL type — fall back to text representation.
             // Log a warning so users know which type OID is not natively mapped.

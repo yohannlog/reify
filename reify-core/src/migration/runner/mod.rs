@@ -127,6 +127,7 @@ impl MigrationRunner {
                         timestamp_source: crate::schema::TimestampSource::Vm,
                         check: None,
                         foreign_key: None,
+                        soft_delete: false,
                     })
                     .collect()
             } else {

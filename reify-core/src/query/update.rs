@@ -219,10 +219,34 @@ impl<M: Table> UpdateBuilder<M> {
 
     /// Build the `UPDATE … SET … WHERE …` SQL string and parameter list.
     ///
+    /// If `#[table(sql_update = "...")]` is set, uses that custom SQL instead.
+    ///
     /// Returns `Err(BuildError::MissingFilter)` if no `.filter()` or
-    /// `.unfiltered()` has been called.
+    /// `.unfiltered()` has been called (unless using custom sql_update).
     #[allow(unused_mut)]
     pub fn try_build(&self) -> Result<(String, Vec<Value>), BuildError> {
+        // Custom SQL override takes precedence
+        if let Some(custom_sql) = M::sql_update() {
+            let mut params = Vec::new();
+            let mut sql = custom_sql.to_string();
+
+            // Append WHERE conditions if any
+            if !self.conditions.is_empty() {
+                let has_where = custom_sql.to_uppercase().contains(" WHERE ");
+                if has_where {
+                    sql.push_str(" AND ");
+                } else {
+                    sql.push_str(" WHERE ");
+                }
+                write_joined(&mut sql, &self.conditions, " AND ", |buf, c| {
+                    c.write_sql(buf, &mut params);
+                });
+            }
+
+            trace_query("update(custom)", M::table_name(), &sql, &params);
+            return Ok((sql, params));
+        }
+
         if !self.unfiltered && self.conditions.is_empty() {
             return Err(BuildError::MissingFilter {
                 operation: "UPDATE",

@@ -19,7 +19,7 @@ use chrono::SecondsFormat;
 // so the rest of the module (and the RFC 4231 / NIST KAT tests) needs
 // no change.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 #[cfg(test)]
 use sha2::Digest;
 use sha2::Sha256;
@@ -46,7 +46,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 /// `pub(crate)` — shared with the `paginate` module for cursor signing.
 #[inline]
 pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
         .expect("Hmac<Sha256> accepts keys of any length");
     mac.update(message);
     mac.finalize().into_bytes().into()
@@ -419,6 +419,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "operation",
@@ -436,6 +437,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             // inserted directly into the audit table.
             check: Some("operation IN ('insert','update','delete')".to_string()),
             foreign_key: None,
+            soft_delete: false,
         },
         // actor_id is TEXT to support i64, UUID, or any string identifier.
         ColumnDef {
@@ -452,6 +454,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         // `changed_at` is bound by the application (RFC 3339 UTC) so it is
         // covered by the HMAC signature. The `NOW()` default remains so
@@ -471,6 +474,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Db,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "row_data",
@@ -486,6 +490,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         // Integrity column — NULL when no HMAC secret is configured.
         ColumnDef {
@@ -502,6 +507,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
     ]
 }
@@ -825,6 +831,37 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
                     out.push('"');
                 }
                 out.push(']');
+            }
+            // Complex types — serialize as quoted string representation
+            #[cfg(feature = "postgres")]
+            Value::Point(p) => {
+                out.push('"');
+                out.push_str(&json_escape(&p.to_string()));
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::Inet(i) => {
+                out.push('"');
+                out.push_str(&i.to_string());
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::Cidr(c) => {
+                out.push('"');
+                out.push_str(&c.to_string());
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::MacAddr(m) => {
+                out.push('"');
+                out.push_str(&m.to_string());
+                out.push('"');
+            }
+            #[cfg(feature = "postgres")]
+            Value::Interval(i) => {
+                out.push('"');
+                out.push_str(&json_escape(&i.to_string()));
+                out.push('"');
             }
         }
     }

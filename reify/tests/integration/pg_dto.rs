@@ -12,7 +12,7 @@
 //! All sub-cases run inside a single `#[tokio::test]` to avoid parallel
 //! DDL races on shared table names (PostgreSQL catalogue lock contention).
 
-#![cfg(feature = "integration-tests")]
+#![cfg(feature = "pg-integration-tests")]
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use reify::{NoTls, PostgresDb, Table, fetch, insert, raw_execute};

@@ -1,8 +1,8 @@
-#![cfg(feature = "integration-tests")]
+#![cfg(feature = "pg-integration-tests")]
 
 use reify::{Database, DbError, NoTls, PostgresDb, Table, Value, fetch, raw_execute};
 
-use crate::{pg_config_from_url, pg_url};
+use crate::{PgFixture, pg_config_from_url, pg_url};
 
 #[derive(Table, Debug, Clone, PartialEq)]
 #[table(name = "copy_products")]
@@ -158,4 +158,77 @@ async fn pg_copy_in_unique_constraint_error() {
     );
 
     teardown(&db).await;
+}
+
+// ── Advanced-type round-trip via COPY ────────────────────────────────
+//
+// `copy_in` drives the PostgreSQL binary-COPY protocol, which has its
+// own type encoders per `Value` variant. The tests above cover the
+// scalar variants (`I64`, `String`, `F64`, `Bool`, `Option<String>`);
+// this final test exercises the less common variants —
+// `Uuid`, `Timestamptz`, `Jsonb`, and `ArrayI64` — in a single model
+// to keep the fixture small.
+
+use uuid::Uuid;
+
+#[derive(Table, Debug, Clone, PartialEq)]
+#[table(name = "copy_events")]
+pub struct CopyEvent {
+    #[column(primary_key)]
+    pub id: Uuid,
+    pub happened_at: chrono::DateTime<chrono::Utc>,
+    pub payload: serde_json::Value,
+    pub tags: Vec<i64>,
+}
+
+#[tokio::test]
+async fn pg_copy_in_advanced_types() {
+    let Some(fx) = PgFixture::new(&["copy_events"]).await else {
+        return;
+    };
+
+    raw_execute(
+        &fx.db,
+        "CREATE TABLE copy_events (
+            id          UUID        PRIMARY KEY,
+            happened_at TIMESTAMPTZ NOT NULL,
+            payload     JSONB       NOT NULL,
+            tags        BIGINT[]    NOT NULL
+        )",
+        &[],
+    )
+    .await
+    .expect("create copy_events");
+
+    let id = Uuid::new_v4();
+    let ts = chrono::Utc::now();
+    let event = CopyEvent {
+        id,
+        happened_at: ts,
+        payload: serde_json::json!({"k": "v", "n": 42}),
+        tags: vec![1, 2, 3],
+    };
+
+    let affected = fx.db.copy_in(&[event.clone()]).await.expect("copy_in");
+    assert_eq!(affected, 1);
+
+    let rows = fetch::<CopyEvent>(&fx.db, &CopyEvent::find().filter(CopyEvent::id.eq(id)))
+        .await
+        .expect("fetch");
+    assert_eq!(rows.len(), 1);
+    // `TIMESTAMPTZ` comparisons: tolerate sub-microsecond drift on
+    // `copy_in` by comparing timestamps to microsecond precision.
+    assert_eq!(rows[0].id, event.id);
+    assert_eq!(rows[0].payload, event.payload);
+    assert_eq!(rows[0].tags, event.tags);
+    let delta = (rows[0].happened_at - event.happened_at)
+        .num_microseconds()
+        .map(i64::abs)
+        .unwrap_or(i64::MAX);
+    assert!(
+        delta <= 1,
+        "happened_at must round-trip within 1 µs (delta: {delta} µs)"
+    );
+
+    fx.teardown().await;
 }

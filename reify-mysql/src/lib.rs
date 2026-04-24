@@ -22,6 +22,7 @@
 
 pub use mysql_async::{self, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
+use mysql_async::consts::ColumnType;
 use mysql_async::prelude::*;
 use tracing::{debug, error};
 
@@ -109,6 +110,20 @@ fn value_to_mysql(val: &Value) -> Result<mysql_async::Value, DbError> {
         Value::Timestamp(v) => mysql_async::Value::from(v.to_string()),
         Value::Date(v) => mysql_async::Value::from(v.to_string()),
         Value::Time(v) => mysql_async::Value::from(v.to_string()),
+        // Complex types — serialize as text for MySQL compatibility
+        #[cfg(feature = "postgres")]
+        Value::Point(p) => {
+            // MySQL POINT via ST_GeomFromText
+            mysql_async::Value::from(format!("POINT({} {})", p.x(), p.y()))
+        }
+        #[cfg(feature = "postgres")]
+        Value::Inet(i) => mysql_async::Value::from(i.to_string()),
+        #[cfg(feature = "postgres")]
+        Value::Cidr(c) => mysql_async::Value::from(c.to_string()),
+        #[cfg(feature = "postgres")]
+        Value::MacAddr(m) => mysql_async::Value::from(m.to_string()),
+        #[cfg(feature = "postgres")]
+        Value::Interval(i) => mysql_async::Value::from(i.to_string()),
         // Any Value variant not handled above (e.g. PostgreSQL-only types
         // like Uuid, Timestamptz, Jsonb, range and array types) cannot be
         // bound as a MySQL parameter. Return a conversion error so a shared
@@ -186,25 +201,28 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
         Some(MV::Float(v)) => Value::F32(*v),
         Some(MV::Double(v)) => Value::F64(*v),
         Some(MV::Date(year, month, day, hour, min, sec, micro)) => {
+            // Use column metadata to distinguish DATE from DATETIME/TIMESTAMP.
+            // The runtime value alone is ambiguous: DATETIME at midnight has
+            // hour/min/sec/micro all zero, same as a pure DATE.
+            let col_type = row.columns()[idx].column_type();
             let date = chrono::NaiveDate::from_ymd_opt(*year as i32, *month as u32, *day as u32);
-            // DATE (no time component and no fractional seconds).
-            if *hour == 0 && *min == 0 && *sec == 0 && *micro == 0 {
-                if let Some(d) = date {
-                    return Value::Date(d);
+
+            match col_type {
+                ColumnType::MYSQL_TYPE_DATE => date.map(Value::Date).unwrap_or(Value::Null),
+                _ => {
+                    // DATETIME, TIMESTAMP, or other temporal types with time component
+                    date.and_then(|d| {
+                        chrono::NaiveTime::from_hms_micro_opt(
+                            *hour as u32,
+                            *min as u32,
+                            *sec as u32,
+                            *micro,
+                        )
+                        .map(|t| Value::Timestamp(chrono::NaiveDateTime::new(d, t)))
+                    })
+                    .unwrap_or(Value::Null)
                 }
             }
-            // DATETIME(0..6) — preserve full microsecond precision.
-            if let Some(d) = date {
-                if let Some(t) = chrono::NaiveTime::from_hms_micro_opt(
-                    *hour as u32,
-                    *min as u32,
-                    *sec as u32,
-                    *micro,
-                ) {
-                    return Value::Timestamp(chrono::NaiveDateTime::new(d, t));
-                }
-            }
-            Value::Null
         }
         Some(MV::Time(is_negative, _, hours, mins, secs, micro)) => {
             if *is_negative {
@@ -387,9 +405,13 @@ impl Database for MysqlDb {
             .get_conn()
             .await
             .map_err(|e| DbError::Connection(e.to_string()))?;
-        conn.exec_drop("BEGIN", mysql_async::Params::Empty)
-            .await
-            .map_err(mysql_err)?;
+        // MySQL rejects `BEGIN` / `COMMIT` / `ROLLBACK` through the
+        // prepared-statement protocol (error 1295: "This command is not
+        // supported in the prepared statement protocol yet"). Use the
+        // text protocol via `query_drop` to control the transaction
+        // boundary. Statements inside the transaction (which use
+        // placeholders) still use `exec_drop` as before.
+        conn.query_drop("BEGIN").await.map_err(mysql_err)?;
 
         let txn = MysqlTransaction {
             conn: tokio::sync::Mutex::new(conn),
@@ -400,15 +422,13 @@ impl Database for MysqlDb {
             Ok(()) => {
                 debug!(target: "reify::mysql", "COMMIT transaction");
                 let mut conn = txn.conn.lock().await;
-                conn.exec_drop("COMMIT", mysql_async::Params::Empty)
-                    .await
-                    .map_err(mysql_err)?;
+                conn.query_drop("COMMIT").await.map_err(mysql_err)?;
                 Ok(())
             }
             Err(e) => {
                 error!(target: "reify::mysql", error = %e, "ROLLBACK transaction");
                 let mut conn = txn.conn.lock().await;
-                let _ = conn.exec_drop("ROLLBACK", mysql_async::Params::Empty).await;
+                let _ = conn.query_drop("ROLLBACK").await;
                 Err(e)
             }
         }

@@ -1,0 +1,6 @@
+error: `#[column(soft_delete)]` requires a datetime type (Option<chrono::DateTime<Utc>> or Option<NaiveDateTime>); got `Option<String>`.
+  --> tests/compile_fail/soft_delete_non_datetime.rs:11:5
+   |
+11 | /     #[column(soft_delete)]
+12 | |     pub deleted_at: Option<String>, // ERROR: must be Option<DateTime<Utc>> or Option<NaiveDateTime>
+   | |__________________________________^

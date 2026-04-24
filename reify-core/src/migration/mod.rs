@@ -117,6 +117,7 @@ mod tests {
                     timestamp_source: crate::schema::TimestampSource::Vm,
                     check: None,
                     foreign_key: None,
+                    soft_delete: false,
                 },
                 crate::schema::ColumnDef {
                     name: "email",
@@ -132,6 +133,7 @@ mod tests {
                     timestamp_source: crate::schema::TimestampSource::Vm,
                     check: None,
                     foreign_key: None,
+                    soft_delete: false,
                 },
                 crate::schema::ColumnDef {
                     name: "role",
@@ -147,6 +149,7 @@ mod tests {
                     timestamp_source: crate::schema::TimestampSource::Vm,
                     check: None,
                     foreign_key: None,
+                    soft_delete: false,
                 },
             ]
         }
@@ -908,6 +911,7 @@ mod tests {
                 timestamp_source: crate::schema::TimestampSource::Vm,
                 check: None,
                 foreign_key: None,
+                soft_delete: false,
             },
             crate::schema::ColumnDef {
                 name: "email",
@@ -923,6 +927,7 @@ mod tests {
                 timestamp_source: crate::schema::TimestampSource::Vm,
                 check: None,
                 foreign_key: None,
+                soft_delete: false,
             },
         ];
         let sql = create_table_sql::<Users>(&defs, crate::query::Dialect::Postgres);
@@ -965,6 +970,7 @@ mod tests {
                 timestamp_source: crate::schema::TimestampSource::Vm,
                 check: None,
                 foreign_key: None,
+                soft_delete: false,
             },
             crate::schema::ColumnDef {
                 name: "user_id",
@@ -985,6 +991,7 @@ mod tests {
                     on_delete: ForeignKeyAction::Cascade,
                     on_update: ForeignKeyAction::NoAction,
                 }),
+                soft_delete: false,
             },
         ];
         let sql = create_table_sql::<Posts>(&defs, crate::query::Dialect::Postgres);
@@ -1532,6 +1539,7 @@ mod tests {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         };
 
         let pg_sql = add_column_sql("users", "status", Some(&def), Dialect::Postgres);
@@ -1790,6 +1798,7 @@ mod tests {
             timestamp_source: TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         }];
         let checks = vec!["id > 0".to_string()];
 

@@ -69,6 +69,23 @@ pub enum Value {
     /// `uuid[]`
     #[cfg(feature = "postgres")]
     ArrayUuid(Vec<uuid::Uuid>),
+
+    // ── Complex types (PostgreSQL) ──────────────────────────────────
+    /// `POINT` — 2D geometric point.
+    #[cfg(feature = "postgres")]
+    Point(crate::types::Point),
+    /// `INET` — IP address (IPv4 or IPv6).
+    #[cfg(feature = "postgres")]
+    Inet(crate::types::Inet),
+    /// `CIDR` — Network address with prefix.
+    #[cfg(feature = "postgres")]
+    Cidr(crate::types::Cidr),
+    /// `MACADDR` — MAC address.
+    #[cfg(feature = "postgres")]
+    MacAddr(crate::types::MacAddr),
+    /// `INTERVAL` — Time interval.
+    #[cfg(feature = "postgres")]
+    Interval(crate::types::Interval),
 }
 
 impl Value {
@@ -114,6 +131,16 @@ impl Value {
             | Value::ArrayF64(_)
             | Value::ArrayString(_)
             | Value::ArrayUuid(_) => SqlType::Text,
+            #[cfg(feature = "postgres")]
+            Value::Point(_) => SqlType::Point,
+            #[cfg(feature = "postgres")]
+            Value::Inet(_) => SqlType::Inet,
+            #[cfg(feature = "postgres")]
+            Value::Cidr(_) => SqlType::Cidr,
+            #[cfg(feature = "postgres")]
+            Value::MacAddr(_) => SqlType::MacAddr,
+            #[cfg(feature = "postgres")]
+            Value::Interval(_) => SqlType::Interval,
         }
     }
 
@@ -186,6 +213,17 @@ impl Value {
             | Value::ArrayF64(_)
             | Value::ArrayString(_)
             | Value::ArrayUuid(_) => "NULL".to_string(),
+            // Complex types — render as PostgreSQL literals
+            #[cfg(feature = "postgres")]
+            Value::Point(p) => format!("'{}'::point", p),
+            #[cfg(feature = "postgres")]
+            Value::Inet(i) => format!("'{}'::inet", i),
+            #[cfg(feature = "postgres")]
+            Value::Cidr(c) => format!("'{}'::cidr", c),
+            #[cfg(feature = "postgres")]
+            Value::MacAddr(m) => format!("'{}'::macaddr", m),
+            #[cfg(feature = "postgres")]
+            Value::Interval(i) => format!("'{}'::interval", i),
         }
     }
 }
@@ -758,6 +796,93 @@ impl FromValue for crate::range::Range<chrono::NaiveDate> {
         match val {
             Value::DateRange(v) => Ok(v),
             _ => Err(format!("expected DateRange, got {:?}", val)),
+        }
+    }
+}
+
+// ── Complex types: IntoValue / FromValue ────────────────────────────
+
+#[cfg(feature = "postgres")]
+impl IntoValue for crate::types::Point {
+    fn into_value(self) -> Value {
+        Value::Point(self)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::types::Point {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Point(v) => Ok(v),
+            _ => Err(format!("expected Point, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl IntoValue for crate::types::Inet {
+    fn into_value(self) -> Value {
+        Value::Inet(self)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::types::Inet {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Inet(v) => Ok(v),
+            _ => Err(format!("expected Inet, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl IntoValue for crate::types::Cidr {
+    fn into_value(self) -> Value {
+        Value::Cidr(self)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::types::Cidr {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Cidr(v) => Ok(v),
+            _ => Err(format!("expected Cidr, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl IntoValue for crate::types::MacAddr {
+    fn into_value(self) -> Value {
+        Value::MacAddr(self)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::types::MacAddr {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::MacAddr(v) => Ok(v),
+            _ => Err(format!("expected MacAddr, got {:?}", val)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl IntoValue for crate::types::Interval {
+    fn into_value(self) -> Value {
+        Value::Interval(self)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl FromValue for crate::types::Interval {
+    fn from_value(val: Value) -> Result<Self, String> {
+        match val {
+            Value::Interval(v) => Ok(v),
+            _ => Err(format!("expected Interval, got {:?}", val)),
         }
     }
 }

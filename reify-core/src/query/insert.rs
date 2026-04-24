@@ -146,8 +146,16 @@ impl<M: Table> InsertBuilder<M> {
     }
 
     /// Build SQL for a specific [`Dialect`].
+    ///
+    /// If `#[table(sql_insert = "...")]` is set, uses that custom SQL instead.
     #[allow(unused_mut)]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        // Custom SQL override takes precedence
+        if let Some(custom_sql) = M::sql_insert() {
+            trace_query("insert(custom)", M::table_name(), custom_sql, &self.values);
+            return (custom_sql.to_string(), self.values.clone());
+        }
+
         let col_names = M::writable_column_names();
         let num_cols = self.values.len();
 

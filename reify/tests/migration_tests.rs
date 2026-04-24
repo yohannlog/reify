@@ -521,6 +521,7 @@ fn create_table_uses_metadata_types_not_heuristics() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "email",
@@ -536,6 +537,7 @@ fn create_table_uses_metadata_types_not_heuristics() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "role",
@@ -551,6 +553,7 @@ fn create_table_uses_metadata_types_not_heuristics() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
     ];
 
@@ -650,6 +653,7 @@ fn create_table_with_column_check() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "email",
@@ -665,6 +669,7 @@ fn create_table_with_column_check() {
             timestamp_source: reify::TimestampSource::Vm,
             check: Some("length(email) > 0".to_string()),
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "role",
@@ -680,6 +685,7 @@ fn create_table_with_column_check() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
     ];
 
@@ -724,6 +730,7 @@ fn create_table_with_table_level_checks() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "email",
@@ -739,6 +746,7 @@ fn create_table_with_table_level_checks() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
         ColumnDef {
             name: "role",
@@ -754,6 +762,7 @@ fn create_table_with_table_level_checks() {
             timestamp_source: reify::TimestampSource::Vm,
             check: None,
             foreign_key: None,
+            soft_delete: false,
         },
     ];
 
@@ -794,6 +803,7 @@ fn create_table_with_no_checks_matches_base() {
         timestamp_source: reify::TimestampSource::Vm,
         check: None,
         foreign_key: None,
+        soft_delete: false,
     }];
 
     let base = create_table_sql::<User>(&defs, Dialect::Generic);
