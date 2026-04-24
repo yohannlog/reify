@@ -1,0 +1,249 @@
+
+   3. Proposition d'implémentation du soft delete
+
+   3.1. Déclaration au niveau macro
+
+   Deux syntaxes ont été proposées dans les docs :
+
+   Option A - `#[table(soft_delete = "deleted_at")]` (TODO1.md) :
+
+   rust
+     #[derive(Table)]
+     #[table(name = "users", soft_delete = "deleted_at")]
+     pub struct User {
+         pub deleted_at: Option<chrono::DateTime<Utc>>,
+     }
+
+   Option B - `#[column(soft_delete)]` (REVIEW.md) :
+
+   rust
+     pub struct User {
+         #[column(soft_delete)]
+         pub deleted_at: Option<chrono::DateTime<Utc>>,
+     }
+
+   Verdict : Option B (`#[column(soft_delete)]`) est supérieure car :
+   •  Elle est co-localisée avec la définition du champ (pas de risque de typo sur le nom de colonne)
+   •  Elle permet de valider à la compilation que le champ est bien Option<T> temporel
+   •  Elle réutilise le parser d'attributs de colonne existant (ColumnAttrs)
+
+   3.2. Ce que la macro doit générer
+
+   rust
+     impl Table for User {
+         // ... existing methods ...
+
+         fn soft_delete_column() -> Option<&'static str> {
+             Some("deleted_at")
+         }
+     }
+
+     impl User {
+         // Query builders avec soft delete auto-injecté
+         pub fn find() -> SelectBuilder<User> {
+             SelectBuilder::with_soft_delete_filter()  // injecte WHERE deleted_at IS NULL
+         }
+
+         pub fn find_with_deleted() -> SelectBuilder<User> {
+             SelectBuilder::new()  // pas de filtre
+         }
+
+         pub fn delete() -> DeleteBuilder<User> {
+             DeleteBuilder::with_soft_delete()  // UPDATE SET deleted_at = NOW()
+         }
+
+         pub fn force_delete() -> DeleteBuilder<User> {
+             DeleteBuilder::new()  // vrai DELETE
+         }
+     }
+
+   3.3. Ce que le core doit fournir
+
+   `Table` trait (reify-core/src/table.rs) :
+
+   rust
+     fn soft_delete_column() -> Option<&'static str> { None }
+
+   `SelectBuilder` :
+   •  new() → constructeur basique (pas de filtre)
+   •  with_soft_delete_filter() → new() + filtre auto (appelé par la macro)
+   •  with_deleted() → supprime le filtre existant
+   •  only_deleted() → remplace le filtre par IS NOT NULL
+
+   `DeleteBuilder` :
+   •  with_soft_delete() → marque le builder comme "soft delete mode"
+   •  try_build() → si soft delete mode + colonne connue, génère UPDATE au lieu de DELETE
+
+   ──────────────────────────────────────────
+
+   4. Idées d'amélioration : inspirations Hibernate / Spring Boot / JHipster
+
+   4.1. @Where clause générique (Hibernate)
+
+   Au lieu de se limiter au soft delete, pourquoi pas un filtre global optionnel ?
+
+   rust
+     #[derive(Table)]
+     #[table(name = "users", default_filter = "active = true")]
+     pub struct User {
+         pub active: bool,
+     }
+
+   → User::find() injecte automatiquement WHERE active = true. Le soft delete devient un cas particulier de ce mécanisme.
+
+   4.2. @Filter / @FilterDef paramétrables (Hibernate)
+
+   Filtres nommés activables à la demande :
+
+   rust
+     #[derive(Table)]
+     #[table(name = "posts", filters("tenant"))]
+     pub struct Post {
+         pub tenant_id: i64,
+     }
+
+     // Usage
+     Post::find().filter_by("tenant", 42).build();
+
+   4.3. @SQLDelete / @SQLUpdate / @SQLInsert (Hibernate)
+
+   Permet de surcharger le SQL généré pour une opération. Très utile pour du soft delete custom ou des appels de procédures stockées :
+
+   rust
+     #[derive(Table)]
+     #[table(
+         name = "users",
+         sql_delete = "UPDATE users SET deleted_at = NOW(), deleted_by = ? WHERE id = ?"
+     )]
+
+   4.4. @PreRemove / @PostLoad callbacks automatiques
+
+   Les hooks actuels (ModelHooks, AsyncModelHooks) sont bien mais ils ne sont pas appelés automatiquement par le query builder. Il faut passer par insert_with_async_hooks().
+
+   Amélioration : les builders (InsertBuilder, UpdateBuilder, DeleteBuilder) appellent automatiquement les hooks si le type implémente AsyncModelHooks. Ça rapprocherait Reify de JPA où les callbacks sont implicites.
+
+   4.5. @Version - Optimistic Locking (Spring Data JPA)
+
+   Un mécanisme de locking optimiste indispensable pour les mutations concurrentes :
+
+   rust
+     #[derive(Table)]
+     pub struct Product {
+         pub id: i64,
+         pub name: String,
+         #[column(version)]
+         pub version: i64,
+     }
+
+   → Product::update().set(...).filter(Product::id.eq(42)).execute(&db) génère :
+
+   sql
+     UPDATE products SET name = ?, version = version + 1 WHERE id = ? AND version = ?
+
+   4.6. @CreatedBy / @LastModifiedBy (JHipster / Spring Data JPA)
+
+   Au-delà de creation_timestamp / update_timestamp, injecter automatiquement l'utilisateur courant :
+
+   rust
+     #[derive(Table)]
+     pub struct Order {
+         #[column(created_by)]
+         pub created_by: String,
+         #[column(updated_by)]
+         pub updated_by: String,
+     }
+
+   → L'AuditContext existant peut fournir l'ActorId. L'UpdateBuilder injecterait updated_by = <actor> automatiquement.
+
+   4.7. @NaturalId (Hibernate)
+
+   Une clé "naturelle" alternative à la PK technique :
+
+   rust
+     #[derive(Table)]
+     pub struct User {
+         #[column(primary_key, auto_increment)]
+         pub id: i64,
+         #[column(natural_id)]
+         pub email: String,
+     }
+
+   → User::find_by_natural_id(email) génère un cache L1 + requête optimisée.
+
+   4.8. Soft Delete Cascade
+
+   Quand on soft-delete un User, soft-delete automatiquement ses Post :
+
+   rust
+     #[derive(Table)]
+     #[relations(
+         has_many(posts: Post, foreign_key = "user_id", cascade_soft_delete)
+     )]
+     pub struct User { ... }
+
+   4.9. @Immutable / ReadOnly entities (Hibernate)
+
+   rust
+     #[derive(Table)]
+     #[table(immutable)]
+     pub struct AuditLog {
+         pub id: i64,
+         pub event: String,
+     }
+
+   → AuditLog::update() et delete() sont interdits à la compilation (ou paniquent).
+
+   4.10. Field-level auditing (Hibernate Envers)
+
+   L'audit actuel est row-level (snapshot JSON complet). Envers-style permet de savoir quel champ a changé :
+
+   rust
+     #[derive(Table, Auditable)]  // génère une table _audit avec old_value/new_value par colonne
+     pub struct User {
+         pub email: String,
+     }
+
+   → Table users_audit avec column_name, old_value, new_value au lieu d'un blob JSON.
+
+   4.11. Multi-tenancy @TenantId (JHipster)
+
+   rust
+     #[derive(Table)]
+     #[table(name = "invoices", tenant_isolation)]
+     pub struct Invoice {
+         #[column(tenant_id)]
+         pub tenant_id: i64,
+     }
+
+   → Invoice::find() injecte automatiquement WHERE tenant_id = ?. Peut s'intégrer avec le RlsContext existant.
+
+   4.12. DTO Projections natives (Spring Data Projections)
+
+   Au lieu de générer seulement {Model}Dto pour l'insert, générer des projections pour les SELECT partiels :
+
+   rust
+     #[derive(Table)]
+     #[table(name = "users")]
+     #[projection(PublicUser, skip = ["password_hash", "api_token"])]
+     pub struct User { ... }
+
+     // Usage
+     let users: Vec<PublicUser> = User::find().as_projection::<PublicUser>().fetch(&db).await?;
+
+   ──────────────────────────────────────────
+
+   5. Points de vigilance
+
+   1. Le "piège du soft delete" : quand un dev fait User::delete().filter(User::id.eq(42)).execute(&db), il s'attend à ce que la ligne disparaisse. Le soft delete doit être explicite (par exemple via User::soft_delete()) ou
+      très visible (logging, documentation). Spring Boot/Data JPA l'a appris à ses dépens avec les @SQLDelete implicites.
+
+   2. Les unique indexes : avec un soft delete, email unique devient problématique (un user supprimé avec alice@example.com empêche de recréer un user avec ce mail). Il faut automatiquement générer des partial indexes WHERE
+      deleted_at IS NULL. MySQL ne supporte pas les partial indexes - il faudra un workaround (colonne générée is_deleted + index composite).
+
+   3. Les relations / JOINs : si Post a un user_id FK et que User est soft-deleted, les Post::find().join(Post::user()) doivent-ils exclure automatiquement les users supprimés ? C'est le comportement Hibernate par défaut avec
+       @Where, mais ça peut être surprenant.
+
+   ──────────────────────────────────────────
+
+   En résumé : l'architecture actuelle de Reify est solide pour accueillir le soft delete (injection de timestamps, AST modulaire, partial indexes). Le pattern #[column(soft_delete)] est le meilleur choix. Les inspirations
+   Java les plus pertinentes pour Reify sont : le @Where générique, le @Version (optimistic locking), les callbacks automatiques, et le @NaturalId.
