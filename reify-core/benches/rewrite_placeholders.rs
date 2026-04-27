@@ -1,5 +1,6 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use reify_core::query::rewrite_placeholders_pg;
+use std::hint::black_box;
 
 fn bench_rewrite_placeholders(c: &mut Criterion) {
     // short: 3 placeholders — single-row INSERT
@@ -20,7 +21,7 @@ fn bench_rewrite_placeholders(c: &mut Criterion) {
     let long = {
         let cols: Vec<&str> = vec!["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10"];
         let col_list = cols.join(", ");
-        let row_placeholder = format!("({})", vec!["?"; 10].join(", "));
+        let row_placeholder = format!("({})", ["?"; 10].join(", "));
         let rows: Vec<&str> = vec![row_placeholder.as_str(); 20];
         format!("INSERT INTO t ({col_list}) VALUES {}", rows.join(", "))
     };

@@ -10,7 +10,7 @@ use crate::query::Dialect;
 ///
 /// Derived automatically from Rust types by `#[derive(Table)]`, or set
 /// explicitly via `#[column(sql_type = "JSONB")]` / the builder API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SqlType {
     /// `SMALLINT` / `INT2`
     SmallInt,
@@ -27,6 +27,7 @@ pub enum SqlType {
     /// `BOOLEAN`
     Boolean,
     /// `TEXT`
+    #[default]
     Text,
     /// `VARCHAR(n)` — variable-length string with a maximum length.
     ///
@@ -200,15 +201,15 @@ impl SqlType {
             },
             SqlType::Interval => match dialect {
                 Dialect::Postgres => Cow::Borrowed("INTERVAL"),
+                // MySQL has no `INTERVAL` column type, but `TIME` is a
+                // signed interval (-838:59:59 to +838:59:59) that round-
+                // trips a `chrono::Duration` natively. Postgres `TIME` is
+                // a wall-clock type and would reject negatives, so we
+                // diverge here on purpose.
+                Dialect::Mysql => Cow::Borrowed("TIME"),
                 _ => Cow::Borrowed("TEXT"),
             },
         }
-    }
-}
-
-impl Default for SqlType {
-    fn default() -> Self {
-        SqlType::Text
     }
 }
 
@@ -307,6 +308,11 @@ impl ForeignKeyAction {
     }
 
     /// Parse from a string (case-insensitive).
+    ///
+    /// Returns `Option<Self>` rather than `Result<Self, _>`; the
+    /// `std::str::FromStr` trait would force a `Result`, so we expose an
+    /// inherent method instead. Suppress the clippy lookalike lint.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "NO ACTION" | "NOACTION" => Some(ForeignKeyAction::NoAction),

@@ -160,7 +160,12 @@ impl MigrationRunner {
         result
     }
 
-    async fn run_since_inner(&self, db: &impl Database, since: &str, dialect: Dialect) -> Result<(), MigrationError> {
+    async fn run_since_inner(
+        &self,
+        db: &impl Database,
+        since: &str,
+        dialect: Dialect,
+    ) -> Result<(), MigrationError> {
         let applied = self.applied_checksums(db, dialect).await?;
         let timestamps = self.applied_timestamps(db, dialect).await?;
 

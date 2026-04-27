@@ -43,12 +43,11 @@ impl Row {
         });
         let h = fnv1a_64(column.as_bytes());
         for &(hh, i) in idx {
-            if hh == h {
-                if let Some(c) = self.columns.get(i) {
-                    if c == column {
-                        return self.values.get(i);
-                    }
-                }
+            if hh == h
+                && let Some(c) = self.columns.get(i)
+                && c == column
+            {
+                return self.values.get(i);
             }
         }
         None
@@ -195,6 +194,20 @@ pub enum DbError {
     },
     /// Row conversion failed.
     Conversion(String),
+    /// Self-deadlock detected: an adapter call would block on a lock the
+    /// current task already holds (e.g. calling `SqliteDb::execute` from
+    /// inside a `transaction()` closure on the same task — use the
+    /// closure's `tx` argument instead).
+    ///
+    /// Distinct from `Other` so callers can match it explicitly.
+    Deadlock(String),
+    /// Operation exceeded its configured deadline.
+    ///
+    /// Surfaced by adapter helpers that wrap async work in a timeout —
+    /// pool acquisition timeouts use [`DbError::Connection`] (the failure
+    /// is at the connection level), while inter-row idle timeouts on
+    /// `query_stream` use this variant.
+    Timeout(String),
     /// Other error.
     Other(String),
 }
@@ -219,6 +232,8 @@ impl std::fmt::Display for DbError {
                 write!(f, "constraint violation: {message}")
             }
             DbError::Conversion(msg) => write!(f, "conversion error: {msg}"),
+            DbError::Deadlock(msg) => write!(f, "deadlock detected: {msg}"),
+            DbError::Timeout(msg) => write!(f, "timeout: {msg}"),
             DbError::Other(msg) => write!(f, "error: {msg}"),
         }
     }
@@ -261,6 +276,50 @@ pub type BoxFuture<'a, T> =
 /// A boxed, `Send`-safe stream returning `Result<T, DbError>`.
 pub type BoxStream<'a, T> =
     std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<T, DbError>> + Send + 'a>>;
+
+/// Wrap a [`BoxStream`] so that each `next().await` is bounded by an
+/// inter-row idle timeout. If no item arrives within `idle`, a single
+/// [`DbError::Timeout`] is yielded and the stream then ends.
+///
+/// Designed for adapter-level `query_stream_idle` helpers (PostgreSQL,
+/// MySQL): a slow consumer that blocks between rows would otherwise
+/// hold its connection out of the pool indefinitely. The timeout
+/// surfaces the stall as a recoverable error and lets the caller drop
+/// the stream (releasing the connection back to the pool).
+///
+/// Cancellation: dropping the returned stream cancels the inner
+/// `s.next()` future cleanly — same semantics as the wrapped stream.
+pub fn with_idle_timeout<'a, T>(
+    stream: BoxStream<'a, T>,
+    idle: std::time::Duration,
+) -> BoxStream<'a, T>
+where
+    T: Send + 'a,
+{
+    use futures_util::StreamExt;
+    Box::pin(futures_util::stream::unfold(
+        (stream, idle, false),
+        move |(mut s, idle, ended)| async move {
+            if ended {
+                return None;
+            }
+            match tokio::time::timeout(idle, s.next()).await {
+                Ok(Some(item)) => Some((item, (s, idle, false))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(DbError::Timeout(format!(
+                        "query_stream idle timeout: no row arrived within {}ms",
+                        idle.as_millis()
+                    ))),
+                    // End the stream after surfacing the timeout so a
+                    // downstream `for await` doesn't loop forever on
+                    // repeated timeouts.
+                    (s, idle, true),
+                )),
+            }
+        },
+    ))
+}
 
 /// The closure accepted by [`Database::transaction`].
 ///
@@ -310,7 +369,6 @@ pub trait Database: Send + Sync {
         sql: String,
         params: Vec<Value>,
     ) -> impl std::future::Future<Output = Result<BoxStream<'a, Row>, DbError>> + Send {
-        use futures_util::StreamExt;
         async move {
             let rows = self.query(&sql, &params).await?;
             Ok(
@@ -469,7 +527,7 @@ pub async fn fetch_all<M: Table>(
             crate::telemetry::start_query("select", M::table_name(), &q.sql, q.params.len());
         let result = db.query(&q.sql, &q.params).await;
         timer.finish(result.as_ref().map(|r| r.len()).unwrap_or(0));
-        return result;
+        result
     }
     #[cfg(not(feature = "postgres"))]
     {
@@ -574,7 +632,7 @@ pub async fn insert<M: Table>(
             crate::telemetry::start_query("insert", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
-        return result;
+        result
     }
     #[cfg(not(feature = "postgres"))]
     {
@@ -598,7 +656,7 @@ pub async fn insert_many<M: Table>(
             crate::telemetry::start_query("insert_many", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
-        return result;
+        result
     }
     #[cfg(not(feature = "postgres"))]
     {
@@ -645,7 +703,7 @@ pub async fn update<M: Table>(
             crate::telemetry::start_query("update", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
-        return result;
+        result
     }
     #[cfg(not(feature = "postgres"))]
     {
@@ -680,7 +738,7 @@ pub async fn delete<M: Table>(
             crate::telemetry::start_query("delete", M::table_name(), &q.sql, q.params.len());
         let result = db.execute(&q.sql, &q.params).await;
         timer.finish(result.as_ref().copied().unwrap_or(0) as usize);
-        return result;
+        result
     }
     #[cfg(not(feature = "postgres"))]
     {
@@ -879,6 +937,10 @@ mod tests {
                 .ok_or_else(|| DbError::Query("no rows".into()))
         }
 
+        // Mirrors the `Database::transaction` trait signature; using
+        // `async fn` here would lose the explicit `+ Send` bound that the
+        // trait expects, so we keep the desugared form.
+        #[allow(clippy::manual_async_fn)]
         fn transaction<'a>(
             &'a self,
             f: TransactionFn<'a>,
@@ -1275,4 +1337,88 @@ pub async fn delete_with_async_hooks<M: Table + crate::hooks::AsyncModelHooks>(
 
     model.after_delete(rows).await.map_err(DbError::from)?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    //! Coverage for [`with_idle_timeout`].
+    //!
+    //! Pre-fix, a `query_stream` consumer that stalled between rows held its
+    //! pooled connection indefinitely, draining the pool and eventually
+    //! freezing every other request waiting on `get_conn`. The wrapper
+    //! turns an inter-row stall into a single explicit `DbError::Timeout`,
+    //! after which the stream ends so the caller drops it and the
+    //! connection returns to the pool.
+
+    use super::*;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    /// Build a `BoxStream<i32>` from a `Vec<Result<…>>`, useful for unit-
+    /// testing `with_idle_timeout` without a database.
+    fn box_stream_from_iter<I>(items: I) -> BoxStream<'static, i32>
+    where
+        I: IntoIterator<Item = Result<i32, DbError>> + Send + 'static,
+        I::IntoIter: Send + 'static,
+    {
+        Box::pin(futures_util::stream::iter(items))
+    }
+
+    #[tokio::test]
+    async fn fast_stream_passes_through_unchanged() {
+        let inner = box_stream_from_iter(vec![Ok(1), Ok(2), Ok(3)]);
+        let mut s = with_idle_timeout(inner, Duration::from_secs(60));
+        assert_eq!(s.next().await.unwrap().unwrap(), 1);
+        assert_eq!(s.next().await.unwrap().unwrap(), 2);
+        assert_eq!(s.next().await.unwrap().unwrap(), 3);
+        assert!(s.next().await.is_none(), "stream ended");
+    }
+
+    #[tokio::test]
+    async fn slow_stream_yields_single_timeout_then_ends() {
+        // Build an inner stream that yields 1 immediately, then stalls
+        // forever. Wrap with a 50 ms idle timeout. We expect: Ok(1),
+        // Err(Timeout), None.
+        let inner: BoxStream<'static, i32> =
+            Box::pin(futures_util::stream::unfold(0u32, |i| async move {
+                if i == 0 {
+                    Some((Ok(1i32), 1))
+                } else {
+                    // Stall longer than the idle timeout — the wrapper
+                    // must produce a Timeout error and end.
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Some((Ok(99), i + 1))
+                }
+            }));
+        let mut s = with_idle_timeout(inner, Duration::from_millis(50));
+        assert_eq!(s.next().await.unwrap().unwrap(), 1);
+        let err = s.next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, DbError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
+        assert!(
+            s.next().await.is_none(),
+            "stream must end after the timeout — looping would be a regression"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_inner_stream_ends_immediately() {
+        let inner = box_stream_from_iter(Vec::<Result<i32, DbError>>::new());
+        let mut s = with_idle_timeout(inner, Duration::from_secs(60));
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inner_error_is_forwarded_unchanged() {
+        let inner = box_stream_from_iter(vec![Ok(1), Err(DbError::Other("boom".into())), Ok(99)]);
+        let mut s = with_idle_timeout(inner, Duration::from_secs(60));
+        assert_eq!(s.next().await.unwrap().unwrap(), 1);
+        let e = s.next().await.unwrap().unwrap_err();
+        assert!(matches!(e, DbError::Other(ref m) if m == "boom"));
+        // Stream is still alive — the wrapper only ends on idle timeout,
+        // not on inner errors. The user decides whether to keep going.
+        assert_eq!(s.next().await.unwrap().unwrap(), 99);
+    }
 }

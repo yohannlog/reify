@@ -53,9 +53,7 @@ async fn sqlite_upsert_do_nothing() {
         .await
         .expect("on_conflict_do_nothing");
 
-    let rows = fetch::<User>(&db, &User::find())
-        .await
-        .expect("fetch");
+    let rows = fetch::<User>(&db, &User::find()).await.expect("fetch");
     assert_eq!(rows.len(), 1, "no new row must be inserted");
     assert_eq!(rows[0].role, None, "original row must be untouched");
 }
@@ -86,9 +84,7 @@ async fn sqlite_upsert_do_update() {
     .await
     .expect("on_conflict_do_update");
 
-    let rows = fetch::<User>(&db, &User::find())
-        .await
-        .expect("fetch");
+    let rows = fetch::<User>(&db, &User::find()).await.expect("fetch");
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].role,

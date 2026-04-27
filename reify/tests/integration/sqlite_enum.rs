@@ -70,10 +70,7 @@ async fn sqlite_enum_round_trip() {
     let variants: Vec<Role> = rows
         .iter()
         .map(|r| {
-            let v = r
-                .get_idx(0)
-                .expect("role column must be present")
-                .clone();
+            let v = r.get_idx(0).expect("role column must be present").clone();
             enum_from_value::<Role>(&v).expect("decode enum")
         })
         .collect();

@@ -58,12 +58,12 @@ impl MigrationPlan {
         if let Some(c) = &self.comment {
             out.push_str(&format!("    -- comment: {c}\n"));
         }
-        if let Some(diff) = &self.schema_diff {
-            if !diff.is_empty() {
-                // Indent each line of the diff block by 4 spaces.
-                for line in diff.display().lines() {
-                    out.push_str(&format!("    {line}\n"));
-                }
+        if let Some(diff) = &self.schema_diff
+            && !diff.is_empty()
+        {
+            // Indent each line of the diff block by 4 spaces.
+            for line in diff.display().lines() {
+                out.push_str(&format!("    {line}\n"));
             }
         }
         if let Some(t) = self.timeout {

@@ -328,8 +328,8 @@ async fn mysql_temporal_round_trip() {
     .await
     .expect("create temporal");
 
-    let dt = chrono::NaiveDateTime::parse_from_str("2024-06-15 12:30:45", "%Y-%m-%d %H:%M:%S")
-        .unwrap();
+    let dt =
+        chrono::NaiveDateTime::parse_from_str("2024-06-15 12:30:45", "%Y-%m-%d %H:%M:%S").unwrap();
     let d = chrono::NaiveDate::parse_from_str("2024-06-15", "%Y-%m-%d").unwrap();
     let t = chrono::NaiveTime::parse_from_str("12:30:45", "%H:%M:%S").unwrap();
 

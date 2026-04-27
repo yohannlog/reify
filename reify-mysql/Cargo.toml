@@ -9,7 +9,7 @@ repository = "https://github.com/yohann-catherine/reify"
 documentation = "https://docs.rs/reify-mysql"
 keywords = ["orm", "mysql", "mariadb", "database", "async"]
 categories = ["database", "asynchronous"]
-rust-version = "1.85"
+rust-version.workspace = true
 
 [features]
 postgres = ["reify-core/postgres"]

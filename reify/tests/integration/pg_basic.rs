@@ -49,12 +49,7 @@ async fn create_users(db: &reify::PostgresDb) {
 /// `pg_basic_children` are used by the FK-violation test only but
 /// listing them here makes cleanup robust to panics.
 async fn fixture() -> Option<PgFixture> {
-    PgFixture::new(&[
-        "pg_basic_children",
-        "pg_basic_parents",
-        "pg_basic_users",
-    ])
-    .await
+    PgFixture::new(&["pg_basic_children", "pg_basic_parents", "pg_basic_users"]).await
 }
 
 #[tokio::test]
@@ -322,12 +317,9 @@ async fn pg_ilike_filter() {
     };
     insert(&fx.db, &User::insert(&user)).await.expect("insert");
 
-    let rows = fetch::<User>(
-        &fx.db,
-        &User::find().filter(User::email.ilike("%example%")),
-    )
-    .await
-    .expect("fetch");
+    let rows = fetch::<User>(&fx.db, &User::find().filter(User::email.ilike("%example%")))
+        .await
+        .expect("fetch");
     assert!(!rows.is_empty(), "ilike should match case-insensitively");
 
     fx.teardown().await;

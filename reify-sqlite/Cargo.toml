@@ -9,7 +9,7 @@ repository = "https://github.com/yohann-catherine/reify"
 documentation = "https://docs.rs/reify-sqlite"
 keywords = ["orm", "sqlite", "database", "async"]
 categories = ["database"]
-rust-version = "1.85"
+rust-version.workspace = true
 
 [features]
 postgres = ["reify-core/postgres"]
@@ -20,3 +20,6 @@ reify-core = { path = "../reify-core", version = "0.1.0" }
 rusqlite = { version = "0.39", features = ["bundled"] }
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }

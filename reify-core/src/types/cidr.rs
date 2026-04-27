@@ -6,8 +6,20 @@ use std::str::FromStr;
 
 /// A network address with prefix length (CIDR notation).
 ///
-/// Maps to PostgreSQL `CIDR` type. Represents a network block like
-/// `192.168.1.0/24` or `2001:db8::/32`.
+/// Represents a network block like `192.168.1.0/24` or `2001:db8::/32`.
+///
+/// # Adapter support
+///
+/// - **PostgreSQL** — native `CIDR` type, round-trips losslessly.
+/// - **MySQL** — bound as `VARCHAR(49)` (text representation). The
+///   network-containment helpers (`contains` / `contains_or_equals`) only
+///   run client-side, not in SQL `WHERE` clauses.
+/// - **SQLite** — bound as `TEXT`. Same caveat as MySQL.
+///
+/// The `Value::Cidr` variant itself is gated on the `postgres` feature
+/// because non-PG adapters fall back to text and lose the structural
+/// type. To use this type with MySQL/SQLite, store as `String` and parse
+/// to `Cidr` in your model layer.
 ///
 /// # Examples
 ///

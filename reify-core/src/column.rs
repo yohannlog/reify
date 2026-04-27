@@ -142,6 +142,18 @@ impl<M: 'static, T: Numeric + 'static> Column<M, T> {
 /// Escapes `\`, `%`, and `_` so they are treated as literal characters
 /// in a LIKE pattern. The corresponding SQL uses `ESCAPE '\\'` to
 /// declare the escape character.
+///
+/// ## MySQL `NO_BACKSLASH_ESCAPES` warning
+///
+/// The `\\` escape character is the MySQL/MariaDB default and the only
+/// option on PostgreSQL/SQLite. If your MySQL server is configured with
+/// the `NO_BACKSLASH_ESCAPES` SQL_MODE, backslash is no longer treated
+/// as an escape and these `.contains()` / `.starts_with()` / `.ends_with()`
+/// helpers will match `\%` / `\_` literally instead of as escaped wildcards
+/// — exposing wildcards from user input.
+///
+/// Either keep the default SQL_MODE, or pre-validate user input upstream
+/// and use [`Column::like`](Column::like) with a hand-built static pattern.
 fn escape_like(input: &str) -> String {
     input
         .replace('\\', "\\\\")
@@ -435,7 +447,23 @@ impl<M: 'static> Column<M, serde_json::Value> {
     /// The key is passed as a **bound parameter** — safe for user-supplied input.
     /// Returns a [`JsonExpr`] — chain `.eq()`, `.neq()`, `.is_null()`, etc.
     ///
-    /// Returns `None` if `key` contains null bytes or exceeds 512 characters.
+    /// # Validation
+    ///
+    /// Returns `None` if the key fails the internal `validate_json_key`
+    /// check, specifically when:
+    /// - `key.len() > 512` bytes — defence-in-depth cap against
+    ///   pathological inputs that could pressure the bind-parameter path
+    ///   or trigger PostgreSQL's own error path on oversized index keys.
+    ///   512 covers every practical key (PG itself does not cap key
+    ///   length, but real schemas use short keys like `"role"` or
+    ///   `"metadata.user.id"`).
+    /// - `key` contains a NUL byte (`\0`) — would terminate the bound
+    ///   parameter early when the driver round-trips it through the
+    ///   wire protocol.
+    ///
+    /// Use [`json_get_path`](Self::json_get_path) for keys that legitimately
+    /// exceed 512 bytes (it stores the path as an array, with no per-segment
+    /// length cap).
     ///
     /// ```ignore
     /// User::metadata.json_get("role")?.eq("admin")
@@ -452,8 +480,11 @@ impl<M: 'static> Column<M, serde_json::Value> {
     /// literal, avoiding the key allocation entirely. Prefer this when
     /// the key is known at compile time.
     ///
-    /// Returns `None` if `key` contains null bytes or exceeds 512 characters
-    /// (in practice impossible for compile-time literals, but kept consistent).
+    /// Returns `None` under the same conditions as [`json_get`](Self::json_get)
+    /// — `key.len() > 512` bytes, or contains a NUL byte. In practice
+    /// impossible for compile-time literals, but the validation is kept
+    /// consistent across both entry points so refactoring `json_get_static`
+    /// → `json_get` doesn't subtly change validation behaviour.
     pub fn json_get_static(&self, key: &'static str) -> Option<JsonExpr> {
         Some(JsonExpr {
             column: self.name,

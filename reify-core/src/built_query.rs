@@ -8,6 +8,7 @@ use crate::value::Value;
 /// Implements `From<BuiltQuery> for (String, Vec<Value>)` for backward
 /// compatibility with code that expects a tuple.
 #[derive(Debug, Clone)]
+#[must_use = "BuiltQuery represents a query to be executed; pass it to the database adapter or destructure it"]
 pub struct BuiltQuery {
     /// The SQL string with `?` placeholders.
     pub sql: String,

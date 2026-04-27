@@ -89,6 +89,7 @@ pub struct User {
 /// Captures every SQL statement and its parameters so we can inspect them
 /// without a real database connection.
 #[derive(Clone)]
+#[allow(clippy::type_complexity)] // example scaffolding, expressive shape > alias
 struct MockDb {
     log: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
     /// Pre-loaded query results consumed in FIFO order.
@@ -139,6 +140,7 @@ impl Database for MockDb {
         Err(DbError::Query("no rows".into()))
     }
 
+    #[allow(clippy::manual_async_fn)] // matches the trait signature (+ Send)
     fn transaction<'a>(
         &'a self,
         f: TransactionFn<'a>,

@@ -167,14 +167,14 @@ fn parse_relations_attr(
                 )));
             }
 
-            if let Some(ref lk) = local_key {
-                if !field_names.contains(lk) {
-                    return Err(rel_meta.error(format!(
-                        "`local_key = \"{lk}\"` does not exist on `{struct_name}`; \
-                         available fields: {}",
-                        field_names.join(", ")
-                    )));
-                }
+            if let Some(ref lk) = local_key
+                && !field_names.contains(lk)
+            {
+                return Err(rel_meta.error(format!(
+                    "`local_key = \"{lk}\"` does not exist on `{struct_name}`; \
+                     available fields: {}",
+                    field_names.join(", ")
+                )));
             }
 
             result.push(ParsedRelation {

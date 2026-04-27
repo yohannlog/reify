@@ -91,7 +91,7 @@ impl MigrationRunner {
                     for stmt in &stmts_clone {
                         txn.execute(stmt, &[]).await?;
                     }
-                    txn.execute(&delete_sql, &[Value::String(version_clone.into())])
+                    txn.execute(&delete_sql, &[Value::String(version_clone)])
                         .await?;
                     Ok(())
                 })
@@ -131,9 +131,7 @@ impl MigrationRunner {
         MigrationLock::ensure(db, dialect).await?;
         MigrationLock::acquire(db, dialect).await?;
 
-        let rows = db
-            .query(&select_manual_versions_sql(dialect), &[])
-            .await?;
+        let rows = db.query(&select_manual_versions_sql(dialect), &[]).await?;
 
         let versions: Vec<String> = rows
             .into_iter()
@@ -210,7 +208,7 @@ impl MigrationRunner {
                         for stmt in &stmts_clone {
                             txn.execute(stmt, &[]).await?;
                         }
-                        txn.execute(&delete_sql, &[Value::String(version_clone.into())])
+                        txn.execute(&delete_sql, &[Value::String(version_clone)])
                             .await?;
                         Ok(())
                     })
@@ -334,7 +332,7 @@ impl MigrationRunner {
                         for stmt in &stmts_clone {
                             txn.execute(stmt, &[]).await?;
                         }
-                        txn.execute(&delete_sql, &[Value::String(version_clone.into())])
+                        txn.execute(&delete_sql, &[Value::String(version_clone)])
                             .await?;
                         Ok(())
                     })

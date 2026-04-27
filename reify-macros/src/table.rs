@@ -1,9 +1,10 @@
 use quote::quote;
-use syn::{parse::Parse, Attribute, Data, DeriveInput, Fields, Lit};
+use syn::spanned::Spanned;
+use syn::{Data, DeriveInput, Fields, Lit, parse::Parse};
 
 use crate::helpers::{
-    parse_column_attrs, parse_sql_type_string, rust_type_to_sql_type, to_snake_case,
-    unwrap_option_type, MetaExt,
+    MetaExt, parse_column_attrs, parse_sql_type_string, rust_type_to_sql_type, to_snake_case,
+    unwrap_option_type,
 };
 
 // ── Parsed index from #[table(index(...))] ──────────────────────────
@@ -27,6 +28,9 @@ pub(crate) struct TableAttr {
     pub indexes: Vec<ParsedIndex>,
     pub audit: bool,
     pub dto_skip: Vec<String>,
+    /// Span of the `dto(skip = "...")` string literal, used to anchor
+    /// validation errors at the user's typo rather than at `Span::call_site()`.
+    pub dto_skip_span: Option<proc_macro2::Span>,
     /// Extra derives requested via `#[table(dto(derives(Serialize, Deserialize)))]`.
     #[allow(dead_code)]
     pub dto_extra_derives: Vec<syn::Path>,
@@ -54,7 +58,7 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         ));
     }
 
-    let table_attr = parse_table_attr(&input.attrs)?;
+    let table_attr = parse_table_attr(input)?;
     let table_name = &table_attr.name;
 
     let fields = match &input.data {
@@ -80,11 +84,16 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         .map(|f| f.ident.as_ref().unwrap().to_string())
         .collect();
 
-    // M2: validate dto_skip names against actual fields at macro-expansion time
+    // M2: validate dto_skip names against actual fields at macro-expansion
+    // time. Anchor the error at the `dto(skip = "...")` literal (captured
+    // during attribute parsing) so the user is pointed straight at their typo.
     for skipped in &table_attr.dto_skip {
         if !all_field_names.contains(skipped) {
+            let span = table_attr
+                .dto_skip_span
+                .unwrap_or_else(|| struct_name.span());
             return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
+                span,
                 format!(
                     "dto(skip = \"{skipped}\"): field `{skipped}` does not exist on `{struct_name}`"
                 ),
@@ -256,6 +265,18 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
         let (is_option, inner_ty) = unwrap_option_type(ty);
         let is_nullable = is_option;
+
+        // M5: a nullable primary key is rejected by every supported SGBD
+        // at schema-creation time. Catch the mistake at macro expansion so
+        // the user sees a clear error on the field rather than a confusing
+        // "ALTER TABLE failed" at first run.
+        if col_attrs.primary_key && is_nullable {
+            return Err(syn::Error::new_spanned(
+                field,
+                "`#[column(primary_key)]` cannot be applied to an `Option<T>` field; \
+                 primary keys must be NOT NULL. Drop the `Option` or remove `primary_key`.",
+            ));
+        }
 
         // Validate that `creation_timestamp`/`update_timestamp` are only
         // applied to datetime types. The macro can only inspect the
@@ -930,16 +951,19 @@ pub(crate) fn impl_table(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     Ok(quote! { #expanded #mutable_methods #audit_impl #dto_impl })
 }
 
-fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
-    for attr in attrs {
+fn parse_table_attr(input: &DeriveInput) -> syn::Result<TableAttr> {
+    let mut last_table_attr_span: Option<proc_macro2::Span> = None;
+    for attr in &input.attrs {
         if !attr.path().is_ident("table") {
             continue;
         }
+        last_table_attr_span = Some(attr.path().span());
 
         let mut table_name = None;
         let mut indexes = Vec::new();
         let mut audit = false;
-        let mut dto_skip = Vec::new();
+        let mut dto_skip: Vec<String> = Vec::new();
+        let mut dto_skip_span: Option<proc_macro2::Span> = None;
         let mut dto_extra_derives: Vec<syn::Path> = Vec::new();
         let mut sql_delete = None;
         let mut sql_update = None;
@@ -954,8 +978,21 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
             } else if meta.path.is_ident("dto") {
                 meta.parse_nested_meta(|inner| {
                     if inner.path.is_ident("skip") {
-                        let val = inner.parse_str_value()?;
-                        dto_skip.extend(val.split(',').map(|s| s.trim().to_string()));
+                        // Capture the literal's span so downstream
+                        // validation can point at the user's typo.
+                        let value = inner.value()?;
+                        let lit: Lit = value.parse()?;
+                        let s = match &lit {
+                            Lit::Str(s) => s.value(),
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    &lit,
+                                    "expected a string literal",
+                                ))
+                            }
+                        };
+                        dto_skip_span = Some(lit.span());
+                        dto_skip.extend(s.split(',').map(|s| s.trim().to_string()));
                     } else if inner.path.is_ident("derives") {
                         // M1: parse `derives(Serialize, Deserialize, PartialEq, ...)`
                         let content;
@@ -1056,6 +1093,7 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
                 indexes,
                 audit,
                 dto_skip,
+                dto_skip_span,
                 dto_extra_derives,
                 sql_delete,
                 sql_update,
@@ -1064,8 +1102,19 @@ fn parse_table_attr(attrs: &[Attribute]) -> syn::Result<TableAttr> {
             });
         }
     }
-    Err(syn::Error::new(
-        proc_macro2::Span::call_site(),
-        r#"Missing #[table(name = "...")] attribute"#,
-    ))
+    // Span the error at the existing `#[table(...)]` attribute (if any) so
+    // the user is pointed at "where to add `name`"; otherwise span at the
+    // struct identifier so the error sits on the user's struct rather than
+    // the `derive` invocation.
+    let (span, msg) = match last_table_attr_span {
+        Some(span) => (
+            span,
+            r#"`#[table(...)]` is missing the required `name = "..."` field"#,
+        ),
+        None => (
+            input.ident.span(),
+            r#"missing `#[table(name = "...")]` attribute on this struct"#,
+        ),
+    };
+    Err(syn::Error::new(span, msg))
 }

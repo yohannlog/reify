@@ -209,7 +209,11 @@ async fn pg_copy_in_advanced_types() {
         tags: vec![1, 2, 3],
     };
 
-    let affected = fx.db.copy_in(&[event.clone()]).await.expect("copy_in");
+    let affected = fx
+        .db
+        .copy_in(std::slice::from_ref(&event))
+        .await
+        .expect("copy_in");
     assert_eq!(affected, 1);
 
     let rows = fetch::<CopyEvent>(&fx.db, &CopyEvent::find().filter(CopyEvent::id.eq(id)))

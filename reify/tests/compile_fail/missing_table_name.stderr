@@ -1,0 +1,5 @@
+error: missing `#[table(name = "...")]` attribute on this struct
+ --> tests/compile_fail/missing_table_name.rs:8:12
+  |
+8 | pub struct User {
+  |            ^^^^

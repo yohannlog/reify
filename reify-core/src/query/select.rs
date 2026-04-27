@@ -1,19 +1,14 @@
 use super::join::{JoinClause, JoinKind};
-use super::with::WithBuilder;
-use super::{
-    BuildError, Dialect, Expr, OnConflict, Order, OrderExpr, trace_query, write_on_conflict,
-};
 #[cfg(feature = "postgres")]
-use super::{rewrite_placeholders_pg, write_returning};
-use crate::condition::{AggregateCondition, Condition};
+use super::rewrite_placeholders_pg;
+use super::with::WithBuilder;
+use super::{Expr, Order, trace_query};
+use crate::condition::Condition;
 use crate::ident::qi;
 use crate::soft_delete::SoftDeleteFilter;
-use crate::sql::{ToSql, write_joined};
 use crate::table::Table;
 use crate::value::Value;
-use std::fmt::Write;
 use std::marker::PhantomData;
-use tracing::debug;
 
 // ── SelectBuilder ───────────────────────────────────────────────────
 
@@ -30,6 +25,7 @@ use tracing::debug;
 ///     .limit(10)
 ///     .build();
 /// ```
+#[must_use = "SelectBuilder is lazy; chain `.build()`, `.fetch(&db)`, or another execution method to use it"]
 pub struct SelectBuilder<M: Table> {
     distinct: bool,
     columns: Option<Vec<&'static str>>,
@@ -180,6 +176,7 @@ impl<M: Table> SelectBuilder<M> {
     ///
     /// Use this when you need to manipulate the query structure (e.g. pagination)
     /// without parsing rendered SQL text.
+    #[must_use]
     pub fn build_ast<'a>(&'a self) -> crate::sql::SqlFragment<'a> {
         let has_joins = !self.joins.is_empty();
 
@@ -246,6 +243,7 @@ impl<M: Table> SelectBuilder<M> {
     }
 
     /// Build the SQL string and parameter list.
+    #[must_use]
     pub fn build(&self) -> (String, Vec<Value>) {
         // Determine if we need to inject a soft-delete filter
         let soft_delete_condition = self.soft_delete_condition();
@@ -269,24 +267,18 @@ impl<M: Table> SelectBuilder<M> {
     }
 
     /// Compute the soft-delete condition based on filter mode and model config.
+    ///
+    /// `SoftDeleteFilter::Default` always emits `IS NULL` — the safe
+    /// default. Callers wanting to see deleted rows must opt in
+    /// per-query via `.with_deleted()` or `.only_deleted()`; there is
+    /// no process-wide toggle.
     fn soft_delete_condition(&self) -> Option<Condition> {
         let col = M::soft_delete_column()?;
 
         match self.soft_delete_filter {
-            SoftDeleteFilter::Default => {
-                // Check global config
-                if crate::soft_delete::show_deleted() {
-                    None // Global says show deleted, no filter
-                } else {
-                    // Hide deleted rows: WHERE col IS NULL
-                    Some(Condition::IsNull(col))
-                }
-            }
-            SoftDeleteFilter::WithDeleted => None, // No filter, show all
-            SoftDeleteFilter::OnlyDeleted => {
-                // Only deleted: WHERE col IS NOT NULL
-                Some(Condition::IsNotNull(col))
-            }
+            SoftDeleteFilter::Default => Some(Condition::IsNull(col)),
+            SoftDeleteFilter::WithDeleted => None,
+            SoftDeleteFilter::OnlyDeleted => Some(Condition::IsNotNull(col)),
         }
     }
 

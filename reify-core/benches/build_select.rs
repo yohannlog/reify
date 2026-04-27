@@ -1,9 +1,10 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use reify_core::condition::Condition;
 use reify_core::query::SelectBuilder;
 use reify_core::schema::{ColumnDef, IndexDef};
 use reify_core::table::Table;
 use reify_core::value::Value;
+use std::hint::black_box;
 
 struct BenchTable;
 

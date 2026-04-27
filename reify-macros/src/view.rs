@@ -108,6 +108,11 @@ pub(crate) fn impl_view(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                 timestamp_source: reify_core::schema::TimestampSource::Vm,
                 check: None,
                 foreign_key: None,
+                // Views never carry a soft-delete column themselves; the
+                // underlying tables own that semantic. Always emit `false`
+                // so the macro stays in sync with `ColumnDef`'s public
+                // shape.
+                soft_delete: false,
             }
         });
     }

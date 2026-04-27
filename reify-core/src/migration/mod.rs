@@ -13,7 +13,6 @@ pub use codegen::{
     generate_view_migration_file,
 };
 pub use context::MigrationContext;
-pub(crate) use ddl::create_table_sql_named;
 pub use ddl::{
     MissingDefaultError, add_column_sql, create_table_sql, create_table_sql_with_checks,
     try_add_column_sql,
@@ -30,7 +29,7 @@ pub use traits::Migration;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, DbError, DynDatabase, Row};
+    use crate::db::{Database, DbError, Row};
     use crate::table::Table;
     use crate::value::Value;
     use std::sync::{Arc, Mutex};
@@ -80,6 +79,7 @@ mod tests {
             Err(DbError::Query("no rows".into()))
         }
 
+        #[allow(clippy::manual_async_fn)] // matches the trait signature (+ Send)
         fn transaction<'a>(
             &'a self,
             f: crate::db::TransactionFn<'a>,
@@ -239,16 +239,46 @@ mod tests {
         // existing_column_details: column metadata query
         let existing = vec![
             Row::new(
-                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-                vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("id".into()),
+                    Value::String("bigint".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
             ),
             Row::new(
-                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-                vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("email".into()),
+                    Value::String("text".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
             ),
             Row::new(
-                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-                vec![Value::String("role".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("role".into()),
+                    Value::String("text".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
             ),
         ];
         db.push_query_result(existing);
@@ -269,12 +299,32 @@ mod tests {
         // existing_column_details: Table exists but missing "role"
         let existing = vec![
             Row::new(
-                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-                vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("id".into()),
+                    Value::String("bigint".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
             ),
             Row::new(
-                vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-                vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+                vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "is_nullable".into(),
+                    "column_default".into(),
+                ],
+                vec![
+                    Value::String("email".into()),
+                    Value::String("text".into()),
+                    Value::String("NO".into()),
+                    Value::Null,
+                ],
             ),
         ];
         db.push_query_result(existing);
@@ -1864,16 +1914,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_interactive_stops_at_first_reject() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let db = MockDb::new();
         db.push_query_result(vec![]); // applied_versions → empty
         db.push_query_result(vec![]); // existing_columns users → absent
 
-        let runner = MigrationRunner::new()
-            .add_table::<Users>()
-            .add(AddUserCity);
+        let runner = MigrationRunner::new().add_table::<Users>().add(AddUserCity);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1895,5 +1943,4 @@ mod tests {
         // Confirm was called twice (once for each pending migration)
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
-
 }

@@ -8,11 +8,7 @@ mod rollback;
 
 use entries::{MatViewEntry, TableEntry, ViewEntry};
 pub use hooks::MigrationHooks;
-use hooks::{MigrationErrorHookFn, MigrationHookFn};
 
-use super::ddl::{
-    add_column_sql, create_table_sql, create_table_sql_named, create_table_sql_with_checks,
-};
 use super::traits::Migration;
 use crate::migration::plan::MigrationPlan;
 use crate::query::Dialect;
@@ -41,9 +37,9 @@ use futures_core::future::BoxFuture;
 /// the new name is treated as a brand-new table. Clean up the orphan row
 /// manually after renaming.
 pub struct MigrationRunner {
-    pub(super) tables: Vec<TableEntry>,
-    pub(super) views: Vec<ViewEntry>,
-    pub(super) mat_views: Vec<MatViewEntry>,
+    pub(in crate::migration) tables: Vec<TableEntry>,
+    pub(in crate::migration) views: Vec<ViewEntry>,
+    pub(in crate::migration) mat_views: Vec<MatViewEntry>,
     pub(super) manual: Vec<Box<dyn Migration>>,
     /// SQL dialect override. When `None`, dialect is auto-detected from the
     /// database connection at runtime (Drizzle-style ergonomics).
@@ -225,6 +221,12 @@ impl MigrationRunner {
     }
 
     /// Register a manual `Migration` implementation.
+    ///
+    /// Named `add` because the surrounding builder API reads as
+    /// `runner.add_table::<T>().add_view::<V>().add(my_migration)`. The
+    /// signature deliberately differs from `std::ops::Add::add` so the
+    /// resemblance is purely lexical — silence the clippy lint.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, migration: impl Migration + 'static) -> Self {
         self.manual.push(Box::new(migration));
         self

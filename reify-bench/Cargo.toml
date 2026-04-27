@@ -7,11 +7,23 @@ description = "Comparative benchmark orchestrator for Reify ORM vs Diesel, SeaOR
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yohann-catherine/reify"
 publish = false
-rust-version = "1.85"
+rust-version.workspace = true
 
 [[bin]]
 name = "reify-bench"
 path = "src/main.rs"
+
+# The source references `#[cfg(feature = "comparative")]` and
+# `#[cfg(feature = "dto-validation")]` to gate optional bench scenarios
+# (diesel/seaorm/sqlx and validator-backed paths). They are intentionally
+# inert at this stage — declaring them as actual features would force
+# compilation of code that depends on crates not in this graph. Instead
+# we whitelist the cfg names so `--check-cfg` (clippy/rustc) stops
+# warning about unrecognised values.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("comparative", "dto-validation"))',
+] }
 
 # The orchestrator deliberately has no database dependencies. Each
 # framework lives in its own sibling crate (reify-bench-{reify,rusqlite,

@@ -1,9 +1,7 @@
 use super::select::SelectBuilder;
-use crate::condition::Condition;
 use crate::ident::qi;
 use crate::table::Table;
 use crate::value::Value;
-use std::marker::PhantomData;
 
 // ── Eager loading — WithBuilder ──────────────────────────────────────
 
@@ -15,6 +13,7 @@ use std::marker::PhantomData;
 /// 2. `SELECT * FROM to_table WHERE to_col IN (parent_key_values…)`
 ///
 /// Then rows are grouped by the join key in memory — no N+1.
+#[must_use = "WithBuilder is lazy; chain `.build_queries()` or an execution method to use it"]
 pub struct WithBuilder<F: Table, T: Table> {
     pub(crate) parent: SelectBuilder<F>,
     pub(crate) rel: crate::relation::Relation<F, T>,
@@ -26,6 +25,7 @@ impl<F: Table, T: Table> WithBuilder<F, T> {
     /// Returns `(parent_sql, parent_params, child_sql_template)`.
     /// The child SQL uses an `IN (?)` placeholder; the caller must
     /// substitute the actual parent key values at runtime.
+    #[must_use]
     pub fn build_queries(&self) -> ((String, Vec<Value>), String) {
         let (parent_sql, parent_params) = self.parent.build();
         // Child query: SELECT * FROM to_table WHERE to_col IN (?)

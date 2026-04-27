@@ -5,3 +5,8 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Minimum Supported Rust Version. Bumped to 1.90 because reify-core
+# already required it (e.g. for `let … else` on stabilised paths and
+# the dyn-compatibility / AFIT machinery the `Database` trait uses).
+# All workspace crates inherit this via `rust-version.workspace = true`.
+rust-version = "1.90"

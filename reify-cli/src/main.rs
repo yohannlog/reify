@@ -21,7 +21,7 @@
 
 use clap::{Parser, Subcommand};
 use reify_core::migration::{
-    MigrationRunner, SchemaDiff, generate_migration_file, generate_view_migration_file,
+    MigrationRunner, generate_migration_file, generate_view_migration_file,
 };
 
 // ── Exit codes ───────────────────────────────────────────────────────

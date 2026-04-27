@@ -5,7 +5,19 @@ use std::str::FromStr;
 
 /// A 48-bit MAC (Media Access Control) address.
 ///
-/// Maps to PostgreSQL `MACADDR` type. Stored as 6 bytes.
+/// Stored as 6 bytes.
+///
+/// # Adapter support
+///
+/// - **PostgreSQL** — native `MACADDR` type (6-byte binary), round-trips
+///   losslessly.
+/// - **MySQL** — bound as `CHAR(17)` in canonical
+///   `XX:XX:XX:XX:XX:XX` form.
+/// - **SQLite** — bound as `TEXT`.
+///
+/// The `Value::MacAddr` variant is gated on the `postgres` feature; on
+/// other adapters store as `String` and parse to `MacAddr` in your model
+/// layer if needed.
 ///
 /// # Examples
 ///
@@ -19,7 +31,7 @@ use std::str::FromStr;
 /// let mac2: MacAddr = "08-00-2b-01-02-03".parse().unwrap();
 /// assert_eq!(mac, mac2);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct MacAddr([u8; 6]);
 
 /// Parse error for MAC addresses.
@@ -86,12 +98,6 @@ impl MacAddr {
     #[inline]
     pub const fn is_universal(&self) -> bool {
         self.0[0] & 0x02 == 0
-    }
-}
-
-impl Default for MacAddr {
-    fn default() -> Self {
-        Self([0; 6])
     }
 }
 

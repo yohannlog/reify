@@ -1,4 +1,4 @@
-use reify::{Table, Value, query::Order};
+use reify::{Table, query::Order};
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "users")]

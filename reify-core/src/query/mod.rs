@@ -1,11 +1,8 @@
 use crate::condition::{AggregateCondition, Condition};
 use crate::ident::qi;
-use crate::sql::{ToSql, write_joined};
-use crate::table::Table;
+use crate::sql::write_joined;
 use crate::value::Value;
 use std::fmt::Write;
-use std::marker::PhantomData;
-use tracing::debug;
 
 mod delete;
 mod insert;
@@ -180,7 +177,7 @@ pub enum ReturningOldNew {
 
 /// Append a `RETURNING old.*`, `new.*`, or both clause (PostgreSQL 18+).
 #[cfg(feature = "postgres18")]
-pub(crate) fn write_returning_old_new(sql: &mut String, mode: ReturningOldNew, table_name: &str) {
+pub(crate) fn write_returning_old_new(sql: &mut String, mode: ReturningOldNew, _table_name: &str) {
     sql.push_str(" RETURNING ");
     match mode {
         ReturningOldNew::Old => {
@@ -195,51 +192,68 @@ pub(crate) fn write_returning_old_new(sql: &mut String, mode: ReturningOldNew, t
     }
 }
 
-/// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params.
+/// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params,
+/// leaving `'…'` string literals untouched.
 ///
 /// Call this on the SQL string returned by `build()` when targeting PostgreSQL.
 ///
+/// ## Literal-awareness
+///
+/// `?` characters inside single-quoted SQL string literals (e.g.
+/// `WHERE pat = '?'`, `LIKE 'foo?'`, `'it''s ?'`) are preserved verbatim.
+/// Only `?` outside literals is treated as a placeholder.
+///
+/// ## Limitations
+///
+/// PostgreSQL's jsonb existence operators (`?`, `?|`, `?&`) collide with
+/// our placeholder syntax when used in static SQL fragments outside of
+/// string literals. Use the function-form (`jsonb_exists(...)`,
+/// `jsonb_exists_any(...)`, `jsonb_exists_all(...)`) or the
+/// `@>` containment operator instead, or pass `$N` SQL directly through
+/// the postgres adapter's raw-query path.
+///
 /// ## Implementation
 ///
-/// Operates on raw bytes: `?` is ASCII (0x3F) so it can never appear as a
-/// continuation byte of a multi-byte UTF-8 sequence. We scan bytes directly,
-/// copy non-`?` runs in bulk with `extend_from_slice`, and only format the
-/// `$N` token when we hit a placeholder. The output capacity is pre-computed
-/// from the placeholder count to avoid reallocations.
+/// Operates on raw bytes — every split point (`'`, `?`) is ASCII, so
+/// non-ASCII bytes are forwarded verbatim via bulk
+/// `push_str(from_utf8_unchecked(...))` of the surrounding run.
 #[cfg(feature = "postgres")]
 pub fn rewrite_placeholders_pg(sql: &str) -> String {
     let bytes = sql.as_bytes();
 
-    // Count placeholders to pre-size the output buffer.
-    // Each `?` (1 byte) is replaced by `$N` (2–11 bytes); reserve for `$N` up
-    // to u32::MAX but in practice SQL never has more than a few hundred params.
-    let n_placeholders = bytecount_question_marks(bytes);
-    // Worst case: every `?` becomes `$4294967295` (11 chars). In practice
-    // params are small numbers, so this slightly over-allocates but avoids
-    // any reallocation.
-    let extra = n_placeholders.saturating_mul(10); // `$N` adds at most 10 extra bytes
-    let mut result = String::with_capacity(sql.len() + extra);
+    // `?` count is an upper bound on the placeholder count (literals may
+    // contain `?` we won't rewrite). Pre-sizing with the upper bound avoids
+    // reallocation; slight over-allocation is acceptable.
+    let n_question_marks = bytecount_question_marks(bytes);
+    // Worst case: every `?` becomes `$4294967295` (11 chars), so add up to
+    // 10 extra bytes per placeholder.
+    let extra = n_question_marks.saturating_mul(10);
+    let mut out = String::with_capacity(sql.len() + extra);
 
     let mut idx = 1u32;
-    let mut start = 0usize;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'?' {
-            // SAFETY: `start..i` is a valid UTF-8 sub-slice because:
-            // 1. `sql` is valid UTF-8.
-            // 2. `?` (0x3F) is ASCII and cannot be a UTF-8 continuation byte,
-            //    so splitting at any `?` position always lands on a char boundary.
-            debug_assert!(std::str::from_utf8(&bytes[start..i]).is_ok());
-            result.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
-            let _ = write!(result, "${idx}");
+    let mut i = 0usize;
+    let mut run_start = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            // Flush the run preceding the literal, then copy the literal
+            // verbatim (including any `?` inside it).
+            crate::adapter::push_run(&mut out, bytes, run_start, i);
+            i = crate::adapter::copy_string_literal(bytes, i, &mut out);
+            run_start = i;
+        } else if b == b'?' {
+            // Flush the run preceding the placeholder, then emit `$N`.
+            crate::adapter::push_run(&mut out, bytes, run_start, i);
+            let _ = write!(out, "${idx}");
             idx += 1;
-            start = i + 1; // skip the `?` byte
+            i += 1;
+            run_start = i;
+        } else {
+            i += 1;
         }
     }
-    // Append the tail after the last placeholder (or the whole string if none).
-    debug_assert!(std::str::from_utf8(&bytes[start..]).is_ok());
-    result.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..]) });
-    result
+    crate::adapter::push_run(&mut out, bytes, run_start, bytes.len());
+    out
 }
 
 /// Count the number of `?` bytes in a byte slice.
@@ -801,5 +815,79 @@ mod tests {
             expr.to_sql_fragment_dialect(Dialect::Mysql),
             "VARIANCE(\"score\")"
         );
+    }
+
+    // ── rewrite_placeholders_pg: literal-awareness ──────────────────
+    //
+    // Pre-fix, the rewriter blindly replaced every `?` byte with `$N`,
+    // including those inside single-quoted SQL string literals. Static
+    // SQL passed via `Condition::raw` or `raw_query` containing
+    // patterns like `'?'`, `LIKE 'foo?'`, or `'it''s ?'` was silently
+    // corrupted. These tests pin the literal-aware behaviour.
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_rewrite_basic() {
+        assert_eq!(
+            rewrite_placeholders_pg("SELECT ? FROM t WHERE x = ?"),
+            "SELECT $1 FROM t WHERE x = $2"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_rewrite_question_inside_string_literal_preserved() {
+        assert_eq!(
+            rewrite_placeholders_pg("SELECT ? WHERE pat = '?'"),
+            "SELECT $1 WHERE pat = '?'"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_rewrite_question_after_escaped_quote() {
+        // `''` is an escaped single quote inside a literal — the `?`
+        // that follows lives inside the literal and must be preserved.
+        assert_eq!(
+            rewrite_placeholders_pg("SELECT 'it''s ?', ? FROM t"),
+            "SELECT 'it''s ?', $1 FROM t"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_rewrite_like_pattern_with_question() {
+        assert_eq!(
+            rewrite_placeholders_pg("SELECT * FROM t WHERE name LIKE 'foo?bar'"),
+            "SELECT * FROM t WHERE name LIKE 'foo?bar'"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_rewrite_non_ascii_literal_preserved() {
+        // The pre-fix `b as char` byte-pushing corrupted UTF-8 inside
+        // literals (`'café'` → `'cafÃ©'`). Bulk copy preserves it.
+        assert_eq!(
+            rewrite_placeholders_pg("SELECT ? WHERE name = 'café'"),
+            "SELECT $1 WHERE name = 'café'"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_rewrite_no_placeholders_passthrough() {
+        let sql = "SELECT 1 FROM t WHERE x = 'literal'";
+        assert_eq!(rewrite_placeholders_pg(sql), sql);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_rewrite_unterminated_literal_does_not_panic() {
+        // Best-effort behaviour on malformed input: don't panic, treat
+        // the rest of the input as literal content.
+        let sql = "SELECT ? WHERE x = 'oops";
+        let out = rewrite_placeholders_pg(sql);
+        assert_eq!(out, "SELECT $1 WHERE x = 'oops");
     }
 }

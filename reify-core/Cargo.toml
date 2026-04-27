@@ -9,7 +9,7 @@ repository = "https://github.com/yohann-catherine/reify"
 documentation = "https://docs.rs/reify-core"
 keywords = ["orm", "database", "sql", "query-builder"]
 categories = ["database", "asynchronous"]
-rust-version = "1.90.0"
+rust-version.workspace = true
 
 [features]
 default = []

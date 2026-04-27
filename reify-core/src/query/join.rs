@@ -1,5 +1,4 @@
 use super::select::SelectBuilder;
-use crate::table::Table;
 
 // ── Join types ──────────────────────────────────────────────────────
 
@@ -38,4 +37,5 @@ pub struct JoinClause {
 /// now a first-class field on `SelectBuilder`. This alias exists so that
 /// downstream code mentioning the type still compiles.
 #[deprecated(note = "Use SelectBuilder directly — joins are now built-in")]
+#[allow(dead_code)]
 pub type JoinedSelectBuilder<M> = SelectBuilder<M>;

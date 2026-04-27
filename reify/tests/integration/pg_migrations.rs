@@ -147,9 +147,7 @@ async fn pg_migration_second_run_is_idempotent() {
     let before = count_before[0]
         .get_idx(0)
         .expect("count before must be Some");
-    let after = count_after[0]
-        .get_idx(0)
-        .expect("count after must be Some");
+    let after = count_after[0].get_idx(0).expect("count after must be Some");
     assert_eq!(
         before, after,
         "tracking table row count must be unchanged on idempotent run"
@@ -252,7 +250,10 @@ async fn pg_migration_dry_run_previews_without_applying() {
         .expect("dry_run");
     assert!(!plans.is_empty(), "expected at least one pending plan");
     assert!(
-        plans[0].statements.iter().any(|s| s.contains("pg_mig_users")),
+        plans[0]
+            .statements
+            .iter()
+            .any(|s| s.contains("pg_mig_users")),
         "plan must reference pg_mig_users: {:?}",
         plans[0].statements
     );

@@ -6,8 +6,19 @@ use std::str::FromStr;
 
 /// An IP address (IPv4 or IPv6).
 ///
-/// Maps to PostgreSQL `INET` type. Stores a single IP address without
-/// network prefix (use [`Cidr`](super::Cidr) for network addresses).
+/// Stores a single IP address without network prefix (use
+/// [`Cidr`](super::Cidr) for network addresses).
+///
+/// # Adapter support
+///
+/// - **PostgreSQL** — native `INET` type, round-trips losslessly.
+/// - **MySQL** — bound as `VARCHAR(45)` (enough for IPv6 in canonical
+///   form). Comparisons are textual.
+/// - **SQLite** — bound as `TEXT`.
+///
+/// The `Value::Inet` variant is gated on the `postgres` feature; on
+/// other adapters store as `String` and parse to `Inet` in your model
+/// layer if needed.
 ///
 /// # Examples
 ///
