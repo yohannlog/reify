@@ -1,5 +1,5 @@
 use super::select::SelectBuilder;
-use super::{BuildError, Dialect, trace_query};
+use super::{BuildError, trace_query};
 #[cfg(feature = "postgres")]
 use super::{rewrite_placeholders_pg, write_returning};
 use crate::column::Column;
@@ -10,7 +10,6 @@ use crate::table::Table;
 use crate::value::Value;
 use std::fmt::Write;
 use std::marker::PhantomData;
-use tracing::debug;
 
 /// Soft-delete mode for delete operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +36,7 @@ enum SoftDeleteMode {
 /// // DELETE FROM users WHERE id = ?
 /// ```
 #[derive(Clone)]
+#[must_use = "DeleteBuilder is lazy; chain `.build()` or `.execute(&db)` to run the DELETE"]
 pub struct DeleteBuilder<M: Table> {
     conditions: Vec<Condition>,
     unfiltered: bool,
@@ -152,6 +152,7 @@ impl<M: Table> DeleteBuilder<M> {
     /// DELETE/UPDATE without a WHERE clause is forbidden to prevent accidental
     /// full-table operations. Use [`try_build`](Self::try_build) for a
     /// non-panicking alternative.
+    #[must_use]
     pub fn build(&self) -> (String, Vec<Value>) {
         self.try_build()
             .expect("DELETE without WHERE is forbidden. Use .filter() or .unfiltered() explicitly.")
@@ -209,7 +210,12 @@ impl<M: Table> DeleteBuilder<M> {
 
         if let Some(col) = soft_delete_col {
             // Soft delete: UPDATE table SET col = CURRENT_TIMESTAMP WHERE ...
-            let _ = write!(sql, "UPDATE {} SET {} = CURRENT_TIMESTAMP", qi(M::table_name()), qi(col));
+            let _ = write!(
+                sql,
+                "UPDATE {} SET {} = CURRENT_TIMESTAMP",
+                qi(M::table_name()),
+                qi(col)
+            );
         } else {
             // Hard delete: DELETE FROM table WHERE ...
             let _ = write!(sql, "DELETE FROM {}", qi(M::table_name()));
@@ -229,13 +235,17 @@ impl<M: Table> DeleteBuilder<M> {
         }
 
         #[cfg(feature = "postgres18")]
-        if soft_delete_col.is_none() {
-            if let Some(mode) = self.returning_old_new {
-                super::write_returning_old_new(&mut sql, mode, M::table_name());
-            }
+        if soft_delete_col.is_none()
+            && let Some(mode) = self.returning_old_new
+        {
+            super::write_returning_old_new(&mut sql, mode, M::table_name());
         }
 
-        let op = if soft_delete_col.is_some() { "soft_delete" } else { "delete" };
+        let op = if soft_delete_col.is_some() {
+            "soft_delete"
+        } else {
+            "delete"
+        };
         trace_query(op, M::table_name(), &sql, &params);
         Ok((sql, params))
     }

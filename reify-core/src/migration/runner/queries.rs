@@ -1,5 +1,7 @@
 use super::MigrationRunner;
-use super::entries::{create_tracking_table_sql, select_checksums_sql, select_timestamps_sql, select_versions_sql};
+use super::entries::{
+    create_tracking_table_sql, select_checksums_sql, select_timestamps_sql, select_versions_sql,
+};
 use crate::db::Database;
 use crate::migration::diff::{DbColumnInfo, normalize_sql_type};
 use crate::migration::error::MigrationError;
@@ -16,8 +18,7 @@ impl MigrationRunner {
         db: &impl Database,
         dialect: Dialect,
     ) -> Result<(), MigrationError> {
-        db.execute(create_tracking_table_sql(dialect), &[])
-            .await?;
+        db.execute(create_tracking_table_sql(dialect), &[]).await?;
         Ok(())
     }
 
@@ -32,14 +33,13 @@ impl MigrationRunner {
     }
 
     /// Fetch the set of already-applied migration versions.
+    #[allow(dead_code)] // logical pair with `applied_checksums`; kept for symmetry / future use
     pub(super) async fn applied_versions(
         &self,
         db: &impl Database,
         dialect: Dialect,
     ) -> Result<HashSet<String>, MigrationError> {
-        let rows = db
-            .query(&select_versions_sql(dialect), &[])
-            .await?;
+        let rows = db.query(&select_versions_sql(dialect), &[]).await?;
         let versions = rows
             .into_iter()
             .filter_map(|r| r.get_string("version"))
@@ -55,9 +55,7 @@ impl MigrationRunner {
         db: &impl Database,
         dialect: Dialect,
     ) -> Result<HashMap<String, String>, MigrationError> {
-        let rows = db
-            .query(&select_checksums_sql(dialect), &[])
-            .await?;
+        let rows = db.query(&select_checksums_sql(dialect), &[]).await?;
         let map = rows
             .into_iter()
             .filter_map(|r| {
@@ -77,9 +75,7 @@ impl MigrationRunner {
         db: &impl Database,
         dialect: Dialect,
     ) -> Result<HashMap<String, String>, MigrationError> {
-        let rows = db
-            .query(&select_timestamps_sql(dialect), &[])
-            .await?;
+        let rows = db.query(&select_timestamps_sql(dialect), &[]).await?;
         let map = rows
             .into_iter()
             .filter_map(|r| {
@@ -103,7 +99,10 @@ impl MigrationRunner {
     ) -> Result<Option<Vec<DbColumnInfo>>, MigrationError> {
         match dialect {
             Dialect::Sqlite => self.existing_column_details_sqlite(db, table).await,
-            _ => self.existing_column_details_information_schema(db, table, dialect).await,
+            _ => {
+                self.existing_column_details_information_schema(db, table, dialect)
+                    .await
+            }
         }
     }
 
@@ -147,10 +146,7 @@ impl MigrationRunner {
                 let name = r.get_string("name")?;
                 let data_type = r.get_string("type").map(|s| normalize_sql_type(&s))?;
                 // notnull = 1 means NOT NULL, so is_nullable = (notnull == 0)
-                let is_nullable = r
-                    .get_string("notnull")
-                    .map(|s| s == "0")
-                    .unwrap_or(true);
+                let is_nullable = r.get_string("notnull").map(|s| s == "0").unwrap_or(true);
                 let column_default = r.get_string("dflt_value");
                 let is_unique = unique_cols.contains(&name);
                 Some(DbColumnInfo {
@@ -249,7 +245,8 @@ impl MigrationRunner {
         table: &str,
     ) -> Result<Option<Vec<DbColumnInfo>>, MigrationError> {
         let dialect = self.resolve_dialect(db);
-        self.existing_column_details_with_dialect(db, table, dialect).await
+        self.existing_column_details_with_dialect(db, table, dialect)
+            .await
     }
 
     /// Fetch existing column names for a table from the DB.

@@ -15,6 +15,7 @@ use reify::{
 // ── MockDb ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
+#[allow(clippy::type_complexity)] // test scaffolding, expressive shape > alias
 struct MockDb {
     executed: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
     query_results: Arc<Mutex<Vec<Vec<Row>>>>,
@@ -76,6 +77,7 @@ impl Database for MockDb {
         Err(DbError::Query("no rows".into()))
     }
 
+    #[allow(clippy::manual_async_fn)] // matches the trait signature (+ Send)
     fn transaction<'a>(
         &'a self,
         f: TransactionFn<'a>,
@@ -217,12 +219,32 @@ async fn runner_emits_add_column_for_new_fields() {
     // existing_column_details: users table exists but missing "role"
     db.push_rows(vec![
         Row::new(
-            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-            vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
+            vec![
+                "column_name".into(),
+                "data_type".into(),
+                "is_nullable".into(),
+                "column_default".into(),
+            ],
+            vec![
+                Value::String("id".into()),
+                Value::String("bigint".into()),
+                Value::String("NO".into()),
+                Value::Null,
+            ],
         ),
         Row::new(
-            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-            vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+            vec![
+                "column_name".into(),
+                "data_type".into(),
+                "is_nullable".into(),
+                "column_default".into(),
+            ],
+            vec![
+                Value::String("email".into()),
+                Value::String("text".into()),
+                Value::String("NO".into()),
+                Value::Null,
+            ],
         ),
     ]);
     db.push_rows(vec![]); // unique constraints query
@@ -248,16 +270,46 @@ async fn runner_skips_table_when_all_columns_present() {
     // existing_column_details: all columns present
     db.push_rows(vec![
         Row::new(
-            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-            vec![Value::String("id".into()), Value::String("bigint".into()), Value::String("NO".into()), Value::Null],
+            vec![
+                "column_name".into(),
+                "data_type".into(),
+                "is_nullable".into(),
+                "column_default".into(),
+            ],
+            vec![
+                Value::String("id".into()),
+                Value::String("bigint".into()),
+                Value::String("NO".into()),
+                Value::Null,
+            ],
         ),
         Row::new(
-            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-            vec![Value::String("email".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+            vec![
+                "column_name".into(),
+                "data_type".into(),
+                "is_nullable".into(),
+                "column_default".into(),
+            ],
+            vec![
+                Value::String("email".into()),
+                Value::String("text".into()),
+                Value::String("NO".into()),
+                Value::Null,
+            ],
         ),
         Row::new(
-            vec!["column_name".into(), "data_type".into(), "is_nullable".into(), "column_default".into()],
-            vec![Value::String("role".into()), Value::String("text".into()), Value::String("NO".into()), Value::Null],
+            vec![
+                "column_name".into(),
+                "data_type".into(),
+                "is_nullable".into(),
+                "column_default".into(),
+            ],
+            vec![
+                Value::String("role".into()),
+                Value::String("text".into()),
+                Value::String("NO".into()),
+                Value::Null,
+            ],
         ),
     ]);
     db.push_rows(vec![]); // unique constraints query

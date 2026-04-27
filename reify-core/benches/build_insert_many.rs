@@ -1,8 +1,9 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use reify_core::InsertManyBuilder;
 use reify_core::schema::{ColumnDef, IndexDef};
 use reify_core::table::Table;
 use reify_core::value::Value;
+use std::hint::black_box;
 
 struct BenchRow {
     id: i64,
@@ -46,7 +47,7 @@ fn make_row(i: usize) -> BenchRow {
         name: format!("user_{i}"),
         email: format!("user_{i}@example.com"),
         score: (i % 100) as i32,
-        active: i % 2 == 0,
+        active: i.is_multiple_of(2),
     }
 }
 

@@ -3,6 +3,7 @@ use crate::ident::qi;
 /// Context passed to `Migration::up` and `Migration::down`.
 ///
 /// Collects SQL statements to be executed (or previewed in dry-run mode).
+#[derive(Default)]
 pub struct MigrationContext {
     /// Accumulated SQL statements in execution order.
     statements: Vec<String>,
@@ -11,9 +12,7 @@ pub struct MigrationContext {
 impl MigrationContext {
     /// Create a new, empty migration context.
     pub fn new() -> Self {
-        Self {
-            statements: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Return the accumulated SQL statements.

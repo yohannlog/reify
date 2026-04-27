@@ -1,9 +1,11 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use reify_core::db::{DbError, FromRow, Row};
 use reify_core::value::Value;
+use std::hint::black_box;
 
 // ── Row5 — 5 columns ────────────────────────────────────────────────
 
+#[allow(dead_code)] // bench scaffolding — fields exist to make Row5 a realistic struct shape
 struct Row5 {
     col_0: i64,
     col_1: String,
@@ -41,6 +43,7 @@ impl FromRow for Row5 {
 
 // ── Row20 — 20 columns ───────────────────────────────────────────────
 
+#[allow(dead_code)] // bench scaffolding: fields populated for realistic FromRow workload
 struct Row20 {
     col_0: i64,
     col_1: String,
@@ -109,6 +112,7 @@ impl FromRow for Row20 {
 
 // ── Row50 — 50 columns ───────────────────────────────────────────────
 
+#[allow(dead_code)] // bench scaffolding: fields populated for realistic FromRow workload
 struct Row50 {
     col_0: i64,
     col_1: String,

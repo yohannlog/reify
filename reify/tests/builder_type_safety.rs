@@ -51,3 +51,27 @@ fn immutable_table_no_delete_fails_to_compile() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/immutable_no_delete.rs");
 }
+
+#[test]
+fn primary_key_on_option_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/primary_key_on_option.rs");
+}
+
+#[test]
+fn duplicate_column_attribute_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/duplicate_column_attr.rs");
+}
+
+#[test]
+fn dto_skip_unknown_field_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/dto_skip_unknown_field.rs");
+}
+
+#[test]
+fn missing_table_name_attr_fails_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/missing_table_name.rs");
+}

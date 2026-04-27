@@ -1,0 +1,6 @@
+error: `#[column(primary_key)]` cannot be applied to an `Option<T>` field; primary keys must be NOT NULL. Drop the `Option` or remove `primary_key`.
+  --> tests/compile_fail/primary_key_on_option.rs:10:5
+   |
+10 | /     #[column(primary_key)]
+11 | |     pub id: Option<i64>, // ERROR: primary keys must be NOT NULL
+   | |_______________________^

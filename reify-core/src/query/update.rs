@@ -1,4 +1,4 @@
-use super::{BuildError, Dialect, trace_query};
+use super::{BuildError, trace_query};
 #[cfg(feature = "postgres")]
 use super::{rewrite_placeholders_pg, write_returning};
 use crate::column::Column;
@@ -9,7 +9,6 @@ use crate::table::Table;
 use crate::value::{IntoValue, Value};
 use std::fmt::Write;
 use std::marker::PhantomData;
-use tracing::debug;
 
 // ── SetExpr — assignment RHS ─────────────────────────────────────────
 
@@ -48,6 +47,7 @@ enum SetExpr {
 /// // UPDATE users SET active = ? WHERE id = ?
 /// ```
 #[derive(Clone)]
+#[must_use = "UpdateBuilder is lazy; chain `.build()` or `.execute(&db)` to run the UPDATE"]
 pub struct UpdateBuilder<M: Table> {
     sets: Vec<(&'static str, SetExpr)>,
     conditions: Vec<Condition>,
@@ -212,6 +212,7 @@ impl<M: Table> UpdateBuilder<M> {
     /// `UPDATE` without a `WHERE` clause is forbidden to prevent accidental
     /// full-table updates. Use [`try_build`](Self::try_build) for a
     /// non-panicking alternative.
+    #[must_use]
     pub fn build(&self) -> (String, Vec<Value>) {
         self.try_build()
             .expect("UPDATE without WHERE is forbidden. Use .filter() or .unfiltered() explicitly.")

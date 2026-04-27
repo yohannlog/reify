@@ -1,6 +1,3 @@
-use super::context::MigrationContext;
-use super::traits::Migration;
-
 /// Convert a `snake_case` string to `PascalCase`.
 fn to_pascal_case(s: &str) -> String {
     s.split('_')

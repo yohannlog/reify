@@ -9,6 +9,9 @@ use reify::{IndexKind, Schema, SortDirection, Table, TableSchema};
 // Both can coexist on the same table.
 
 #[derive(Table, Debug, Clone)]
+// `clippy::duplicated_attributes` false-positives on the repeated
+// `unique` token across distinct `index(...)` entries below.
+#[allow(clippy::duplicated_attributes)]
 #[table(
     name = "orders",
     // Composite index on (user_id ASC, created_at DESC) — for queries like

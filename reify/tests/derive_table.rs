@@ -225,7 +225,7 @@ fn update_build() {
 #[test]
 #[should_panic(expected = "UPDATE without WHERE is forbidden")]
 fn update_without_where_panics() {
-    User::update().set(User::role, "admin").build();
+    let _ = User::update().set(User::role, "admin").build();
 }
 
 #[cfg(feature = "postgres")]
@@ -255,7 +255,7 @@ fn delete_build() {
 #[test]
 #[should_panic(expected = "DELETE without WHERE is forbidden")]
 fn delete_without_where_panics() {
-    User::delete().build();
+    let _ = User::delete().build();
 }
 
 #[cfg(feature = "postgres")]

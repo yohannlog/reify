@@ -32,7 +32,16 @@ use reify_core::value::Value;
 /// PostgreSQL database backed by a `deadpool-postgres` connection pool.
 pub struct PostgresDb {
     pool: Pool,
+    /// Maximum time to wait for a free connection in [`get_conn`]. Pre-fix,
+    /// pool exhaustion (e.g. a long-lived `query_stream` that doesn't drain)
+    /// froze every subsequent query indefinitely with no observable error.
+    /// With this guard a stalled pool surfaces as `DbError::Connection`
+    /// after the configured deadline so callers can fail fast.
+    acquire_timeout: std::time::Duration,
 }
+
+/// Default upper bound for [`PostgresDb::with_acquire_timeout`] (30 s).
+pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl PostgresDb {
     /// Connect to a PostgreSQL database using a [`deadpool_postgres::Config`].
@@ -68,12 +77,67 @@ impl PostgresDb {
             .create_pool(Some(Runtime::Tokio1), tls)
             .map_err(|e| DbError::Connection(e.to_string()))?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+        })
     }
 
     /// Build a `PostgresDb` from an already-constructed `deadpool_postgres::Pool`.
     pub fn from_pool(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+        }
+    }
+
+    /// Override the maximum time spent waiting for a pooled connection.
+    ///
+    /// Defaults to [`DEFAULT_ACQUIRE_TIMEOUT`] (30 s). A `Duration::ZERO` is
+    /// rejected by `tokio::time::timeout` (it always yields `Err`); use a
+    /// very small duration like `Duration::from_millis(1)` to effectively
+    /// disable waiting.
+    pub fn with_acquire_timeout(mut self, dur: std::time::Duration) -> Self {
+        self.acquire_timeout = dur;
+        self
+    }
+
+    /// Currently-configured pool acquisition timeout.
+    pub fn acquire_timeout(&self) -> std::time::Duration {
+        self.acquire_timeout
+    }
+
+    /// Like [`Database::query_stream`] but every `next().await` is bounded
+    /// by an inter-row idle timeout.
+    ///
+    /// If no row arrives within `idle`, a single
+    /// [`reify_core::db::DbError::Timeout`] is yielded
+    /// and the stream ends. Dropping the returned stream cancels the
+    /// underlying cursor and returns the connection to the pool.
+    ///
+    /// Use this when streaming to a slow / external consumer (HTTP client,
+    /// network bridge, …) to bound how long the connection stays out of
+    /// the pool when the consumer stalls.
+    ///
+    /// ```ignore
+    /// let mut stream = db
+    ///     .query_stream_idle(sql, params, std::time::Duration::from_secs(5))
+    ///     .await?;
+    /// while let Some(row) = stream.next().await {
+    ///     match row {
+    ///         Ok(r)  => /* … */,
+    ///         Err(e) => /* timeout or driver error — break and drop */,
+    ///     }
+    /// }
+    /// ```
+    pub async fn query_stream_idle<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+        idle: std::time::Duration,
+    ) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
+        let inner = <Self as Database>::query_stream(self, sql, params).await?;
+        Ok(reify_core::db::with_idle_timeout(inner, idle))
     }
 }
 
@@ -95,6 +159,22 @@ impl PgToSql for PgValue<'_> {
             Value::I16(v) => v.to_sql(ty, out),
             Value::I32(v) => v.to_sql(ty, out),
             Value::I64(v) => v.to_sql(ty, out),
+            Value::U64(v) => {
+                // PostgreSQL has no native u64 type. Bind as i64 (BIGINT)
+                // when the value fits; refuse otherwise rather than
+                // silently truncating.
+                let signed = i64::try_from(*v).map_err(|_| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Value::U64({v}) exceeds i64::MAX and PostgreSQL has no \
+                             native u64 type; bind as NUMERIC via to_string() or use a \
+                             smaller value"
+                        ),
+                    )) as Box<dyn std::error::Error + Sync + Send>
+                })?;
+                signed.to_sql(ty, out)
+            }
             Value::F32(v) => {
                 use tokio_postgres::types::Type;
                 if *ty == Type::FLOAT4 {
@@ -111,6 +191,27 @@ impl PgToSql for PgValue<'_> {
             Value::Timestamp(v) => v.to_sql(ty, out),
             Value::Date(v) => v.to_sql(ty, out),
             Value::Time(v) => v.to_sql(ty, out),
+            Value::Duration(d) => {
+                // PostgreSQL `INTERVAL` binary format: i64 microseconds,
+                // i32 days, i32 months. A `chrono::Duration` carries no
+                // calendar component, so days and months are zero —
+                // PostgreSQL normalises microseconds into days as needed.
+                use bytes::BufMut;
+                let micros = d.num_microseconds().ok_or_else(|| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Value::Duration({d:?}) is too large to fit in PostgreSQL \
+                             INTERVAL microseconds (i64); the chrono::Duration exceeds \
+                             ~292 000 years"
+                        ),
+                    )) as Box<dyn std::error::Error + Sync + Send>
+                })?;
+                out.put_i64(micros);
+                out.put_i32(0);
+                out.put_i32(0);
+                Ok(tokio_postgres::types::IsNull::No)
+            }
             Value::Jsonb(v) => serde_json::to_value(v)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Sync + Send>)?
                 .to_sql(ty, out),
@@ -335,6 +436,34 @@ fn pg_row_to_row(row: &tokio_postgres::Row) -> Result<Row, DbError> {
     Ok(Row::new(columns, values))
 }
 
+/// Log a wire-format / decode failure for a PG range column.
+///
+/// Pre-fix, both `Ok(None)` (genuine NULL) and `Err(...)` (decode failure)
+/// silently mapped to `Value::Null`, hiding data-integrity issues.
+/// Now we surface decode errors at `warn` so operators can distinguish
+/// real NULLs from corruption or column-type drift.
+fn log_range_decode_err(
+    row: &tokio_postgres::Row,
+    idx: usize,
+    pg_type: &str,
+    e: &impl std::fmt::Display,
+) {
+    let column = row
+        .columns()
+        .get(idx)
+        .map(|c| c.name())
+        .unwrap_or("<unknown>");
+    tracing::warn!(
+        target: "reify::postgres",
+        column = %column,
+        column_idx = idx,
+        pg_type = pg_type,
+        error = %e,
+        "Failed to decode PG range column; returning Value::Null. Possible \
+         causes: corrupt wire format, column-type drift, or driver mismatch."
+    );
+}
+
 fn pg_column_to_value(
     row: &tokio_postgres::Row,
     idx: usize,
@@ -422,6 +551,7 @@ fn pg_column_to_value(
             .map(Value::Jsonb)
             .unwrap_or(Value::Null),
         Type::INT4_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(None) => Value::Null,
             Ok(Some(raw)) => {
                 let r = range_from_pg(raw, |b| {
                     use bytes::Buf;
@@ -433,9 +563,13 @@ fn pg_column_to_value(
                 })?;
                 Value::Int4Range(r)
             }
-            _ => Value::Null,
+            Err(e) => {
+                log_range_decode_err(row, idx, "int4range", &e);
+                Value::Null
+            }
         },
         Type::INT8_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(None) => Value::Null,
             Ok(Some(raw)) => {
                 let r = range_from_pg(raw, |b| {
                     use bytes::Buf;
@@ -447,34 +581,49 @@ fn pg_column_to_value(
                 })?;
                 Value::Int8Range(r)
             }
-            _ => Value::Null,
+            Err(e) => {
+                log_range_decode_err(row, idx, "int8range", &e);
+                Value::Null
+            }
         },
         Type::TS_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(None) => Value::Null,
             Ok(Some(raw)) => {
                 let r = range_from_pg(raw, |b| {
                     postgres_types::FromSql::from_sql(&Type::TIMESTAMP, b).ok()
                 })?;
                 Value::TsRange(r)
             }
-            _ => Value::Null,
+            Err(e) => {
+                log_range_decode_err(row, idx, "tsrange", &e);
+                Value::Null
+            }
         },
         Type::TSTZ_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(None) => Value::Null,
             Ok(Some(raw)) => {
                 let r = range_from_pg(raw, |b| {
                     postgres_types::FromSql::from_sql(&Type::TIMESTAMPTZ, b).ok()
                 })?;
                 Value::TstzRange(r)
             }
-            _ => Value::Null,
+            Err(e) => {
+                log_range_decode_err(row, idx, "tstzrange", &e);
+                Value::Null
+            }
         },
         Type::DATE_RANGE => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(None) => Value::Null,
             Ok(Some(raw)) => {
                 let r = range_from_pg(raw, |b| {
                     postgres_types::FromSql::from_sql(&Type::DATE, b).ok()
                 })?;
                 Value::DateRange(r)
             }
-            _ => Value::Null,
+            Err(e) => {
+                log_range_decode_err(row, idx, "daterange", &e);
+                Value::Null
+            }
         },
         Type::BOOL_ARRAY => row
             .try_get::<_, Option<Vec<bool>>>(idx)
@@ -609,11 +758,26 @@ pub(crate) fn pg_err(e: tokio_postgres::Error) -> DbError {
     DbError::Query(e.to_string())
 }
 
-/// Acquire a pooled connection, mapping pool errors to `DbError`.
-pub(crate) async fn get_conn(pool: &Pool) -> Result<deadpool_postgres::Object, DbError> {
-    pool.get()
-        .await
-        .map_err(|e| DbError::Connection(e.to_string()))
+/// Acquire a pooled connection, mapping pool errors to `DbError` and
+/// bounding the wait by `acquire_timeout`.
+///
+/// Pre-fix this just delegated to `pool.get().await` with no timeout, so a
+/// stalled pool (e.g. all connections held by un-drained `query_stream`s)
+/// froze callers indefinitely. The timeout converts pool exhaustion into
+/// an observable `DbError::Connection`.
+pub(crate) async fn get_conn(
+    pool: &Pool,
+    acquire_timeout: std::time::Duration,
+) -> Result<deadpool_postgres::Object, DbError> {
+    match tokio::time::timeout(acquire_timeout, pool.get()).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(DbError::Connection(e.to_string())),
+        Err(_) => Err(DbError::Connection(format!(
+            "pool acquisition timed out after {}ms; check for streams or \
+             transactions holding connections",
+            acquire_timeout.as_millis()
+        ))),
+    }
 }
 
 /// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params.
@@ -690,12 +854,12 @@ async fn pg_query_one(
 
 impl Database for PostgresDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-        let conn = get_conn(&self.pool).await?;
+        let conn = get_conn(&self.pool, self.acquire_timeout).await?;
         pg_execute(&conn, sql, params).await
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
-        let conn = get_conn(&self.pool).await?;
+        let conn = get_conn(&self.pool, self.acquire_timeout).await?;
         pg_query(&conn, sql, params).await
     }
 
@@ -720,7 +884,7 @@ impl Database for PostgresDb {
         sql: String,
         params: Vec<Value>,
     ) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
-        let conn = get_conn(&self.pool).await?;
+        let conn = get_conn(&self.pool, self.acquire_timeout).await?;
         let sql = rewrite_placeholders_pg(&sql);
         let pg_params: Vec<PgValue> = params.iter().map(PgValue).collect();
         let param_refs: Vec<&(dyn PgToSql + Sync)> = pg_params
@@ -734,29 +898,28 @@ impl Database for PostgresDb {
         let stream =
             futures_util::stream::unfold((row_stream, conn), |(mut row_stream, conn)| async move {
                 use futures_util::StreamExt;
-                match row_stream.next().await {
-                    Some(res) => Some((
+                row_stream.next().await.map(|res| {
+                    (
                         match res {
                             Ok(r) => pg_row_to_row(&r),
                             Err(e) => Err(pg_err(e)),
                         },
                         (row_stream, conn),
-                    )),
-                    None => None,
-                }
+                    )
+                })
             });
 
         Ok(Box::pin(stream))
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
-        let conn = get_conn(&self.pool).await?;
+        let conn = get_conn(&self.pool, self.acquire_timeout).await?;
         pg_query_one(&conn, sql, params).await
     }
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         debug!(target: "reify::postgres", "BEGIN transaction");
-        let conn = get_conn(&self.pool).await?;
+        let conn = get_conn(&self.pool, self.acquire_timeout).await?;
         conn.execute("BEGIN", &[]).await.map_err(pg_err)?;
 
         let txn = PgTransaction {
@@ -843,15 +1006,11 @@ mod copy;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reify_core::range::Range;
-    use reify_core::value::Value;
 
     #[test]
     fn test_range_from_pg_corrupt_data() {
         let corrupt_raw = &[];
-        let result = range_from_pg(corrupt_raw, |b| {
-            if b.len() == 4 { Some(0) } else { None }
-        });
+        let result = range_from_pg(corrupt_raw, |b| if b.len() == 4 { Some(0) } else { None });
 
         assert!(matches!(result, Err(DbError::Conversion(_))));
     }
@@ -860,12 +1019,28 @@ mod tests {
     fn test_range_from_pg_element_decode_failure() {
         let valid_envelope_but_parse_fail = &[
             0x01 | 0x02 | 0x04,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
+            0x00,
+            0x00,
+            0x00,
+            0x04,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x04,
+            0x00,
+            0x00,
+            0x00,
+            0x02,
         ];
 
         let result = range_from_pg::<i32, _>(valid_envelope_but_parse_fail, |_| None);
 
-        assert!(matches!(result, Err(DbError::Conversion(msg)) if msg == "range element decode failed"));
+        assert!(
+            matches!(result, Err(DbError::Conversion(msg)) if msg == "range element decode failed")
+        );
     }
 }

@@ -162,8 +162,8 @@ pub fn normalize_sql_type(raw: &str) -> String {
         None => (lower.as_str(), None),
     };
     // Handle PostgreSQL array notation: "integer[]" or internal names like "_int4".
-    let base = if base.ends_with("[]") {
-        return format!("{}[]", normalize_sql_type(&base[..base.len() - 2]));
+    let base = if let Some(without_brackets) = base.strip_suffix("[]") {
+        return format!("{}[]", normalize_sql_type(without_brackets));
     } else if let Some(inner) = base.strip_prefix('_') {
         // PostgreSQL internal array prefix: _int4 → integer[]
         let inner_normalized = normalize_sql_type(inner);

@@ -17,7 +17,10 @@ pub struct User {
 
 #[derive(Table, Debug, Clone)]
 #[table(name = "orders")]
-pub struct Order_ {
+// Renamed from `Order_` to avoid the `non_camel_case_types` lint on the
+// macro-generated `Order_Dto` type (the trailing underscore was originally
+// added to dodge a name collision; `OrderRow` is the idiomatic fix).
+pub struct OrderRow {
     #[column(primary_key, auto_increment)]
     pub id: i64,
     pub user_id: i64,
@@ -257,7 +260,7 @@ fn main() {
     println!("\nMigrationRunner integration:");
     println!("  MigrationRunner::new()");
     println!("      .add_table::<User>()");
-    println!("      .add_table::<Order_>()");
+    println!("      .add_table::<OrderRow>()");
     println!("      .add_view::<ActiveUser>()          // macro view");
     println!("      .add_view::<AdminUser>()           // builder view");
     println!("      .add_view::<HighValueCustomer>()   // builder + raw_query");

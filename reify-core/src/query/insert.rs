@@ -26,14 +26,12 @@ impl std::fmt::Display for ParamLimitExceeded {
 
 impl std::error::Error for ParamLimitExceeded {}
 use crate::column::Column;
-use crate::condition::Condition;
 use crate::ident::qi;
-use crate::sql::{ToSql, write_joined};
+use crate::sql::write_joined;
 use crate::table::Table;
 use crate::value::Value;
 use std::fmt::Write;
 use std::marker::PhantomData;
-use tracing::debug;
 
 // ── InsertBuilder ───────────────────────────────────────────────────
 
@@ -49,6 +47,7 @@ use tracing::debug;
 ///     .build();
 /// // INSERT INTO users (name, email) VALUES (?, ?)
 /// ```
+#[must_use = "InsertBuilder is lazy; chain `.build()`, `.execute(&db)`, or another execution method to use it"]
 pub struct InsertBuilder<M: Table> {
     values: Vec<Value>,
     on_conflict: Option<OnConflict>,
@@ -130,6 +129,7 @@ impl<M: Table> InsertBuilder<M> {
 
     /// Build with the default (generic) dialect — no upsert extensions.
     #[allow(unused_mut)]
+    #[must_use]
     pub fn build(&self) -> (String, Vec<Value>) {
         self.build_with_dialect(Dialect::Generic)
     }
@@ -149,6 +149,7 @@ impl<M: Table> InsertBuilder<M> {
     ///
     /// If `#[table(sql_insert = "...")]` is set, uses that custom SQL instead.
     #[allow(unused_mut)]
+    #[must_use]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
         // Custom SQL override takes precedence
         if let Some(custom_sql) = M::sql_insert() {
@@ -234,6 +235,7 @@ impl<M: Table> InsertBuilder<M> {
 /// Builds a multi-row `INSERT INTO … VALUES (…), (…), …` statement.
 ///
 /// Obtain one via the generated `Model::insert_many(&[…])` method.
+#[must_use = "InsertManyBuilder is lazy; chain `.build()`, `.execute(&db)`, or another execution method to use it"]
 pub struct InsertManyBuilder<M: Table> {
     /// Flat list of all values: row0_col0, row0_col1, …, rowN_colM.
     rows: Vec<Vec<Value>>,
@@ -317,6 +319,7 @@ impl<M: Table> InsertManyBuilder<M> {
     }
 
     /// Build with the default (generic) dialect.
+    #[must_use]
     pub fn build(&self) -> (String, Vec<Value>) {
         self.build_with_dialect(Dialect::Generic)
     }
@@ -341,6 +344,7 @@ impl<M: Table> InsertManyBuilder<M> {
     /// recoverable error, or [`build_chunked`](Self::build_chunked) to split
     /// the statement automatically.
     #[allow(unused_mut)]
+    #[must_use]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
         self.try_build_with_dialect(dialect)
             .unwrap_or_else(|e| panic!("{e}"))
@@ -489,6 +493,7 @@ impl<M: Table> InsertManyBuilder<M> {
     ///     db.execute(sql, params).await?;
     /// }
     /// ```
+    #[must_use]
     pub fn build_chunked(&self, dialect: Dialect) -> Vec<(String, Vec<Value>)> {
         let chunk_size = self.rows_per_chunk(dialect);
         if chunk_size >= self.rows.len() {

@@ -39,7 +39,7 @@ pub fn make_row(i: usize) -> UserRow {
         name: format!("user_{i}"),
         email: format!("user_{i}@example.com"),
         score: (i as i32) % 100,
-        active: i % 2 == 0,
+        active: i.is_multiple_of(2),
     }
 }
 

@@ -1,0 +1,5 @@
+error: dto(skip = "nonexistent_field"): field `nonexistent_field` does not exist on `User`
+ --> tests/compile_fail/dto_skip_unknown_field.rs:8:36
+  |
+8 | #[table(name = "users", dto(skip = "id,nonexistent_field"))]
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^

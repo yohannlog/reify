@@ -9,7 +9,7 @@ repository = "https://github.com/yohann-catherine/reify"
 documentation = "https://docs.rs/reify-macros"
 keywords = ["orm", "database", "macro", "derive"]
 categories = ["database", "development-tools::procedural-macro-helpers"]
-rust-version = "1.85"
+rust-version.workspace = true
 
 [lib]
 proc-macro = true

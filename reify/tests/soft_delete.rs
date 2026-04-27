@@ -80,9 +80,7 @@ fn column_defs_include_soft_delete_flag() {
 
 #[test]
 fn select_auto_filters_deleted_rows() {
-    // Default: hide deleted rows
-    reify::soft_delete::set_show_deleted(false);
-
+    // Default: hide deleted rows (no global override possible).
     let (sql, params) = Article::find().build();
     assert!(
         sql.contains("WHERE \"deleted_at\" IS NULL"),
@@ -93,8 +91,6 @@ fn select_auto_filters_deleted_rows() {
 
 #[test]
 fn select_with_deleted_includes_all_rows() {
-    reify::soft_delete::set_show_deleted(false);
-
     let (sql, _) = Article::find().with_deleted().build();
     assert!(
         !sql.contains("deleted_at"),
@@ -104,8 +100,6 @@ fn select_with_deleted_includes_all_rows() {
 
 #[test]
 fn select_only_deleted_filters_to_deleted_rows() {
-    reify::soft_delete::set_show_deleted(false);
-
     let (sql, _) = Article::find().only_deleted().build();
     assert!(
         sql.contains("WHERE \"deleted_at\" IS NOT NULL"),
@@ -114,23 +108,7 @@ fn select_only_deleted_filters_to_deleted_rows() {
 }
 
 #[test]
-fn select_respects_global_show_deleted_true() {
-    reify::soft_delete::set_show_deleted(true);
-
-    let (sql, _) = Article::find().build();
-    assert!(
-        !sql.contains("deleted_at"),
-        "Global show_deleted=true should not filter: {sql}"
-    );
-
-    // Restore default
-    reify::soft_delete::set_show_deleted(false);
-}
-
-#[test]
 fn select_combines_soft_delete_with_user_filters() {
-    reify::soft_delete::set_show_deleted(false);
-
     let (sql, params) = Article::find().filter(Article::title.eq("Hello")).build();
 
     // Should have both soft delete filter AND user filter
@@ -209,23 +187,6 @@ fn is_soft_delete_returns_correct_value() {
 
     let regular_builder = Comment::delete().filter(Comment::id.eq(1i64));
     assert!(!regular_builder.is_soft_delete());
-}
-
-// ── Global config tests ─────────────────────────────────────────────
-
-#[test]
-fn global_config_get_set() {
-    // Save current state
-    let original = reify::soft_delete::show_deleted();
-
-    reify::soft_delete::set_show_deleted(true);
-    assert!(reify::soft_delete::show_deleted());
-
-    reify::soft_delete::set_show_deleted(false);
-    assert!(!reify::soft_delete::show_deleted());
-
-    // Restore
-    reify::soft_delete::set_show_deleted(original);
 }
 
 // ── Custom SQL tests (Hibernate-style @SQLDelete/@SQLUpdate/@SQLInsert) ──

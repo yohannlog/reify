@@ -1,0 +1,5 @@
+error: duplicate `#[column(primary_key)]` attribute on this field; each option may only appear once
+  --> tests/compile_fail/duplicate_column_attr.rs:10:27
+   |
+10 |     #[column(primary_key, primary_key)] // ERROR: duplicate `primary_key`
+   |                           ^^^^^^^^^^^

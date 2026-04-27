@@ -9,7 +9,7 @@ repository = "https://github.com/yohann-catherine/reify"
 documentation = "https://docs.rs/reify-postgres"
 keywords = ["orm", "postgresql", "database", "async"]
 categories = ["database", "asynchronous"]
-rust-version = "1.85"
+rust-version.workspace = true
 
 [dependencies]
 reify-core = { path = "../reify-core", version = "0.1.0", features = ["postgres"] }

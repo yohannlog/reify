@@ -5,7 +5,19 @@ use std::str::FromStr;
 
 /// A 2D point with `x` and `y` coordinates.
 ///
-/// Maps to PostgreSQL `POINT` type and MySQL `POINT` geometry type.
+/// # Adapter support
+///
+/// - **PostgreSQL** — native `POINT` type (two `float8` in network byte
+///   order), round-trips losslessly via the binary protocol.
+/// - **MySQL** — bound as a `POINT(x y)` WKT string; reads currently
+///   require explicit deserialisation (no auto-mapping from MySQL
+///   `POINT` geometry).
+/// - **SQLite** — bound as `TEXT` (no native geometry type).
+///
+/// The `Value::Point` variant is gated on the `postgres` feature; the
+/// MySQL adapter encodes via `ST_GeomFromText`-compatible text so a
+/// shared model can still bind a `Point` parameter when targeting
+/// MySQL, but the read path cannot reconstruct a `Point` automatically.
 ///
 /// # Examples
 ///
@@ -103,7 +115,10 @@ impl FromStr for Point {
 
         let parts: Vec<&str> = s.split(',').collect();
         if parts.len() != 2 {
-            return Err(ParsePointError(format!("expected 2 coordinates, got {}", parts.len())));
+            return Err(ParsePointError(format!(
+                "expected 2 coordinates, got {}",
+                parts.len()
+            )));
         }
 
         let x = parts[0]
@@ -174,7 +189,10 @@ mod tests {
     fn test_point_parse() {
         assert_eq!("(1.5,2.5)".parse::<Point>().unwrap(), Point::new(1.5, 2.5));
         assert_eq!("1.5,2.5".parse::<Point>().unwrap(), Point::new(1.5, 2.5));
-        assert_eq!("( 1.5 , 2.5 )".parse::<Point>().unwrap(), Point::new(1.5, 2.5));
+        assert_eq!(
+            "( 1.5 , 2.5 )".parse::<Point>().unwrap(),
+            Point::new(1.5, 2.5)
+        );
     }
 
     #[test]

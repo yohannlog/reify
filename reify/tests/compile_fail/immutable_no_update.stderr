@@ -10,9 +10,13 @@ error[E0599]: no function or associated item named `update` found for struct `Au
    = help: items from traits can only be used if the trait is implemented and in scope
    = note: the following traits define an item `update`, perhaps you need to implement one of them:
            candidate #1: `digest::Update`
-           candidate #2: `digest::digest::Digest`
-           candidate #3: `digest::digest::DynDigest`
-           candidate #4: `digest::mac::Mac`
+           candidate #2: `digest::Update`
+           candidate #3: `digest::digest::Digest`
+           candidate #4: `digest::digest::Digest`
+           candidate #5: `digest::digest::DynDigest`
+           candidate #6: `digest::digest::DynDigest`
+           candidate #7: `digest::mac::Mac`
+           candidate #8: `rustls::crypto::hash::Context`
 help: there is an associated function `sql_update` with a similar name
    |
 15 |     let _ = AuditLog::sql_update();

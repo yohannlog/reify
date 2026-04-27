@@ -83,12 +83,11 @@ async fn sqlite_has_many_join_returns_correct_rows() {
 
     // Build the JOIN SQL from the typed descriptor — no magic strings.
     let rel = User::posts();
-    let sql = format!(
-        "SELECT u.name, p.title FROM rel_users u \
+    let sql = "SELECT u.name, p.title FROM rel_users u \
          INNER JOIN rel_posts p ON u.id = p.user_id \
          WHERE u.id = ? \
-         ORDER BY p.id",
-    );
+         ORDER BY p.id"
+        .to_string();
     // The assert here is defensive: if the descriptor ever drifts to
     // the wrong columns, the compile-time `join_condition()` unit
     // test catches it, but we mirror the same columns below to

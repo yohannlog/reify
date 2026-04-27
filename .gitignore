@@ -198,3 +198,7 @@ Temporary Items
 .code-review-graph/
 .claude
 .agents
+
+# Stale local test/build output captures
+test_out.txt
+*.test_out

@@ -4,6 +4,45 @@ use reify_core::adapter::SavepointCounter;
 use reify_core::db::{Database, DbError, Row, TransactionFn};
 use reify_core::value::Value;
 
+// ── Self-deadlock detection ─────────────────────────────────────────
+//
+// The single rusqlite connection is shared between `SqliteDb` (the pool-
+// like outer handle) and `SqliteTransaction` (the in-transaction handle
+// passed to `transaction()` closures), with `txn_lock` held by
+// `transaction()` for the duration of the closure to keep other tasks
+// out. If user code mistakenly calls back into `SqliteDb::execute`
+// (etc.) from inside the closure on the same task, the call would
+// re-acquire `txn_lock` — which the task itself already holds — and
+// hang forever, with no error and no log.
+//
+// Setting this `task_local` for the duration of the closure lets the
+// outer methods detect the case and return a clear `DbError::Deadlock`
+// instead of freezing.
+tokio::task_local! {
+    static TX_GUARD: ();
+}
+
+/// Is a transaction active on the current task?
+///
+/// Returns `true` only when the current task is *itself* inside the
+/// `transaction()` scope on a `SqliteDb`. Other tasks running concurrently
+/// while another task holds the transaction will return `false` and hit
+/// the legitimate `txn_lock.lock().await` wait path.
+fn tx_active_on_current_task() -> bool {
+    TX_GUARD.try_with(|_| ()).is_ok()
+}
+
+/// Build the `DbError::Deadlock` message used by all `SqliteDb` methods
+/// when re-entered from inside their own transaction closure.
+fn self_deadlock_error(method: &str) -> DbError {
+    DbError::Deadlock(format!(
+        "called `SqliteDb::{method}` from inside an active `transaction()` closure on the \
+         same task; SQLite shares one connection between the outer handle and the \
+         transaction handle, so this would deadlock on the transaction lock. Use the \
+         `tx: &dyn DynDatabase` argument passed to your `transaction()` closure instead."
+    ))
+}
+
 // ── SqliteDb ────────────────────────────────────────────────────────
 
 /// SQLite database adapter backed by rusqlite.
@@ -173,10 +212,29 @@ fn value_to_sqlite(v: &Value) -> Result<rusqlite::types::Value, DbError> {
         Value::I16(i) => rusqlite::types::Value::Integer(*i as i64),
         Value::I32(i) => rusqlite::types::Value::Integer(*i as i64),
         Value::I64(i) => rusqlite::types::Value::Integer(*i),
+        // SQLite stores all integers as i64. u64 values that fit are bound
+        // as INTEGER; values exceeding i64::MAX are refused rather than
+        // silently truncated.
+        Value::U64(u) => match i64::try_from(*u) {
+            Ok(signed) => rusqlite::types::Value::Integer(signed),
+            Err(_) => {
+                return Err(DbError::Conversion(format!(
+                    "Value::U64({u}) exceeds i64::MAX and SQLite has no native \
+                     u64 type; bind as TEXT via to_string() or use a smaller value"
+                )));
+            }
+        },
         Value::F32(f) => rusqlite::types::Value::Real(*f as f64),
         Value::F64(f) => rusqlite::types::Value::Real(*f),
         Value::String(s) => rusqlite::types::Value::Text(s.clone()),
         Value::Bytes(b) => rusqlite::types::Value::Blob(b.clone()),
+        // SQLite has no native interval type. Bind as TEXT in MySQL's
+        // canonical [-]HHH:MM:SS[.ffffff] format so the value round-trips
+        // unambiguously across adapters.
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        Value::Duration(d) => {
+            rusqlite::types::Value::Text(reify_core::value::format_mysql_time(*d))
+        }
         // Any Value variant not handled above (e.g. temporal types from the
         // mysql/postgres feature, or PostgreSQL-only types like Uuid, Jsonb,
         // range and array types) cannot be bound to SQLite. Return a
@@ -351,6 +409,9 @@ fn sqlite_query_one(
 
 impl Database for SqliteDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        if tx_active_on_current_task() {
+            return Err(self_deadlock_error("execute"));
+        }
         let params = values_to_sqlite(params)?;
         let _guard = self.txn_lock.lock().await;
         let conn = Arc::clone(&self.conn);
@@ -359,6 +420,9 @@ impl Database for SqliteDb {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        if tx_active_on_current_task() {
+            return Err(self_deadlock_error("query"));
+        }
         let params = values_to_sqlite(params)?;
         let _guard = self.txn_lock.lock().await;
         let conn = Arc::clone(&self.conn);
@@ -367,6 +431,9 @@ impl Database for SqliteDb {
     }
 
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
+        if tx_active_on_current_task() {
+            return Err(self_deadlock_error("query_one"));
+        }
         let params = values_to_sqlite(params)?;
         let _guard = self.txn_lock.lock().await;
         let conn = Arc::clone(&self.conn);
@@ -375,6 +442,14 @@ impl Database for SqliteDb {
     }
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
+        // Re-entering `transaction()` on the same task would attempt to
+        // re-acquire `txn_lock` and deadlock. Surface the misuse instead.
+        // Inside an existing transaction, callers should chain
+        // `tx.transaction(...)` (which uses SAVEPOINTs) instead.
+        if tx_active_on_current_task() {
+            return Err(self_deadlock_error("transaction"));
+        }
+
         // Hold the transaction lock for the entire duration, preventing
         // other tasks from issuing queries that would interleave with
         // this transaction.
@@ -387,7 +462,12 @@ impl Database for SqliteDb {
             savepoint_counter: SavepointCounter::new(),
         };
 
-        match f(&txn).await {
+        // Run the user closure inside the `TX_GUARD` task-local scope so
+        // any accidental call back into `self.execute()` etc. on the same
+        // task is detected and returns `DbError::Deadlock`.
+        let result = TX_GUARD.scope((), f(&txn)).await;
+
+        match result {
             Ok(()) => sqlite_spawn(Arc::clone(&txn.conn), |c| sqlite_execute(c, "COMMIT", &[]))
                 .await
                 .map(|_| ()),
@@ -471,5 +551,154 @@ impl Database for SqliteTransaction {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tx_deadlock_tests {
+    //! `SqliteDb` and `SqliteTransaction` share a single rusqlite connection
+    //! guarded by `txn_lock`. Pre-fix, calling back into `SqliteDb::execute`
+    //! from inside a `transaction()` closure on the same task froze
+    //! indefinitely (the task was blocked on a lock it was already holding,
+    //! with no error and no log). The `TX_GUARD` task-local turns the
+    //! footgun into an explicit `DbError::Deadlock` at the entry point.
+    //!
+    //! Tests use a short `tokio::time::timeout` so a regression hangs the
+    //! test runner for at most a second instead of forever.
+    use super::*;
+    use std::time::Duration;
+
+    fn db() -> SqliteDb {
+        SqliteDb::open_in_memory().expect("open in-memory")
+    }
+
+    #[tokio::test]
+    async fn execute_inside_transaction_returns_deadlock_error() {
+        let db = Arc::new(db());
+        let db_inner = Arc::clone(&db);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            db.transaction(Box::new(move |_tx| {
+                Box::pin(async move {
+                    // Forwarding the error unchanged: the outer assertion
+                    // matches on `DbError::Deadlock(_)` so we just propagate.
+                    db_inner.execute("SELECT 1", &[]).await.map(|_| ())
+                })
+            })),
+        )
+        .await
+        .expect("timeout — deadlock detection regressed");
+
+        assert!(
+            matches!(result, Err(DbError::Deadlock(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_inside_transaction_returns_deadlock_error() {
+        let db = Arc::new(db());
+        let db_inner = Arc::clone(&db);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            db.transaction(Box::new(move |_tx| {
+                Box::pin(async move { db_inner.query("SELECT 1", &[]).await.map(|_| ()) })
+            })),
+        )
+        .await
+        .expect("timeout — deadlock detection regressed");
+
+        assert!(
+            matches!(result, Err(DbError::Deadlock(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_db_transaction_on_same_task_returns_deadlock() {
+        // Calling `db.transaction()` (not `tx.transaction()`) from inside
+        // an active transaction would re-acquire the same `txn_lock` and
+        // hang. Detect it.
+        let db = Arc::new(db());
+        let db_inner = Arc::clone(&db);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            db.transaction(Box::new(move |_tx| {
+                Box::pin(async move {
+                    db_inner
+                        .transaction(Box::new(|_inner_tx| Box::pin(async move { Ok(()) })))
+                        .await
+                })
+            })),
+        )
+        .await
+        .expect("timeout — deadlock detection regressed");
+
+        assert!(
+            matches!(result, Err(DbError::Deadlock(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn correct_use_via_tx_argument_still_works() {
+        // Sanity: the supported pattern (using the `tx` argument) is
+        // unaffected by the deadlock guard.
+        let db = db();
+
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            &[],
+        )
+        .await
+        .expect("create table");
+
+        db.transaction(Box::new(|tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO t (id, name) VALUES (?, ?)",
+                    &[Value::I64(1), Value::String("alice".into())],
+                )
+                .await?;
+                Ok(())
+            })
+        }))
+        .await
+        .expect("transaction");
+
+        let rows = db.query("SELECT id, name FROM t", &[]).await.expect("read");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_savepoint_via_tx_still_works() {
+        // `tx.transaction(...)` uses SAVEPOINT and must NOT hit the guard:
+        // it operates on `SqliteTransaction`, not `SqliteDb`.
+        let db = db();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+            .await
+            .expect("create");
+
+        db.transaction(Box::new(|tx| {
+            Box::pin(async move {
+                tx.execute("INSERT INTO t (id) VALUES (1)", &[]).await?;
+                tx.transaction(Box::new(|inner| {
+                    Box::pin(async move {
+                        inner.execute("INSERT INTO t (id) VALUES (2)", &[]).await?;
+                        Ok(())
+                    })
+                }))
+                .await?;
+                Ok(())
+            })
+        }))
+        .await
+        .expect("nested savepoint should commit");
+
+        let rows = db.query("SELECT id FROM t ORDER BY id", &[]).await.unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }

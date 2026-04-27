@@ -34,7 +34,7 @@ impl<M> Page<M> {
         let total_pages = if total_items == 0 {
             1
         } else {
-            (total_items + per_page - 1) / per_page
+            total_items.div_ceil(per_page)
         };
         Self {
             page,
@@ -418,6 +418,7 @@ fn encode_value(val: &Value) -> String {
         Value::I16(v) => format!("i16:{v}"),
         Value::I32(v) => format!("i32:{v}"),
         Value::I64(v) => format!("i64:{v}"),
+        Value::U64(v) => format!("u64:{v}"),
         Value::F32(v) => format!("f32:{v}"),
         Value::F64(v) => format!("f64:{v}"),
         Value::String(s) => format!("str:{}", escape_cursor_str(s)),
@@ -432,6 +433,15 @@ fn encode_value(val: &Value) -> String {
         Value::Date(d) => format!("date:{d}"),
         #[cfg(any(feature = "postgres", feature = "mysql"))]
         Value::Time(t) => format!("time:{t}"),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        Value::Duration(d) => format!(
+            "dur:{}",
+            d.num_microseconds().unwrap_or(if d.num_seconds() >= 0 {
+                i64::MAX
+            } else {
+                i64::MIN
+            })
+        ),
         _ => "null:".to_string(),
     }
 }
@@ -449,6 +459,7 @@ fn decode_field(part: &str) -> Option<(String, Value)> {
         "i16" => Value::I16(raw.parse().ok()?),
         "i32" => Value::I32(raw.parse().ok()?),
         "i64" => Value::I64(raw.parse().ok()?),
+        "u64" => Value::U64(raw.parse().ok()?),
         "f32" => Value::F32(raw.parse().ok()?),
         "f64" => Value::F64(raw.parse().ok()?),
         "str" => Value::String(unescape_cursor_str(raw)),
@@ -467,6 +478,8 @@ fn decode_field(part: &str) -> Option<(String, Value)> {
         "date" => Value::Date(raw.parse().ok()?),
         #[cfg(any(feature = "postgres", feature = "mysql"))]
         "time" => Value::Time(raw.parse().ok()?),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        "dur" => Value::Duration(chrono::Duration::microseconds(raw.parse().ok()?)),
         _ => return None,
     };
     Some((col.to_string(), val))
@@ -477,7 +490,7 @@ fn decode_field(part: &str) -> Option<(String, Value)> {
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 fn base64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };

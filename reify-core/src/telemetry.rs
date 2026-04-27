@@ -148,20 +148,20 @@ impl QueryTimer {
         );
 
         // Slow-query warning
-        if let Some(threshold) = ReifyConfig::slow_query_threshold() {
-            if elapsed > threshold {
-                tracing::warn!(
-                    target: "reify.query",
-                    operation = self.operation,
-                    table = self.table,
-                    sql = %self.sql,
-                    params_count = self.params_count,
-                    rows,
-                    elapsed_ms,
-                    threshold_ms = threshold.as_millis(),
-                    "slow query detected"
-                );
-            }
+        if let Some(threshold) = ReifyConfig::slow_query_threshold()
+            && elapsed > threshold
+        {
+            tracing::warn!(
+                target: "reify.query",
+                operation = self.operation,
+                table = self.table,
+                sql = %self.sql,
+                params_count = self.params_count,
+                rows,
+                elapsed_ms,
+                threshold_ms = threshold.as_millis(),
+                "slow query detected"
+            );
         }
 
         // Optional metrics

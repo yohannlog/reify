@@ -35,9 +35,13 @@ async fn pg_array_i64_round_trip() {
     .await
     .expect("insert array");
 
-    let rows = raw_query(&fx.db, "SELECT tags FROM pg_array_rows WHERE id = ?", &[Value::I64(1)])
-        .await
-        .expect("fetch array");
+    let rows = raw_query(
+        &fx.db,
+        "SELECT tags FROM pg_array_rows WHERE id = ?",
+        &[Value::I64(1)],
+    )
+    .await
+    .expect("fetch array");
     assert_eq!(rows.len(), 1);
     match rows[0].get_idx(0) {
         Some(Value::ArrayI64(v)) => assert_eq!(v, &values, "array must round-trip exactly"),
@@ -61,7 +65,11 @@ async fn pg_array_text_round_trip() {
     .await
     .expect("create");
 
-    let labels = vec!["rust".to_string(), "go".to_string(), "it's 'ok'".to_string()];
+    let labels = vec![
+        "rust".to_string(),
+        "go".to_string(),
+        "it's 'ok'".to_string(),
+    ];
     raw_execute(
         &fx.db,
         "INSERT INTO pg_array_text_rows (id, labels) VALUES (?, ?)",

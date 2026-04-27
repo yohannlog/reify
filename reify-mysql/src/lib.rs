@@ -35,7 +35,16 @@ use reify_core::value::Value;
 /// MySQL / MariaDB database backed by a `mysql_async` connection pool.
 pub struct MysqlDb {
     pool: Pool,
+    /// Maximum time to wait for a free connection. Pre-fix, pool exhaustion
+    /// (e.g. a long-lived `query_stream` that doesn't drain) froze every
+    /// subsequent query indefinitely with no observable error. With this
+    /// guard a stalled pool surfaces as `DbError::Connection` after the
+    /// configured deadline so callers can fail fast.
+    acquire_timeout: std::time::Duration,
 }
+
+/// Default upper bound for [`MysqlDb::with_acquire_timeout`] (30 s).
+pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl MysqlDb {
     /// Connect to a MySQL / MariaDB database using [`mysql_async::Opts`].
@@ -72,12 +81,67 @@ impl MysqlDb {
                 .await
                 .map_err(|e| DbError::Connection(e.to_string()))?,
         );
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+        })
     }
 
     /// Build a `MysqlDb` from an already-constructed `mysql_async::Pool`.
     pub fn from_pool(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+        }
+    }
+
+    /// Override the maximum time spent waiting for a pooled connection.
+    ///
+    /// Defaults to [`DEFAULT_ACQUIRE_TIMEOUT`] (30 s).
+    pub fn with_acquire_timeout(mut self, dur: std::time::Duration) -> Self {
+        self.acquire_timeout = dur;
+        self
+    }
+
+    /// Currently-configured pool acquisition timeout.
+    pub fn acquire_timeout(&self) -> std::time::Duration {
+        self.acquire_timeout
+    }
+
+    /// Acquire a pooled connection bounded by `acquire_timeout`. A stalled
+    /// pool surfaces as `DbError::Connection` after the deadline instead of
+    /// blocking the caller indefinitely.
+    async fn get_conn(&self) -> Result<mysql_async::Conn, DbError> {
+        match tokio::time::timeout(self.acquire_timeout, self.pool.get_conn()).await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(DbError::Connection(e.to_string())),
+            Err(_) => Err(DbError::Connection(format!(
+                "pool acquisition timed out after {}ms; check for streams or \
+                 transactions holding connections",
+                self.acquire_timeout.as_millis()
+            ))),
+        }
+    }
+
+    /// Like [`Database::query_stream`] but every `next().await` is bounded
+    /// by an inter-row idle timeout.
+    ///
+    /// If no row arrives within `idle`, a single
+    /// [`reify_core::db::DbError::Timeout`] is yielded
+    /// and the stream ends. Dropping the returned stream cancels the
+    /// background producer task and returns the connection to the pool.
+    ///
+    /// Use this when streaming to a slow / external consumer (HTTP client,
+    /// network bridge, …) to bound how long the connection stays out of
+    /// the pool when the consumer stalls.
+    pub async fn query_stream_idle<'a>(
+        &'a self,
+        sql: String,
+        params: Vec<Value>,
+        idle: std::time::Duration,
+    ) -> Result<reify_core::db::BoxStream<'a, Row>, DbError> {
+        let inner = <Self as Database>::query_stream(self, sql, params).await?;
+        Ok(reify_core::db::with_idle_timeout(inner, idle))
     }
 }
 
@@ -101,6 +165,9 @@ fn value_to_mysql(val: &Value) -> Result<mysql_async::Value, DbError> {
         Value::I16(v) => mysql_async::Value::from(*v),
         Value::I32(v) => mysql_async::Value::from(*v),
         Value::I64(v) => mysql_async::Value::from(*v),
+        // mysql_async natively supports unsigned 64-bit, so the full
+        // BIGINT UNSIGNED range round-trips losslessly.
+        Value::U64(v) => mysql_async::Value::UInt(*v),
         Value::F32(v) => mysql_async::Value::from(*v),
         Value::F64(v) => mysql_async::Value::from(*v),
         Value::String(v) => mysql_async::Value::from(v.as_str()),
@@ -110,6 +177,29 @@ fn value_to_mysql(val: &Value) -> Result<mysql_async::Value, DbError> {
         Value::Timestamp(v) => mysql_async::Value::from(v.to_string()),
         Value::Date(v) => mysql_async::Value::from(v.to_string()),
         Value::Time(v) => mysql_async::Value::from(v.to_string()),
+        Value::Duration(d) => {
+            // Bind via mysql_async's structured `Value::Time`, which the
+            // driver serialises using the binary protocol's signed-time
+            // layout. This preserves the full MySQL TIME range
+            // (-838:59:59.999999 to +838:59:59.999999) including signs and
+            // microseconds; values exceeding MySQL's range are clipped by
+            // the server itself, matching the documented behaviour.
+            let total_us = d.num_microseconds().unwrap_or(if d.num_seconds() >= 0 {
+                i64::MAX
+            } else {
+                i64::MIN
+            });
+            let neg = total_us < 0;
+            let abs = (total_us as i128).unsigned_abs();
+            let micros = (abs % 1_000_000) as u32;
+            let total_secs = abs / 1_000_000;
+            let secs = (total_secs % 60) as u8;
+            let mins = ((total_secs / 60) % 60) as u8;
+            let hours_total = total_secs / 3600;
+            let days = (hours_total / 24).min(u32::MAX as u128) as u32;
+            let hours = (hours_total % 24) as u8;
+            mysql_async::Value::Time(neg, days, hours, mins, secs, micros)
+        }
         // Complex types — serialize as text for MySQL compatibility
         #[cfg(feature = "postgres")]
         Value::Point(p) => {
@@ -155,6 +245,82 @@ fn mysql_row_to_row(row: &mysql_async::Row) -> Row {
     Row::new(columns, values)
 }
 
+/// MySQL/MariaDB column types that carry a temporal value.
+///
+/// Used to gate temporal parsing on the `MV::Bytes` path: a VARCHAR column
+/// whose textual content happens to look like `"2024-01-15"` must NOT be
+/// silently coerced to `Value::Date` — that was a real type-confusion bug
+/// before this gating was introduced.
+fn is_temporal_column_type(t: ColumnType) -> bool {
+    matches!(
+        t,
+        ColumnType::MYSQL_TYPE_DATE
+            | ColumnType::MYSQL_TYPE_NEWDATE
+            | ColumnType::MYSQL_TYPE_DATETIME
+            | ColumnType::MYSQL_TYPE_DATETIME2
+            | ColumnType::MYSQL_TYPE_TIMESTAMP
+            | ColumnType::MYSQL_TYPE_TIMESTAMP2
+            | ColumnType::MYSQL_TYPE_TIME
+            | ColumnType::MYSQL_TYPE_TIME2
+    )
+}
+
+/// Convert a raw `MV::Bytes` payload to a `Value`, using the column type to
+/// decide whether and how to parse it as a temporal value.
+///
+/// Non-temporal columns always return `Value::String` (or `Value::Bytes` for
+/// non-UTF-8 payloads). Temporal columns parse with the format that matches
+/// their declared precision; on parse failure we log a warning and fall back
+/// to `Value::String` rather than discarding the data.
+///
+/// `name` is a closure to keep column-name lookup off the hot path when
+/// no warning is logged.
+fn bytes_to_value(bytes: &[u8], col_type: ColumnType, name: impl FnOnce() -> String) -> Value {
+    let s = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return Value::Bytes(bytes.to_vec()),
+    };
+
+    if !is_temporal_column_type(col_type) {
+        return Value::String(s.to_owned());
+    }
+
+    // Temporal column. Try the fractional-seconds format first because it
+    // succeeds for both `2024-01-15 10:30:00` (no fraction) and
+    // `2024-01-15 10:30:00.123456` (microsecond precision); chrono's `%.f`
+    // matches an optional fractional part.
+    let parsed = match col_type {
+        ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE => {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map(Value::Date)
+        }
+        ColumnType::MYSQL_TYPE_DATETIME
+        | ColumnType::MYSQL_TYPE_DATETIME2
+        | ColumnType::MYSQL_TYPE_TIMESTAMP
+        | ColumnType::MYSQL_TYPE_TIMESTAMP2 => {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                .map(Value::Timestamp)
+        }
+        ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => {
+            chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
+                .map(Value::Time)
+        }
+        _ => return Value::String(s.to_owned()),
+    };
+
+    parsed.unwrap_or_else(|_| {
+        tracing::warn!(
+            target: "reify::mysql",
+            column = %name(),
+            value = s,
+            column_type = ?col_type,
+            "MySQL temporal column returned an unparseable string; preserving as Value::String"
+        );
+        Value::String(s.to_owned())
+    })
+}
+
 fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
     use mysql_async::Value as MV;
 
@@ -162,42 +328,17 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
     let raw: Option<&MV> = row.as_ref(idx);
     match raw {
         None | Some(MV::NULL) => Value::Null,
-        Some(MV::Bytes(b)) => {
-            // Try to interpret as UTF-8 string first
-            if let Ok(s) = std::str::from_utf8(b) {
-                // Try parsing as temporal types
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-                    return Value::Timestamp(dt);
-                }
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-                    return Value::Timestamp(dt);
-                }
-                if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                    return Value::Date(d);
-                }
-                if let Ok(t) = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S") {
-                    return Value::Time(t);
-                }
-                if let Ok(t) = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f") {
-                    return Value::Time(t);
-                }
-                Value::String(s.to_owned())
-            } else {
-                Value::Bytes(b.clone())
-            }
-        }
+        Some(MV::Bytes(b)) => bytes_to_value(b, row.columns()[idx].column_type(), || {
+            row.columns()[idx].name_str().to_string()
+        }),
         Some(MV::Int(v)) => Value::I64(*v),
-        Some(MV::UInt(v)) => {
-            // MySQL UNSIGNED BIGINT can exceed i64::MAX. Return such values
-            // as a decimal string (lossless) so callers can parse them as
-            // u64, BigDecimal, etc. without silent clamping.
-            // TODO: handle unsigned integer properly (determine type ?)
-            if *v > i64::MAX as u64 {
-                Value::String(v.to_string())
-            } else {
-                Value::I64(*v as i64)
-            }
-        }
+        // BIGINT UNSIGNED — always return `Value::U64` so the type stays
+        // consistent regardless of the runtime value. Pre-fix, the value
+        // alternated between `Value::I64` and `Value::String(...)` based on
+        // whether it exceeded `i64::MAX`, breaking type-driven business
+        // logic. Callers reading these columns should declare them as `u64`
+        // (or use `i64::try_from` via `FromValue<i64>`).
+        Some(MV::UInt(v)) => Value::U64(*v),
         Some(MV::Float(v)) => Value::F32(*v),
         Some(MV::Double(v)) => Value::F64(*v),
         Some(MV::Date(year, month, day, hour, min, sec, micro)) => {
@@ -224,18 +365,22 @@ fn mysql_column_to_value(row: &mysql_async::Row, idx: usize) -> Value {
                 }
             }
         }
-        Some(MV::Time(is_negative, _, hours, mins, secs, micro)) => {
+        Some(MV::Time(is_negative, days, hours, mins, secs, micros)) => {
+            // MySQL TIME is a *signed interval* (-838:59:59 to +838:59:59),
+            // not a wall-clock time. Pre-fix, negative values were dropped
+            // and the `days` component (≥ 24 h) was ignored, silently
+            // losing data. Build a `chrono::Duration` that preserves all
+            // four components and the sign.
+            let secs_total = i64::from(*days) * 86_400
+                + i64::from(*hours) * 3_600
+                + i64::from(*mins) * 60
+                + i64::from(*secs);
+            let mut d = chrono::Duration::seconds(secs_total)
+                + chrono::Duration::microseconds(i64::from(*micros));
             if *is_negative {
-                tracing::warn!(
-                    target: "reify::mysql",
-                    "Negative TIME value is not representable as NaiveTime; returning Null"
-                );
-                return Value::Null;
+                d = -d;
             }
-            // TIME(0..6) — preserve full microsecond precision.
-            chrono::NaiveTime::from_hms_micro_opt(*hours as u32, *mins as u32, *secs as u32, *micro)
-                .map(Value::Time)
-                .unwrap_or(Value::Null)
+            Value::Duration(d)
         }
     }
 }
@@ -292,11 +437,7 @@ impl Database for MysqlDb {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
         let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Executing");
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut conn = self.get_conn().await?;
         conn.exec_drop(sql, mysql_params).await.map_err(mysql_err)?;
         Ok(conn.affected_rows())
     }
@@ -304,11 +445,7 @@ impl Database for MysqlDb {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
         let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Querying");
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut conn = self.get_conn().await?;
         let rows: Vec<mysql_async::Row> = conn.exec(sql, mysql_params).await.map_err(mysql_err)?;
         Ok(rows.iter().map(mysql_row_to_row).collect())
     }
@@ -316,11 +453,7 @@ impl Database for MysqlDb {
     async fn query_one(&self, sql: &str, params: &[Value]) -> Result<Row, DbError> {
         let (sql, mysql_params) = prepare_mysql(sql, params)?;
         debug!(target: "reify::mysql", sql, "Querying one");
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut conn = self.get_conn().await?;
         let row: Option<mysql_async::Row> = conn
             .exec_first(sql, mysql_params)
             .await
@@ -357,11 +490,7 @@ impl Database for MysqlDb {
         use futures_util::StreamExt;
 
         let (sql, mysql_params) = prepare_mysql(&sql, &params)?;
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut conn = self.get_conn().await?;
         debug!(target: "reify::mysql", sql, "Querying (stream)");
 
         // Small buffer keeps memory bounded while letting the producer stay
@@ -400,11 +529,7 @@ impl Database for MysqlDb {
 
     async fn transaction<'a>(&'a self, f: TransactionFn<'a>) -> Result<(), DbError> {
         debug!(target: "reify::mysql", "BEGIN transaction");
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut conn = self.get_conn().await?;
         // MySQL rejects `BEGIN` / `COMMIT` / `ROLLBACK` through the
         // prepared-statement protocol (error 1295: "This command is not
         // supported in the prepared statement protocol yet"). Use the
@@ -516,6 +641,171 @@ impl Database for MysqlTransaction {
                     .await;
                 Err(e)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the MV::Bytes → Value conversion path.
+    //!
+    //! Pre-fix, `bytes_to_value` parsed any UTF-8 string that happened to
+    //! match a temporal format, regardless of the column's declared type.
+    //! That made a `VARCHAR` column whose content looked like a date silently
+    //! decode to `Value::Date`, breaking downstream code that expected a
+    //! string. These tests pin the column-type-gated parsing.
+
+    use super::*;
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
+    fn bv(s: &str, t: ColumnType) -> Value {
+        bytes_to_value(s.as_bytes(), t, || "test_col".to_string())
+    }
+
+    #[test]
+    fn varchar_with_datelike_content_stays_string() {
+        // Pre-fix bug: this returned Value::Date. Now stays Value::String.
+        assert_eq!(
+            bv("2024-01-15", ColumnType::MYSQL_TYPE_VARCHAR),
+            Value::String("2024-01-15".into())
+        );
+        assert_eq!(
+            bv("2024-01-15 10:30:00", ColumnType::MYSQL_TYPE_STRING),
+            Value::String("2024-01-15 10:30:00".into())
+        );
+    }
+
+    #[test]
+    fn date_column_parses_to_value_date() {
+        assert_eq!(
+            bv("2024-01-15", ColumnType::MYSQL_TYPE_DATE),
+            Value::Date(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn datetime_with_microseconds_preserved() {
+        let dt = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+            NaiveTime::from_hms_micro_opt(10, 30, 45, 123456).unwrap(),
+        );
+        assert_eq!(
+            bv(
+                "2024-01-15 10:30:45.123456",
+                ColumnType::MYSQL_TYPE_DATETIME
+            ),
+            Value::Timestamp(dt)
+        );
+    }
+
+    #[test]
+    fn datetime_without_fractional_still_parses() {
+        let dt = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+            NaiveTime::from_hms_opt(10, 30, 45).unwrap(),
+        );
+        assert_eq!(
+            bv("2024-01-15 10:30:45", ColumnType::MYSQL_TYPE_DATETIME),
+            Value::Timestamp(dt)
+        );
+        assert_eq!(
+            bv("2024-01-15 10:30:45", ColumnType::MYSQL_TYPE_TIMESTAMP),
+            Value::Timestamp(dt)
+        );
+    }
+
+    #[test]
+    fn time_with_and_without_fractional() {
+        let t1 = NaiveTime::from_hms_opt(10, 30, 45).unwrap();
+        let t2 = NaiveTime::from_hms_micro_opt(10, 30, 45, 123).unwrap();
+        assert_eq!(bv("10:30:45", ColumnType::MYSQL_TYPE_TIME), Value::Time(t1));
+        assert_eq!(
+            bv("10:30:45.000123", ColumnType::MYSQL_TYPE_TIME),
+            Value::Time(t2)
+        );
+    }
+
+    #[test]
+    fn unparseable_temporal_falls_back_to_string_not_null() {
+        // Data must be preserved on parse failure so operators can debug.
+        // Pre-fix this returned Value::String silently with no log; now we
+        // log a warning and still preserve the data.
+        assert_eq!(
+            bv("not-a-date", ColumnType::MYSQL_TYPE_DATE),
+            Value::String("not-a-date".into())
+        );
+    }
+
+    #[test]
+    fn non_utf8_bytes_stay_bytes() {
+        let invalid_utf8 = [0xff, 0xfe, 0xfd];
+        assert_eq!(
+            bytes_to_value(&invalid_utf8, ColumnType::MYSQL_TYPE_BLOB, || "c".into()),
+            Value::Bytes(invalid_utf8.to_vec())
+        );
+    }
+
+    // ── MySQL TIME ↔ Value::Duration round-trip ────────────────────
+    //
+    // Pre-fix, the read path silently returned `Value::Null` for negative
+    // TIME values and ignored the `days` field entirely (so values > 24 h
+    // were truncated). The bind path went through chrono::NaiveTime which
+    // can only express 0:00:00..24:00:00. Both directions now use
+    // chrono::Duration so the full MySQL range round-trips losslessly.
+
+    #[test]
+    fn value_to_mysql_duration_positive_under_24h() {
+        let d = chrono::Duration::seconds(5 * 3600 + 30 * 60 + 45)
+            + chrono::Duration::microseconds(123_456);
+        let mv = value_to_mysql(&Value::Duration(d)).unwrap();
+        assert_eq!(mv, mysql_async::Value::Time(false, 0, 5, 30, 45, 123_456));
+    }
+
+    #[test]
+    fn value_to_mysql_duration_negative() {
+        let d = -chrono::Duration::seconds(3600 + 30 * 60);
+        let mv = value_to_mysql(&Value::Duration(d)).unwrap();
+        assert_eq!(mv, mysql_async::Value::Time(true, 0, 1, 30, 0, 0));
+    }
+
+    #[test]
+    fn value_to_mysql_duration_above_24h_uses_days_field() {
+        // 838h59m59s = 34 days + 22h59m59s
+        let d = chrono::Duration::seconds(838 * 3600 + 59 * 60 + 59);
+        let mv = value_to_mysql(&Value::Duration(d)).unwrap();
+        assert_eq!(mv, mysql_async::Value::Time(false, 34, 22, 59, 59, 0));
+    }
+
+    #[test]
+    fn value_to_mysql_duration_negative_above_24h() {
+        // -838h59m59s = -(34 days + 22h59m59s)
+        let d = -(chrono::Duration::seconds(838 * 3600 + 59 * 60 + 59));
+        let mv = value_to_mysql(&Value::Duration(d)).unwrap();
+        assert_eq!(mv, mysql_async::Value::Time(true, 34, 22, 59, 59, 0));
+    }
+
+    #[test]
+    fn is_temporal_column_type_covers_all_variants() {
+        for t in [
+            ColumnType::MYSQL_TYPE_DATE,
+            ColumnType::MYSQL_TYPE_NEWDATE,
+            ColumnType::MYSQL_TYPE_DATETIME,
+            ColumnType::MYSQL_TYPE_DATETIME2,
+            ColumnType::MYSQL_TYPE_TIMESTAMP,
+            ColumnType::MYSQL_TYPE_TIMESTAMP2,
+            ColumnType::MYSQL_TYPE_TIME,
+            ColumnType::MYSQL_TYPE_TIME2,
+        ] {
+            assert!(is_temporal_column_type(t), "{t:?} should be temporal");
+        }
+        for t in [
+            ColumnType::MYSQL_TYPE_VARCHAR,
+            ColumnType::MYSQL_TYPE_STRING,
+            ColumnType::MYSQL_TYPE_BLOB,
+            ColumnType::MYSQL_TYPE_LONGLONG,
+            ColumnType::MYSQL_TYPE_YEAR,
+        ] {
+            assert!(!is_temporal_column_type(t), "{t:?} should NOT be temporal");
         }
     }
 }

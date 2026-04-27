@@ -6,8 +6,7 @@
 #![cfg(feature = "sqlite-integration-tests")]
 
 use reify::{
-    Dialect, Migration, MigrationContext, MigrationRunner, SqliteDb, Table, raw_execute,
-    raw_query,
+    Dialect, Migration, MigrationContext, MigrationRunner, SqliteDb, Table, raw_execute, raw_query,
 };
 
 #[derive(Table, Debug, Clone)]

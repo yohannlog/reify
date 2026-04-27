@@ -3,10 +3,32 @@
 use std::fmt;
 use std::ops::{Add, Neg, Sub};
 
-/// A time interval representing a duration.
+/// A time interval representing a calendar duration.
 ///
-/// Maps to PostgreSQL `INTERVAL` type. Internally stored as months, days,
-/// and microseconds to match PostgreSQL's representation.
+/// Internally stored as months, days, and microseconds — the three
+/// components are separate because months/days have variable absolute
+/// length (28–31 / 24h±DST) and PostgreSQL preserves the distinction.
+///
+/// # Choosing between `Interval` and [`chrono::Duration`]
+///
+/// - Use **`Interval`** when the duration is calendar-aware (e.g. "1 month",
+///   "1 year + 3 days"). Maps to PostgreSQL `INTERVAL` natively.
+/// - Use **[`chrono::Duration`](chrono::Duration)** (via `Value::Duration`,
+///   feature-gated on `postgres`/`mysql`) when the duration is a wall-clock
+///   delta in microseconds, possibly negative, possibly > 24 h. Maps to
+///   PostgreSQL `INTERVAL` and MySQL `TIME` (which is itself a signed
+///   interval, not a wall-clock).
+///
+/// # Adapter support
+///
+/// - **PostgreSQL** — native `INTERVAL` type via the `Value::Interval`
+///   variant, round-trips losslessly.
+/// - **MySQL** — there is no direct `Interval` mapping; for plain
+///   wall-clock deltas use `chrono::Duration` (`Value::Duration` →
+///   MySQL `TIME`). Calendar-aware intervals (`Interval::months`,
+///   `Interval::years`) have no portable MySQL representation.
+/// - **SQLite** — same as MySQL: use `chrono::Duration` for wall-clock
+///   deltas; calendar-aware intervals must be modelled application-side.
 ///
 /// # Examples
 ///

@@ -638,6 +638,17 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::I16(n) => out.push_str(&n.to_string()),
             Value::I32(n) => out.push_str(&n.to_string()),
             Value::I64(n) => out.push_str(&n.to_string()),
+            // u64 values above 2^53 lose precision in JSON's number type
+            // (which IEEE 754 double-precision floats implicitly truncate).
+            // Audit integrity matters more than parser convenience: emit as
+            // a quoted decimal string so consumers can losslessly round-trip
+            // any u64. The HMAC chain spans the exact bytes we write here,
+            // so a downstream verifier must use the same encoding.
+            Value::U64(n) => {
+                out.push('"');
+                out.push_str(&n.to_string());
+                out.push('"');
+            }
             // Non-finite floats (NaN, ±Infinity) are not representable in
             // strict JSON — emit them as tagged string literals so no evidence
             // is silently discarded from the audit log. Consumers can parse
@@ -699,6 +710,14 @@ pub fn values_to_json_string(cols: &[&str], vals: &[crate::value::Value]) -> Str
             Value::Time(t) => {
                 out.push('"');
                 out.push_str(&t.to_string());
+                out.push('"');
+            }
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Value::Duration(d) => {
+                // Use the canonical MySQL TIME formatting so audit verifiers
+                // can compare against the database's native rendering.
+                out.push('"');
+                out.push_str(&crate::value::format_mysql_time(*d));
                 out.push('"');
             }
             #[cfg(feature = "postgres")]
@@ -906,11 +925,8 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
             affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
 
             // 2. Serialize the inserted values as JSON.
-            let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
-            let row_data = values_to_json_string(
-                &col_refs,
-                &insert_params.iter().cloned().collect::<Vec<_>>(),
-            );
+            let col_refs: Vec<&str> = col_names.to_vec();
+            let row_data = values_to_json_string(&col_refs, &insert_params.to_vec());
 
             // 3. Generate changed_at app-side so it is covered by the HMAC.
             //    A DB-side NOW() would only be known post-INSERT and therefore
@@ -997,7 +1013,7 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
             let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
 
             // 2. Serialize before-images.
-            let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
+            let col_refs: Vec<&str> = col_names.to_vec();
             let mut before_images: Vec<String> = Vec::with_capacity(old_rows.len());
             for row in &old_rows {
                 let vals: Vec<crate::value::Value> = col_names
@@ -1110,7 +1126,7 @@ pub async fn audited_delete<M: Auditable + FromRow>(
 
             // 2. Serialize rows and compute HMACs. changed_at is generated
             //    app-side so it is covered by the signature.
-            let col_refs: Vec<&str> = col_names.iter().map(|s| *s).collect();
+            let col_refs: Vec<&str> = col_names.to_vec();
             let mut entries: Vec<(String, String, Option<String>)> =
                 Vec::with_capacity(old_rows.len());
             for row in &old_rows {

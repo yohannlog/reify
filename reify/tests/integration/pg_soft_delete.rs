@@ -6,12 +6,11 @@
 //! - `find().with_deleted()` includes deleted rows
 //! - `find().only_deleted()` returns only deleted rows
 //! - `delete().force()` performs hard DELETE
-//! - Global `set_show_deleted()` config
 
 #![cfg(feature = "pg-integration-tests")]
 
 use chrono::{DateTime, Utc};
-use reify::{Database, Table, delete, fetch, insert, raw_execute, update};
+use reify::{Table, delete, fetch, insert, raw_execute, update};
 
 use crate::PgFixture;
 
@@ -82,9 +81,6 @@ async fn find_auto_filters_deleted_rows() {
     let Some(fx) = fixture().await else { return };
     create_table(&fx.db).await;
 
-    // Ensure global config is default (hide deleted)
-    reify::soft_delete::set_show_deleted(false);
-
     // Insert two rows
     insert(
         &fx.db,
@@ -114,9 +110,7 @@ async fn find_auto_filters_deleted_rows() {
         .expect("soft delete");
 
     // Default find() should only return active row
-    let rows: Vec<Article> = fetch(&fx.db, &Article::find())
-        .await
-        .expect("fetch");
+    let rows: Vec<Article> = fetch(&fx.db, &Article::find()).await.expect("fetch");
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].title, "Active");
@@ -128,8 +122,6 @@ async fn find_auto_filters_deleted_rows() {
 async fn find_with_deleted_includes_all() {
     let Some(fx) = fixture().await else { return };
     create_table(&fx.db).await;
-
-    reify::soft_delete::set_show_deleted(false);
 
     insert(
         &fx.db,
@@ -171,8 +163,6 @@ async fn find_with_deleted_includes_all() {
 async fn find_only_deleted_returns_deleted_only() {
     let Some(fx) = fixture().await else { return };
     create_table(&fx.db).await;
-
-    reify::soft_delete::set_show_deleted(false);
 
     insert(
         &fx.db,
@@ -246,7 +236,10 @@ async fn force_delete_performs_hard_delete() {
 }
 
 #[tokio::test]
-async fn global_show_deleted_config() {
+async fn default_find_filters_deleted_with_deleted_overrides() {
+    // Pins the post-removal-of-`set_show_deleted` semantics: default
+    // `find()` always hides soft-deleted rows, and the only way to see
+    // them is the per-query `.with_deleted()` opt-in.
     let Some(fx) = fixture().await else { return };
     create_table(&fx.db).await;
 
@@ -276,18 +269,20 @@ async fn global_show_deleted_config() {
         .await
         .expect("soft delete");
 
-    // Set global to show deleted
-    reify::soft_delete::set_show_deleted(true);
-
-    // Default find() should now return both
-    let rows: Vec<Article> = fetch(&fx.db, &Article::find())
+    let active_only: Vec<Article> = fetch(&fx.db, &Article::find())
         .await
-        .expect("fetch");
+        .expect("fetch default");
+    assert_eq!(
+        active_only.len(),
+        1,
+        "default find() must hide deleted rows"
+    );
+    assert_eq!(active_only[0].id, 1);
 
-    assert_eq!(rows.len(), 2, "global show_deleted=true should include deleted rows");
-
-    // Restore default
-    reify::soft_delete::set_show_deleted(false);
+    let all: Vec<Article> = fetch(&fx.db, &Article::find().with_deleted())
+        .await
+        .expect("fetch with_deleted");
+    assert_eq!(all.len(), 2, ".with_deleted() must include deleted rows");
 
     fx.teardown().await;
 }
@@ -314,9 +309,7 @@ async fn restore_soft_deleted_row() {
         .expect("soft delete");
 
     // Verify it's deleted
-    let rows: Vec<Article> = fetch(&fx.db, &Article::find())
-        .await
-        .expect("fetch");
+    let rows: Vec<Article> = fetch(&fx.db, &Article::find()).await.expect("fetch");
     assert_eq!(rows.len(), 0);
 
     // Restore by setting deleted_at to NULL
@@ -330,9 +323,7 @@ async fn restore_soft_deleted_row() {
     .expect("restore");
 
     // Should be visible again
-    let rows: Vec<Article> = fetch(&fx.db, &Article::find())
-        .await
-        .expect("fetch");
+    let rows: Vec<Article> = fetch(&fx.db, &Article::find()).await.expect("fetch");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].title, "Restorable");
 

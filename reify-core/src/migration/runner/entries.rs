@@ -48,6 +48,7 @@ pub(crate) fn select_timestamps_sql(dialect: Dialect) -> String {
 }
 
 /// INSERT INTO tracking table (version, description, checksum, comment).
+#[allow(dead_code)] // logical pair with `delete_migration_sql`; reserved for future use
 pub(crate) fn insert_migration_sql(dialect: Dialect) -> String {
     let t = tracking_table(dialect);
     let v = quote_col("version", dialect);
@@ -153,26 +154,32 @@ pub(crate) fn create_tracking_table_sql(dialect: Dialect) -> &'static str {
 }
 
 /// An entry registered via `MigrationRunner::add_table::<T>()`.
-pub(super) struct TableEntry {
-    pub(super) table_name: &'static str,
-    pub(super) column_names: &'static [&'static str],
-    pub(super) column_defs: Vec<crate::schema::ColumnDef>,
+///
+/// Visibility note: the type and its fields are exposed at
+/// `pub(in crate::migration)` so they line up with the
+/// `pub(in crate::migration)` fields of `MigrationRunner` (clippy's
+/// `private_interfaces` lint flags any type strictly more private than
+/// the field that exposes it).
+pub(in crate::migration) struct TableEntry {
+    pub(in crate::migration) table_name: &'static str,
+    pub(in crate::migration) column_names: &'static [&'static str],
+    pub(in crate::migration) column_defs: Vec<crate::schema::ColumnDef>,
     /// Index definitions from `Table::indexes()`.
-    pub(super) indexes: Vec<crate::schema::IndexDef>,
+    pub(in crate::migration) indexes: Vec<crate::schema::IndexDef>,
     /// Optional CHECK constraints from `TableSchema`.
-    pub(super) checks: Vec<String>,
+    pub(in crate::migration) checks: Vec<String>,
 }
 
 /// An entry registered via `MigrationRunner::add_view::<V>()`.
-pub(super) struct ViewEntry {
-    pub(super) view_name: &'static str,
+pub(in crate::migration) struct ViewEntry {
+    pub(in crate::migration) view_name: &'static str,
     /// The SELECT query that defines this view.
-    pub(super) query: String,
+    pub(in crate::migration) query: String,
 }
 
 /// An entry registered via `MigrationRunner::add_materialized_view::<V>()`.
-pub(super) struct MatViewEntry {
-    pub(super) view_name: &'static str,
+pub(in crate::migration) struct MatViewEntry {
+    pub(in crate::migration) view_name: &'static str,
     /// The SELECT query that defines this materialized view.
-    pub(super) query: String,
+    pub(in crate::migration) query: String,
 }

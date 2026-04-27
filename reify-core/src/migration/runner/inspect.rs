@@ -33,11 +33,17 @@ impl MigrationRunner {
 
     /// Compare all registered `Table` types against the live database schema
     /// using the specified dialect.
-    pub(super) async fn diff_with_dialect(&self, db: &impl Database, dialect: Dialect) -> Result<SchemaDiff, MigrationError> {
+    pub(super) async fn diff_with_dialect(
+        &self,
+        db: &impl Database,
+        dialect: Dialect,
+    ) -> Result<SchemaDiff, MigrationError> {
         let mut table_diffs = Vec::new();
 
         for entry in &self.tables {
-            let db_cols = self.existing_column_details_with_dialect(db, entry.table_name, dialect).await?;
+            let db_cols = self
+                .existing_column_details_with_dialect(db, entry.table_name, dialect)
+                .await?;
 
             let table_diff = match db_cols {
                 // ── Table does not exist yet ──────────────────────

@@ -276,8 +276,8 @@ mod value_tests {
 
 #[cfg(feature = "postgres")]
 mod sql_type_tests {
-    use reify::schema::SqlType;
     use reify::Dialect;
+    use reify::schema::SqlType;
 
     #[test]
     fn test_point_sql_type() {
@@ -316,7 +316,11 @@ mod sql_type_tests {
             SqlType::Interval.to_sql(Dialect::Postgres).as_ref(),
             "INTERVAL"
         );
-        assert_eq!(SqlType::Interval.to_sql(Dialect::Mysql).as_ref(), "TEXT");
+        // MySQL has no `INTERVAL` column type but `TIME` is a signed
+        // interval (-838:59:59 to +838:59:59), which round-trips a
+        // `chrono::Duration` natively. Pre-fix this rendered as `TEXT`,
+        // making `Value::Duration` round-trip lossy on MySQL.
+        assert_eq!(SqlType::Interval.to_sql(Dialect::Mysql).as_ref(), "TIME");
         assert_eq!(SqlType::Interval.to_sql(Dialect::Sqlite).as_ref(), "TEXT");
     }
 }

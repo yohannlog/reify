@@ -1,5 +1,7 @@
 use quote::quote;
-use syn::parse::{Parse, ParseStream};
+use std::collections::HashSet;
+use syn::parse::Parse;
+use syn::spanned::Spanned;
 use syn::{Attribute, Lit};
 
 /// Helper trait to extract a string value from a `meta.value()` call.
@@ -17,15 +19,6 @@ impl MetaExt for syn::meta::ParseNestedMeta<'_> {
             Lit::Str(s) => Ok(s.value()),
             _ => Err(syn::Error::new_spanned(lit, "expected a string literal")),
         }
-    }
-}
-
-/// Parse a string literal from a ParseStream (for use inside parenthesized content).
-pub(crate) fn parse_str_lit(input: ParseStream) -> syn::Result<String> {
-    let lit: Lit = input.parse()?;
-    match lit {
-        Lit::Str(s) => Ok(s.value()),
-        _ => Err(syn::Error::new_spanned(lit, "expected a string literal")),
     }
 }
 
@@ -61,36 +54,69 @@ pub(crate) struct ColumnAttrs {
 
 pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs> {
     let mut result = ColumnAttrs::default();
+    // M6: track which keys have already been seen across all `#[column(...)]`
+    // attributes on this field so that copy-paste duplicates like
+    // `#[column(primary_key, primary_key)]` or
+    // `#[column(unique)] #[column(unique)]` are rejected with a clear span
+    // pointing at the second occurrence rather than silently overwriting
+    // (the previous behaviour swallowed user typos).
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    let mark_unique = |name: &'static str,
+                       seen: &mut HashSet<&'static str>,
+                       span: proc_macro2::Span|
+     -> syn::Result<()> {
+        if !seen.insert(name) {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "duplicate `#[column({name})]` attribute on this field; \
+                     each option may only appear once"
+                ),
+            ));
+        }
+        Ok(())
+    };
     for attr in attrs {
         if !attr.path().is_ident("column") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("primary_key") {
+                mark_unique("primary_key", &mut seen, meta.path.span())?;
                 result.primary_key = true;
             } else if meta.path.is_ident("auto_increment") {
+                mark_unique("auto_increment", &mut seen, meta.path.span())?;
                 result.auto_increment = true;
             } else if meta.path.is_ident("unique") {
+                mark_unique("unique", &mut seen, meta.path.span())?;
                 result.unique = true;
             } else if meta.path.is_ident("index") {
+                mark_unique("index", &mut seen, meta.path.span())?;
                 result.index = true;
             } else if meta.path.is_ident("default") {
+                mark_unique("default", &mut seen, meta.path.span())?;
                 result.default = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("sql_type") {
+                mark_unique("sql_type", &mut seen, meta.path.span())?;
                 result.sql_type = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("computed") {
+                mark_unique("computed", &mut seen, meta.path.span())?;
                 result.computed = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("computed_rust") {
+                mark_unique("computed_rust", &mut seen, meta.path.span())?;
                 result.computed_rust = true;
             } else if meta.path.is_ident("creation_timestamp") {
+                mark_unique("creation_timestamp", &mut seen, meta.path.span())?;
                 result.creation_timestamp = true;
             } else if meta.path.is_ident("update_timestamp") {
+                mark_unique("update_timestamp", &mut seen, meta.path.span())?;
                 result.update_timestamp = true;
             } else if meta.path.is_ident("source") {
+                mark_unique("source", &mut seen, meta.path.span())?;
                 let val = meta.parse_str_value()?;
                 if val != "db" && val != "vm" {
                     return Err(syn::Error::new(
-                        proc_macro2::Span::call_site(),
+                        meta.path.span(),
                         format!(
                             "invalid `source` value {:?}; expected \"db\" or \"vm\"",
                             val
@@ -99,18 +125,25 @@ pub(crate) fn parse_column_attrs(attrs: &[Attribute]) -> syn::Result<ColumnAttrs
                 }
                 result.timestamp_source = Some(val);
             } else if meta.path.is_ident("check") {
+                mark_unique("check", &mut seen, meta.path.span())?;
                 result.check = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("references") {
+                mark_unique("references", &mut seen, meta.path.span())?;
                 result.references = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("on_delete") {
+                mark_unique("on_delete", &mut seen, meta.path.span())?;
                 result.on_delete = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("on_update") {
+                mark_unique("on_update", &mut seen, meta.path.span())?;
                 result.on_update = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("name") {
+                mark_unique("name", &mut seen, meta.path.span())?;
                 result.name = Some(meta.parse_str_value()?);
             } else if meta.path.is_ident("soft_delete") {
+                mark_unique("soft_delete", &mut seen, meta.path.span())?;
                 result.soft_delete = true;
             } else if meta.path.is_ident("validate") {
+                mark_unique("validate", &mut seen, meta.path.span())?;
                 let content;
                 syn::parenthesized!(content in meta.input);
                 // Parse into a comma-separated list of meta items so we can
@@ -225,14 +258,12 @@ pub(crate) fn unwrap_option_type(ty: &syn::Type) -> (bool, &syn::Type) {
                     .as_slice(),
                 ["Option"] | ["std", "option", "Option"] | ["core", "option", "Option"]
             );
-            if path_matches {
-                if let Some(seg) = type_path.path.segments.last() {
-                    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                        if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                            return (true, inner);
-                        }
-                    }
-                }
+            if path_matches
+                && let Some(seg) = type_path.path.segments.last()
+                && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+            {
+                return (true, inner);
             }
         }
     }
@@ -245,6 +276,14 @@ pub(crate) fn rust_type_to_sql_type(ty: &syn::Type) -> proc_macro2::TokenStream 
         "i16" => quote! { reify_core::schema::SqlType::SmallInt },
         "i32" => quote! { reify_core::schema::SqlType::Integer },
         "i64" => quote! { reify_core::schema::SqlType::BigInt },
+        // Unsigned integers map to the next-wider signed SQL type so the
+        // full Rust value range round-trips through `Value` and the
+        // database's signed columns. Users wanting `BIGINT UNSIGNED`
+        // semantics on MySQL should set `#[column(sql_type = "...")]`.
+        "u8" => quote! { reify_core::schema::SqlType::SmallInt },
+        "u16" => quote! { reify_core::schema::SqlType::Integer },
+        "u32" => quote! { reify_core::schema::SqlType::BigInt },
+        "u64" => quote! { reify_core::schema::SqlType::BigInt },
         "f32" => quote! { reify_core::schema::SqlType::Float },
         "f64" => quote! { reify_core::schema::SqlType::Double },
         "bool" => quote! { reify_core::schema::SqlType::Boolean },
@@ -261,6 +300,14 @@ pub(crate) fn rust_type_to_sql_type(ty: &syn::Type) -> proc_macro2::TokenStream 
         }
         "chrono::NaiveTime" | "NaiveTime" => {
             quote! { reify_core::schema::SqlType::Time }
+        }
+        // `chrono::Duration` carries signed-interval semantics. The
+        // schema renderer maps `SqlType::Interval` to PostgreSQL
+        // `INTERVAL` and MySQL `TIME` (MySQL has no `INTERVAL` column
+        // type but `TIME` is a signed interval). PG `TIME` is a wall-
+        // clock type and rejects negatives, so it would be wrong here.
+        "chrono::Duration" | "Duration" | "chrono::TimeDelta" | "TimeDelta" => {
+            quote! { reify_core::schema::SqlType::Interval }
         }
         "uuid::Uuid" | "Uuid" => quote! { reify_core::schema::SqlType::Uuid },
         "serde_json::Value" | "JsonValue" => {
@@ -320,19 +367,17 @@ pub(crate) fn parse_sql_type_string(s: &str) -> proc_macro2::TokenStream {
     if let Some(inner) = upper
         .strip_prefix("VARCHAR(")
         .and_then(|r| r.strip_suffix(')'))
+        && let Ok(len) = inner.trim().parse::<u32>()
     {
-        if let Ok(len) = inner.trim().parse::<u32>() {
-            return quote! { reify_core::schema::SqlType::Varchar(#len) };
-        }
+        return quote! { reify_core::schema::SqlType::Varchar(#len) };
     }
 
     if let Some(inner) = upper
         .strip_prefix("CHAR(")
         .and_then(|r| r.strip_suffix(')'))
+        && let Ok(len) = inner.trim().parse::<u32>()
     {
-        if let Ok(len) = inner.trim().parse::<u32>() {
-            return quote! { reify_core::schema::SqlType::Char(#len) };
-        }
+        return quote! { reify_core::schema::SqlType::Char(#len) };
     }
 
     let decimal_inner = upper
@@ -341,11 +386,10 @@ pub(crate) fn parse_sql_type_string(s: &str) -> proc_macro2::TokenStream {
         .and_then(|r| r.strip_suffix(')'));
     if let Some(inner) = decimal_inner {
         let parts: Vec<&str> = inner.split(',').collect();
-        if parts.len() == 2 {
-            if let (Ok(p), Ok(sc)) = (parts[0].trim().parse::<u8>(), parts[1].trim().parse::<u8>())
-            {
-                return quote! { reify_core::schema::SqlType::Decimal(#p, #sc) };
-            }
+        if parts.len() == 2
+            && let (Ok(p), Ok(sc)) = (parts[0].trim().parse::<u8>(), parts[1].trim().parse::<u8>())
+        {
+            return quote! { reify_core::schema::SqlType::Decimal(#p, #sc) };
         }
     }
 
@@ -366,13 +410,13 @@ pub(crate) fn parse_sql_type_string(s: &str) -> proc_macro2::TokenStream {
         "BIGINT" | "INT8" => return quote! { reify_core::schema::SqlType::BigInt },
         "REAL" | "FLOAT4" | "FLOAT" => return quote! { reify_core::schema::SqlType::Float },
         "DOUBLE PRECISION" | "FLOAT8" | "DOUBLE" => {
-            return quote! { reify_core::schema::SqlType::Double }
+            return quote! { reify_core::schema::SqlType::Double };
         }
         "DATE" => return quote! { reify_core::schema::SqlType::Date },
         "TIME" => return quote! { reify_core::schema::SqlType::Time },
         "TIMESTAMP" => return quote! { reify_core::schema::SqlType::Timestamp },
         "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => {
-            return quote! { reify_core::schema::SqlType::Timestamptz }
+            return quote! { reify_core::schema::SqlType::Timestamptz };
         }
         "SERIAL" => return quote! { reify_core::schema::SqlType::Serial },
         "BIGSERIAL" => return quote! { reify_core::schema::SqlType::BigSerial },

@@ -78,7 +78,7 @@ fn insert_many_three_rows_param_order() {
 #[test]
 #[should_panic(expected = "insert_many requires at least one row")]
 fn insert_many_empty_panics() {
-    User::insert_many(&[]).build();
+    let _ = User::insert_many(&[]).build();
 }
 
 #[test]

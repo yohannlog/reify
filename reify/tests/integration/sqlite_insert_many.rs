@@ -54,9 +54,7 @@ async fn sqlite_insert_many_returns_row_count() {
         .expect("insert_many");
     assert_eq!(affected, 10, "expected 10 rows inserted");
 
-    let rows = fetch::<User>(&db, &User::find())
-        .await
-        .expect("fetch");
+    let rows = fetch::<User>(&db, &User::find()).await.expect("fetch");
     assert_eq!(rows.len(), 10);
 }
 
@@ -73,14 +71,12 @@ async fn sqlite_insert_many_single_row() {
         email: "only@example.com".into(),
         role: None,
     };
-    let affected = insert_many(&db, &User::insert_many(&[user.clone()]))
+    let affected = insert_many(&db, &User::insert_many(std::slice::from_ref(&user)))
         .await
         .expect("insert_many one");
     assert_eq!(affected, 1);
 
-    let rows = fetch::<User>(&db, &User::find())
-        .await
-        .expect("fetch");
+    let rows = fetch::<User>(&db, &User::find()).await.expect("fetch");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], user);
 }

@@ -12,6 +12,7 @@ use reify::{
 // ── MockDb ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
+#[allow(clippy::type_complexity)] // test scaffolding, expressive shape > alias
 struct MockDb {
     executed: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
     query_results: Arc<Mutex<Vec<Vec<Row>>>>,
@@ -69,6 +70,7 @@ impl Database for MockDb {
         Err(DbError::Query("no rows".into()))
     }
 
+    #[allow(clippy::manual_async_fn)] // matches the trait signature (+ Send)
     fn transaction<'a>(
         &'a self,
         f: TransactionFn<'a>,

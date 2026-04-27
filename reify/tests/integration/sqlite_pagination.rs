@@ -78,12 +78,8 @@ async fn sqlite_offset_pagination_last_page() {
 
     let paginated = User::find().paginate(3, 20);
     let (data_sql, count_sql, params) = paginated.build();
-    let data_rows = raw_query(&db, &data_sql, &params)
-        .await
-        .expect("data");
-    let count_rows = raw_query(&db, &count_sql, &params)
-        .await
-        .expect("count");
+    let data_rows = raw_query(&db, &data_sql, &params).await.expect("data");
+    let count_rows = raw_query(&db, &count_sql, &params).await.expect("count");
     let total_items = match count_rows[0].get_idx(0) {
         Some(Value::I64(n)) => *n as u64,
         other => panic!("count: {other:?}"),

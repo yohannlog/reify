@@ -21,10 +21,10 @@ pub fn create_table_sql<T: Table>(
         let def = column_defs.iter().find(|d| d.name == *name);
 
         // Skip Rust-side virtual columns — they don't exist in the DB.
-        if let Some(d) = def {
-            if matches!(d.computed, Some(ComputedColumn::Virtual)) {
-                continue;
-            }
+        if let Some(d) = def
+            && matches!(d.computed, Some(ComputedColumn::Virtual))
+        {
+            continue;
         }
 
         let mut parts: Vec<String> = vec![format!("    {}", qi(name))];
@@ -144,6 +144,7 @@ pub fn create_table_sql_with_checks<T: Table>(
 
 /// Generate a `CREATE TABLE IF NOT EXISTS` statement from an explicit table name
 /// and column definitions (used for synthetic tables like audit companions).
+#[allow(dead_code)] // currently unused; kept as a building block for synthetic tables
 pub(crate) fn create_table_sql_named(
     table_name: &str,
     column_defs: &[crate::schema::ColumnDef],
@@ -263,16 +264,16 @@ pub fn try_add_column_sql(
     use crate::schema::ComputedColumn;
 
     // DB-generated computed column
-    if let Some(d) = def {
-        if let Some(ComputedColumn::Stored(expr)) = &d.computed {
-            let sql_type = d.sql_type.to_sql(dialect);
-            return Ok(format!(
-                "ALTER TABLE {} ADD COLUMN {} {} GENERATED ALWAYS AS ({expr}) STORED;",
-                quote_ident(table, dialect),
-                quote_ident(column, dialect),
-                &*sql_type
-            ));
-        }
+    if let Some(d) = def
+        && let Some(ComputedColumn::Stored(expr)) = &d.computed
+    {
+        let sql_type = d.sql_type.to_sql(dialect);
+        return Ok(format!(
+            "ALTER TABLE {} ADD COLUMN {} {} GENERATED ALWAYS AS ({expr}) STORED;",
+            quote_ident(table, dialect),
+            quote_ident(column, dialect),
+            &*sql_type
+        ));
     }
 
     let is_nullable = def.map(|d| d.nullable).unwrap_or(false);
@@ -399,7 +400,7 @@ pub fn create_index_sql(table: &str, index: &IndexDef, dialect: crate::query::Di
 
     // Partial index predicate (WHERE clause)
     let predicate = match (&index.predicate, dialect) {
-        (Some(pred), crate::query::Dialect::Mysql) => {
+        (Some(_pred), crate::query::Dialect::Mysql) => {
             // MySQL doesn't support partial indexes — log warning and skip
             tracing::warn!(
                 index = %index_name,
@@ -424,6 +425,7 @@ pub fn create_index_sql(table: &str, index: &IndexDef, dialect: crate::query::Di
 ///
 /// - **PostgreSQL/SQLite**: `DROP INDEX IF EXISTS "index_name";`
 /// - **MySQL**: `DROP INDEX `index_name` ON `table`;`
+#[allow(dead_code)] // logical pair with `create_index_sql`; reserved for future migration tools
 pub fn drop_index_sql(table: &str, index_name: &str, dialect: crate::query::Dialect) -> String {
     use crate::ident::quote_ident;
 

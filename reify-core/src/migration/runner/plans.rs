@@ -1,12 +1,10 @@
 use super::MigrationRunner;
 use crate::db::Database;
 use crate::migration::context::MigrationContext;
-use crate::migration::ddl::{add_column_sql, create_index_sql, create_table_sql_with_checks};
-use crate::migration::diff::ColumnDiff;
+use crate::migration::ddl::{add_column_sql, create_index_sql};
 use crate::migration::error::MigrationError;
 use crate::migration::plan::{MigrationPlan, compute_checksum};
 use crate::query::Dialect;
-use crate::table::Table;
 use std::collections::HashSet;
 
 impl MigrationRunner {
@@ -47,12 +45,7 @@ impl MigrationRunner {
                                 .iter()
                                 .map(|col| {
                                     let def = entry.column_defs.iter().find(|d| d.name == *col);
-                                    add_column_sql(
-                                        entry.table_name,
-                                        col,
-                                        def,
-                                        dialect,
-                                    )
+                                    add_column_sql(entry.table_name, col, def, dialect)
                                 })
                                 .collect();
                             let checksum = compute_checksum(&stmts);
@@ -76,7 +69,9 @@ impl MigrationRunner {
             }
 
             // Fetch column details once — reuse for both ADD COLUMN logic and warnings.
-            let details = self.existing_column_details_with_dialect(db, entry.table_name, dialect).await?;
+            let details = self
+                .existing_column_details_with_dialect(db, entry.table_name, dialect)
+                .await?;
             match details {
                 None => {
                     // Table doesn't exist → CREATE TABLE + CREATE INDEX for all indexes
@@ -108,23 +103,18 @@ impl MigrationRunner {
                         db_cols.iter().map(|c| c.name.as_str()).collect();
                     let mut stmts = Vec::new();
                     for col in entry.column_names {
-                        if !existing_col_names.iter().any(|c| *c == *col) {
+                        if !existing_col_names.contains(col) {
                             let def = entry.column_defs.iter().find(|d| d.name == *col);
-                            stmts.push(add_column_sql(
-                                entry.table_name,
-                                col,
-                                def,
-                                dialect,
-                            ));
+                            stmts.push(add_column_sql(entry.table_name, col, def, dialect));
                         }
                     }
 
                     // Check for missing indexes
-                    let existing_indexes = self.existing_indexes(db, entry.table_name, dialect).await?;
+                    let existing_indexes =
+                        self.existing_indexes(db, entry.table_name, dialect).await?;
                     for idx in &entry.indexes {
                         let idx_name = idx.name.clone().unwrap_or_else(|| {
-                            let col_names: Vec<&str> =
-                                idx.columns.iter().map(|c| c.name).collect();
+                            let col_names: Vec<&str> = idx.columns.iter().map(|c| c.name).collect();
                             let prefix = if idx.unique { "uidx" } else { "idx" };
                             format!("{}_{}", prefix, col_names.join("_"))
                         });
@@ -217,7 +207,6 @@ impl MigrationRunner {
             }
         }
     }
-
 
     /// Build the list of view plans (CREATE OR REPLACE VIEW).
     pub(super) fn view_plans(&self, applied: &HashSet<String>) -> Vec<MigrationPlan> {

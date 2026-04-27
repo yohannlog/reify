@@ -27,7 +27,7 @@ impl PostgresDb {
             cols.join(", ")
         );
 
-        let conn = get_conn(&self.pool).await?;
+        let conn = get_conn(&self.pool, self.acquire_timeout).await?;
         let sink = conn.copy_in(&sql).await.map_err(pg_err)?;
 
         let defs = T::column_defs();
@@ -111,6 +111,9 @@ fn value_to_pg_type(value: &Value) -> Type {
         Value::I16(_) => Type::INT2,
         Value::I32(_) => Type::INT4,
         Value::I64(_) => Type::INT8,
+        // No native u64 in PostgreSQL — bind as INT8 (the to_sql conversion
+        // refuses values above i64::MAX so we won't truncate silently).
+        Value::U64(_) => Type::INT8,
         Value::F32(_) => Type::FLOAT4,
         Value::F64(_) => Type::FLOAT8,
         Value::String(_) => Type::TEXT,
@@ -120,6 +123,7 @@ fn value_to_pg_type(value: &Value) -> Type {
         Value::Timestamp(_) => Type::TIMESTAMP,
         Value::Date(_) => Type::DATE,
         Value::Time(_) => Type::TIME,
+        Value::Duration(_) => Type::INTERVAL,
         Value::Jsonb(_) => Type::JSONB,
         Value::Int4Range(_) => Type::INT4_RANGE,
         Value::Int8Range(_) => Type::INT8_RANGE,
