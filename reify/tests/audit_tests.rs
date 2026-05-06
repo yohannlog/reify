@@ -112,7 +112,9 @@ fn audit_table_name() {
 #[test]
 fn audit_column_defs_count() {
     let defs = AuditUser::audit_column_defs();
-    assert_eq!(defs.len(), 6);
+    // 7 = 6 base columns + `prev_hash` chain link added in the
+    // hash-chaining feature.
+    assert_eq!(defs.len(), 7);
 }
 
 #[test]
@@ -124,6 +126,7 @@ fn audit_column_defs_names() {
     assert_eq!(defs[3].name, "changed_at");
     assert_eq!(defs[4].name, "row_data");
     assert_eq!(defs[5].name, "row_hash");
+    assert_eq!(defs[6].name, "prev_hash");
 }
 
 #[test]
@@ -139,7 +142,12 @@ fn audit_column_defs_types() {
     assert_eq!(defs[2].sql_type, SqlType::Text);
     assert!(defs[2].nullable);
     assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
-    assert_eq!(defs[3].default, Some(reify::DefaultValue::Expr("NOW()")));
+    // SQL-standard `CURRENT_TIMESTAMP` (works on PG, MySQL, SQLite —
+    // see fix in `migration::ddl` to keep DDL emission portable).
+    assert_eq!(
+        defs[3].default,
+        Some(reify::DefaultValue::Expr("CURRENT_TIMESTAMP")),
+    );
     assert_eq!(defs[4].sql_type, SqlType::Jsonb);
     assert!(!defs[4].nullable);
     assert_eq!(defs[5].sql_type, SqlType::Text);

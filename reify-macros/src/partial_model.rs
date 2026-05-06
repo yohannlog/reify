@@ -37,7 +37,7 @@ pub(crate) fn impl_partial_model(input: &DeriveInput) -> syn::Result<proc_macro2
         from_row_arms.push(quote! {
             let #ident = match row.get(#name_str) {
                 Some(v) => <#ty as reify_core::value::FromValue>::from_value(v.clone())
-                    .map_err(|e| reify_core::db::DbError::Conversion(e))?,
+                    .map_err(|e| reify_core::db::DbError::Conversion(e.to_string()))?,
                 None => return Err(reify_core::db::DbError::Conversion(
                     format!("missing column: {}", #name_str)
                 )),

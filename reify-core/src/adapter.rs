@@ -27,6 +27,45 @@ impl SavepointCounter {
     }
 }
 
+// ── Pool acquisition with timeout ───────────────────────────────────
+
+/// Wrap a connection-pool acquisition future with a wall-clock timeout
+/// and uniform error mapping.
+///
+/// Every adapter that uses a connection pool (`reify-postgres`,
+/// `reify-mysql`) needs the same scaffolding: bound the wait by a
+/// configurable timeout, surface `Connection`-class errors with a
+/// consistent message, and convert a timeout into an observable
+/// `DbError::Connection` (instead of letting the caller block forever
+/// when all connections are stuck on un-drained streams or open
+/// transactions).
+///
+/// Pre-fix, both adapters carried near-identical 10-line copies of this
+/// logic. Centralising it here means future fixes (better error
+/// messages, telemetry, retry semantics) apply uniformly.
+///
+/// The `E` bound is `Display` rather than `std::error::Error` so callers
+/// can pass driver-specific error types that implement only `Display`
+/// without an extra adapter layer.
+pub async fn acquire_with_timeout<C, E, F>(
+    timeout: std::time::Duration,
+    fut: F,
+) -> Result<C, crate::db::DbError>
+where
+    F: std::future::Future<Output = Result<C, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(crate::db::DbError::Connection(e.to_string())),
+        Err(_) => Err(crate::db::DbError::Connection(format!(
+            "pool acquisition timed out after {}ms; check for streams or \
+             transactions holding connections",
+            timeout.as_millis()
+        ))),
+    }
+}
+
 // ── Quote-aware SQL rewriting ───────────────────────────────────────
 //
 // All rewriters here scan the SQL as raw bytes — the structural

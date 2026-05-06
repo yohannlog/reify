@@ -224,6 +224,12 @@ pub struct AuditContext {
     hmac_secret: Option<ZeroOnDrop>,
     /// SQL dialect — controls `?` vs `$N` placeholders in audit INSERTs.
     dialect: crate::query::Dialect,
+    /// Optional external append-only log destination. When set, every
+    /// audit row is mirrored to the sink **inside** the audited
+    /// transaction; a sink failure rolls back the whole transaction so
+    /// no DML row exists in the database without a corresponding sink
+    /// entry. See [`AuditSink`] for the contract.
+    sink: Option<std::sync::Arc<dyn AuditSink>>,
 }
 
 impl AuditContext {
@@ -236,6 +242,7 @@ impl AuditContext {
             actor: actor.into(),
             hmac_secret: None,
             dialect: crate::query::Dialect::Generic,
+            sink: None,
         }
     }
 
@@ -273,6 +280,7 @@ impl AuditContext {
             actor: actor.into(),
             hmac_secret: Some(ZeroOnDrop(secret)),
             dialect: crate::query::Dialect::Generic,
+            sink: None,
         })
     }
 
@@ -283,6 +291,29 @@ impl AuditContext {
     pub fn with_dialect(mut self, dialect: crate::query::Dialect) -> Self {
         self.dialect = dialect;
         self
+    }
+
+    /// Mirror every audit row to an external append-only log.
+    ///
+    /// The sink is invoked **inside** the audited transaction, after the
+    /// audit row has been inserted in the DB. A sink error is propagated
+    /// as a `DbError`, which rolls back the transaction — the audited
+    /// DML and the audit row are both undone, so the database can never
+    /// commit a row that the sink rejected. This is the strongest
+    /// SOC2 / PCI-DSS guarantee, traded against holding the DB
+    /// connection while the sink runs (slow remote sinks effectively
+    /// gate write throughput).
+    ///
+    /// Pass `Arc<MyBackend>` for cheap cloning across the request path.
+    /// See [`AuditSink`] and [`NoopAuditSink`].
+    pub fn with_sink(mut self, sink: std::sync::Arc<dyn AuditSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Currently configured external sink, if any.
+    pub fn sink(&self) -> Option<&std::sync::Arc<dyn AuditSink>> {
+        self.sink.as_ref()
     }
 
     /// Read the actor.
@@ -308,9 +339,29 @@ impl AuditContext {
         changed_at: &str,
         row_data: &str,
     ) -> Option<String> {
+        self.compute_hash_chained(operation, changed_at, row_data, None)
+    }
+
+    /// Compute a chained HMAC-SHA256 over the audit fields and an optional
+    /// previous-row hash.
+    ///
+    /// When `prev_hash` is `None`, the resulting hash matches
+    /// [`AuditContext::compute_hash`] (legacy 4-field layout), so chains can
+    /// start from rows written before chaining was enabled. When `Some`, the
+    /// previous-row hash is folded into the signed message — corrupting the
+    /// previous row, deleting it, or skipping a chain link all break
+    /// verification.
+    pub fn compute_hash_chained(
+        &self,
+        operation: &str,
+        changed_at: &str,
+        row_data: &str,
+        prev_hash: Option<&str>,
+    ) -> Option<String> {
         let secret = self.hmac_secret.as_ref().map(|z| z.0.as_slice())?;
         let actor = self.actor.as_hmac_str();
-        let message = build_hmac_message(operation, &actor, changed_at, row_data);
+        let message =
+            build_hmac_message_chained(operation, &actor, changed_at, prev_hash, row_data);
         Some(hex_encode(&hmac_sha256(secret, &message)))
     }
 }
@@ -361,6 +412,10 @@ fn current_changed_at() -> String {
 ///
 /// `changed_at` is included so that antedating a row is detectable even when
 /// `row_data` and `operation` are unchanged.
+///
+/// This is the legacy 4-field layout — kept for backward compatibility with
+/// audit rows written before hash chaining was added. New rows use
+/// [`build_hmac_message_chained`] when a previous-row hash is available.
 fn build_hmac_message(operation: &str, actor: &str, changed_at: &str, row_data: &str) -> Vec<u8> {
     let op = operation.as_bytes();
     let ac = actor.as_bytes();
@@ -378,6 +433,54 @@ fn build_hmac_message(operation: &str, actor: &str, changed_at: &str, row_data: 
     out
 }
 
+/// Build an HMAC message that chains to a previous row's `row_hash`.
+///
+/// Layout (concatenated, length-prefixed):
+///
+/// ```text
+///   op_len_be_u64    || op_bytes
+/// || actor_len_be_u64 || actor_bytes
+/// || ts_len_be_u64    || changed_at_bytes
+/// || prev_len_be_u64  || prev_hash_bytes
+/// || data_len_be_u64  || row_data_bytes
+/// ```
+///
+/// When `prev_hash` is `None`, falls back to the legacy 4-field layout in
+/// [`build_hmac_message`] so audit rows pre-dating the chain feature continue
+/// to verify with their original signatures. The first row of a chain
+/// always has `prev_hash = None`.
+fn build_hmac_message_chained(
+    operation: &str,
+    actor: &str,
+    changed_at: &str,
+    prev_hash: Option<&str>,
+    row_data: &str,
+) -> Vec<u8> {
+    let prev = match prev_hash {
+        // No previous row — preserve the legacy layout so existing
+        // signatures continue to verify.
+        None => return build_hmac_message(operation, actor, changed_at, row_data),
+        Some(p) => p,
+    };
+    let op = operation.as_bytes();
+    let ac = actor.as_bytes();
+    let ts = changed_at.as_bytes();
+    let pv = prev.as_bytes();
+    let rd = row_data.as_bytes();
+    let mut out = Vec::with_capacity(40 + op.len() + ac.len() + ts.len() + pv.len() + rd.len());
+    out.extend_from_slice(&(op.len() as u64).to_be_bytes());
+    out.extend_from_slice(op);
+    out.extend_from_slice(&(ac.len() as u64).to_be_bytes());
+    out.extend_from_slice(ac);
+    out.extend_from_slice(&(ts.len() as u64).to_be_bytes());
+    out.extend_from_slice(ts);
+    out.extend_from_slice(&(pv.len() as u64).to_be_bytes());
+    out.extend_from_slice(pv);
+    out.extend_from_slice(&(rd.len() as u64).to_be_bytes());
+    out.extend_from_slice(rd);
+    out
+}
+
 // ── Auditable trait ──────────────────────────────────────────────────
 
 /// Implemented automatically by `#[table(audit)]`.
@@ -386,6 +489,238 @@ pub trait Auditable: Table {
     fn audit_table_name() -> &'static str;
     /// Fixed column defs for the audit table.
     fn audit_column_defs() -> Vec<ColumnDef>;
+}
+
+// ── AuditSink — append-only external audit log ───────────────────────
+
+/// One entry sent to an [`AuditSink`].
+///
+/// Mirrors the audit row that was just inserted in the database, with
+/// the same byte-perfect `row_data` and `row_hash` fields so a downstream
+/// verifier can reconstruct the HMAC signature without round-tripping
+/// the database.
+///
+/// `actor` is exposed by reference (no clone). Borrowed `&'static str`
+/// for `table` matches what the audited table contributes.
+#[derive(Debug)]
+pub struct AuditEvent<'a> {
+    /// SQL name of the audited (parent) table — e.g. `"users"`, not
+    /// `"users_audit"`.
+    pub table: &'static str,
+    /// What changed.
+    pub operation: AuditOperation,
+    /// Actor identity (matches the value bound into the `actor_id`
+    /// column of the audit row).
+    pub actor: &'a ActorId,
+    /// RFC 3339 UTC timestamp string, byte-identical to the
+    /// `changed_at` column.
+    pub changed_at: &'a str,
+    /// JSON serialisation of the row, byte-identical to `row_data`.
+    pub row_data: &'a str,
+    /// HMAC-SHA256 hex digest of this row, or `None` when integrity
+    /// is not configured on the [`AuditContext`].
+    pub row_hash: Option<&'a str>,
+    /// Hash chain link to the previous audit row's `row_hash`, or
+    /// `None` for the first row of the chain / pre-chaining rows.
+    pub prev_hash: Option<&'a str>,
+}
+
+/// Error returned by [`AuditSink::write`].
+///
+/// Variant boundaries mirror the most common failure modes: I/O for
+/// file/network sinks, serialization for JSON/protobuf encoders,
+/// `Backend` for everything else (status-code rejection, queue full,
+/// signing failure, …).
+#[derive(Debug)]
+pub enum AuditSinkError {
+    /// I/O error from a file/network/socket backend.
+    Io(std::io::Error),
+    /// Failure encoding the event to the wire format.
+    Serialization(String),
+    /// Catch-all for backend-specific failures (HTTP non-2xx, S3 access
+    /// denied, Kafka broker unavailable, …).
+    Backend(String),
+}
+
+impl std::fmt::Display for AuditSinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditSinkError::Io(e) => write!(f, "audit sink io error: {e}"),
+            AuditSinkError::Serialization(m) => {
+                write!(f, "audit sink serialization error: {m}")
+            }
+            AuditSinkError::Backend(m) => write!(f, "audit sink backend error: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for AuditSinkError {}
+
+impl From<std::io::Error> for AuditSinkError {
+    fn from(e: std::io::Error) -> Self {
+        AuditSinkError::Io(e)
+    }
+}
+
+/// Boxed future returned by [`AuditSink::write`].
+///
+/// Type-erased so the trait stays dyn-safe. Project convention mirrors
+/// [`crate::db::BoxFuture`] but with a different `Err` variant since
+/// audit-sink failures are not `DbError`s.
+pub type AuditSinkFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditSinkError>> + Send + 'a>>;
+
+/// Append-only audit log destination outside the application database.
+///
+/// Implementations are free to write to a local file, an HTTP endpoint,
+/// an S3 bucket with Object Lock, a Kafka topic, etc. The contract is:
+///
+/// - **Append-only**: every successful call appends exactly one event.
+/// - **Atomic with the DB transaction**: the audit code calls
+///   `write` *inside* the same transaction that wrote the audit row in
+///   the database. If `write` returns `Err`, the audit code propagates
+///   it as a `DbError`, the transaction is rolled back, and **neither**
+///   the underlying DML nor the audit row are committed. This trades
+///   database connection time for the strongest durability guarantee:
+///   a row only exists in the DB if it also reached the sink.
+/// - **Synchronous failure**: the function must not silently retain
+///   events in a background buffer. If a sink wants async batching,
+///   it must finalise (or fail) before returning.
+///
+/// The trait is dyn-safe via [`BoxFuture`](crate::db::BoxFuture). Most
+/// implementations look like:
+///
+/// ```ignore
+/// impl AuditSink for MySink {
+///     fn write<'a>(
+///         &'a self,
+///         event: &'a AuditEvent<'a>,
+///     ) -> BoxFuture<'a, Result<(), AuditSinkError>> {
+///         Box::pin(async move {
+///             // … push to backend …
+///             Ok(())
+///         })
+///     }
+/// }
+/// ```
+pub trait AuditSink: Send + Sync {
+    fn write<'a>(&'a self, event: &'a AuditEvent<'a>) -> AuditSinkFuture<'a>;
+}
+
+/// No-op sink — accepts every event and discards it.
+///
+/// Useful as a default when no external sink is configured, and as a
+/// stand-in in tests where the sink itself is not under test.
+pub struct NoopAuditSink;
+
+impl AuditSink for NoopAuditSink {
+    fn write<'a>(&'a self, _event: &'a AuditEvent<'a>) -> AuditSinkFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+// ── FileAuditSink (feature: audit-file) ──────────────────────────────
+
+/// Append-only newline-delimited JSON sink to a local file.
+///
+/// Each successful `write` appends one JSON object plus a newline. The
+/// file is opened in append mode with `O_CREAT`, so concurrent writers
+/// pointing at the same path are serialised by the OS at the syscall
+/// level (POSIX `O_APPEND` guarantees atomic appends ≤ `PIPE_BUF` on
+/// local filesystems). An internal `tokio::sync::Mutex` further
+/// serialises writes within a single process so a single audit event
+/// always lands as one contiguous line.
+///
+/// **Durability**: `flush` is called after every line. For ultimate
+/// durability against power loss callers can wrap or extend this sink
+/// to call `sync_all` explicitly — at the cost of a syscall per event.
+///
+/// Enabled by the `audit-file` feature.
+#[cfg(feature = "audit-file")]
+pub struct FileAuditSink {
+    /// Locked for the duration of one write so concurrent calls don't
+    /// interleave half a line. Tokio's async mutex is intentional —
+    /// holding a `std::sync::Mutex` across an await would block the
+    /// runtime.
+    file: tokio::sync::Mutex<tokio::fs::File>,
+}
+
+#[cfg(feature = "audit-file")]
+impl FileAuditSink {
+    /// Open the file at `path` in append mode, creating it if missing.
+    pub async fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        Ok(Self {
+            file: tokio::sync::Mutex::new(file),
+        })
+    }
+
+    /// Build from an already-opened `tokio::fs::File`. Useful for tests
+    /// or when the caller wants custom open flags (e.g. `O_DSYNC`).
+    pub fn from_file(file: tokio::fs::File) -> Self {
+        Self {
+            file: tokio::sync::Mutex::new(file),
+        }
+    }
+}
+
+#[cfg(feature = "audit-file")]
+impl AuditSink for FileAuditSink {
+    fn write<'a>(&'a self, event: &'a AuditEvent<'a>) -> AuditSinkFuture<'a> {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut line = audit_event_to_jsonl(event);
+            line.push('\n');
+            let mut guard = self.file.lock().await;
+            guard.write_all(line.as_bytes()).await?;
+            guard.flush().await?;
+            Ok(())
+        })
+    }
+}
+
+/// Serialise an [`AuditEvent`] to a single JSON object string suitable
+/// for newline-delimited logs (no embedded newlines).
+///
+/// Public so tests in this crate can pin the format. The
+/// representation is **stable** — adding new fields is allowed,
+/// renaming or removing existing ones is a breaking change.
+#[cfg(feature = "audit-file")]
+pub fn audit_event_to_jsonl(event: &AuditEvent<'_>) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(256 + event.row_data.len());
+    out.push('{');
+    let _ = write!(
+        &mut out,
+        "\"table\":\"{}\",\"operation\":\"{}\",\"actor\":{},\"changed_at\":\"{}\",\"row_data\":{}",
+        event.table,
+        event.operation.as_str(),
+        actor_to_json(event.actor),
+        event.changed_at,
+        event.row_data,
+    );
+    if let Some(h) = event.row_hash {
+        let _ = write!(&mut out, ",\"row_hash\":\"{h}\"");
+    }
+    if let Some(p) = event.prev_hash {
+        let _ = write!(&mut out, ",\"prev_hash\":\"{p}\"");
+    }
+    out.push('}');
+    out
+}
+
+#[cfg(feature = "audit-file")]
+fn actor_to_json(a: &ActorId) -> String {
+    match a {
+        ActorId::None => "null".to_string(),
+        ActorId::Int(n) => n.to_string(),
+        ActorId::String(s) => format!("\"{}\"", json_escape(s)),
+    }
 }
 
 // ── Fixed audit column defs ──────────────────────────────────────────
@@ -399,6 +734,8 @@ pub trait Auditable: Table {
 /// 4. `changed_at` — `TIMESTAMPTZ NOT NULL DEFAULT NOW()` (DB-side timestamp)
 /// 5. `row_data`   — `JSONB NOT NULL` (before-image for UPDATE/DELETE, full row for INSERT)
 /// 6. `row_hash`   — `TEXT NULL` (HMAC-SHA256 hex; NULL when no secret is configured)
+/// 7. `prev_hash`  — `TEXT NULL` (hash chain link to the previous audit row;
+///    `NULL` for the first row of the chain or rows written before chaining was enabled)
 ///
 /// **Column order is stable** — the HMAC covers `row_data` by position, so
 /// changing this order would invalidate existing hashes.
@@ -457,9 +794,12 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             soft_delete: false,
         },
         // `changed_at` is bound by the application (RFC 3339 UTC) so it is
-        // covered by the HMAC signature. The `NOW()` default remains so
-        // legacy rows inserted without an explicit value still get a
-        // server-side timestamp — but `audited_*` always passes one in.
+        // covered by the HMAC signature. The `CURRENT_TIMESTAMP` default
+        // remains so legacy rows inserted without an explicit value still
+        // get a server-side timestamp — but `audited_*` always passes one
+        // in. We use the SQL-standard `CURRENT_TIMESTAMP` (rather than the
+        // PG/MySQL `NOW()` synonym) so the same DDL works on SQLite too;
+        // PG and MySQL both accept `CURRENT_TIMESTAMP` identically.
         ColumnDef {
             name: "changed_at",
             sql_type: SqlType::Timestamptz,
@@ -468,7 +808,7 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
             unique: false,
             index: false,
             nullable: false,
-            default: Some(crate::schema::DefaultValue::Expr("NOW()")),
+            default: Some(crate::schema::DefaultValue::Expr("CURRENT_TIMESTAMP")),
             computed: None,
             timestamp_kind: None,
             timestamp_source: TimestampSource::Db,
@@ -495,6 +835,27 @@ pub fn audit_column_defs_for(table_name: &str) -> Vec<ColumnDef> {
         // Integrity column — NULL when no HMAC secret is configured.
         ColumnDef {
             name: "row_hash",
+            sql_type: SqlType::Text,
+            primary_key: false,
+            auto_increment: false,
+            unique: false,
+            index: false,
+            nullable: true,
+            default: None,
+            computed: None,
+            timestamp_kind: None,
+            timestamp_source: TimestampSource::Vm,
+            check: None,
+            foreign_key: None,
+            soft_delete: false,
+        },
+        // Chain link — references the `row_hash` of the previous audit row in
+        // this table. NULL for the first row of the chain, or for any row
+        // written before hash chaining was introduced. A `verify_audit_chain`
+        // walk detects deletions by spotting a `prev_hash` that does not
+        // match the previous row's `row_hash`.
+        ColumnDef {
+            name: "prev_hash",
             sql_type: SqlType::Text,
             primary_key: false,
             auto_increment: false,
@@ -552,15 +913,175 @@ pub fn verify_audit_row(
     stored_hash: Option<&str>,
     integrity_expected: bool,
 ) -> Option<bool> {
+    verify_audit_row_chained(
+        secret,
+        operation,
+        actor,
+        changed_at,
+        None,
+        row_data,
+        stored_hash,
+        integrity_expected,
+    )
+}
+
+/// Verify an audit row's `row_hash` against a chained HMAC-SHA256.
+///
+/// Like [`verify_audit_row`], but also folds an optional `prev_hash` into
+/// the signed message. When `prev_hash` is `None`, the message format is
+/// identical to the legacy 4-field layout, so rows written before chaining
+/// was added continue to verify under this entry point.
+///
+/// Use [`verify_audit_chain`] to verify both the per-row signature **and**
+/// the chain continuity in one pass.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_audit_row_chained(
+    secret: &[u8],
+    operation: &str,
+    actor: &str,
+    changed_at: &str,
+    prev_hash: Option<&str>,
+    row_data: &str,
+    stored_hash: Option<&str>,
+    integrity_expected: bool,
+) -> Option<bool> {
     match stored_hash {
         Some(stored) => {
-            let message = build_hmac_message(operation, actor, changed_at, row_data);
+            let message =
+                build_hmac_message_chained(operation, actor, changed_at, prev_hash, row_data);
             let expected = hex_encode(&hmac_sha256(secret, &message));
             // Constant-time comparison to prevent timing attacks.
             Some(constant_time_eq(expected.as_bytes(), stored.as_bytes()))
         }
         None if integrity_expected => Some(false),
         None => None,
+    }
+}
+
+// ── Chain verification ────────────────────────────────────────────────
+
+/// Result of verifying a single audit row during a chain walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditChainCheck {
+    /// Row signature and chain link both verify.
+    Ok,
+    /// Row HMAC does not match the stored `row_hash`.
+    BadHash,
+    /// `row_hash` is `NULL` but integrity was expected.
+    MissingHash,
+    /// Row signature verifies, but `prev_hash` does not match the previous
+    /// row's `row_hash` (or one of the two is `NULL` while the other is
+    /// not). A deletion of a chain link surfaces here.
+    BrokenChain {
+        expected: Option<String>,
+        found: Option<String>,
+    },
+}
+
+/// One row's verdict in a chain walk: the `audit_id` of the row and its
+/// individual check result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditChainRowResult {
+    pub audit_id: i64,
+    pub check: AuditChainCheck,
+}
+
+/// Walk every row of an audit table in `audit_id` order and verify both
+/// the per-row HMAC signature **and** the integrity of the `prev_hash`
+/// chain.
+///
+/// A deleted row is surfaced as a [`AuditChainCheck::BrokenChain`] on the
+/// row that follows it: `prev_hash` of row N+1 still references the
+/// deleted row's `row_hash`, but row N (now the row before N+1) has a
+/// different `row_hash`.
+///
+/// `integrity_expected` mirrors the parameter of [`verify_audit_row`]: pass
+/// `true` when every row of the chain was supposed to carry an HMAC, and
+/// the function will flag rows missing a `row_hash` as
+/// [`AuditChainCheck::MissingHash`]. Pass `false` to allow a chain that
+/// was bootstrapped without integrity to pass through.
+pub async fn verify_audit_chain(
+    db: &impl Database,
+    audit_table: &str,
+    secret: &[u8],
+    integrity_expected: bool,
+) -> Result<Vec<AuditChainRowResult>, DbError> {
+    let sql = format!(
+        "SELECT \"audit_id\", \"operation\", \"actor_id\", \"changed_at\", \"row_data\", \"row_hash\", \"prev_hash\" FROM {} ORDER BY \"audit_id\" ASC",
+        qi(audit_table)
+    );
+    let rows = db.query(&sql, &[]).await?;
+    let mut results = Vec::with_capacity(rows.len());
+    let mut last_row_hash: Option<String> = None;
+
+    for row in &rows {
+        let audit_id = match row.get("audit_id") {
+            Some(crate::value::Value::I64(n)) => *n,
+            Some(crate::value::Value::I32(n)) => *n as i64,
+            _ => 0,
+        };
+        let operation = row_get_string(row, "operation");
+        // actor_id is nullable: render NULL as "" so it matches the
+        // `as_hmac_str()` behaviour of `ActorId::None`.
+        let actor = row_get_string(row, "actor_id");
+        let changed_at = row_get_string(row, "changed_at");
+        let row_data = row_get_string(row, "row_data");
+        let stored_hash = row_get_optional_string(row, "row_hash");
+        let prev_hash = row_get_optional_string(row, "prev_hash");
+
+        let check = match verify_audit_row_chained(
+            secret,
+            &operation,
+            &actor,
+            &changed_at,
+            prev_hash.as_deref(),
+            &row_data,
+            stored_hash.as_deref(),
+            integrity_expected,
+        ) {
+            Some(true) => {
+                // Row signature verified — now check the chain link.
+                if prev_hash == last_row_hash {
+                    AuditChainCheck::Ok
+                } else {
+                    AuditChainCheck::BrokenChain {
+                        expected: last_row_hash.clone(),
+                        found: prev_hash.clone(),
+                    }
+                }
+            }
+            Some(false) => {
+                if stored_hash.is_none() {
+                    AuditChainCheck::MissingHash
+                } else {
+                    AuditChainCheck::BadHash
+                }
+            }
+            None => AuditChainCheck::Ok, // integrity not expected for this row
+        };
+
+        results.push(AuditChainRowResult { audit_id, check });
+        // Advance the chain tracker even on errors so the *next* row's
+        // verdict reflects what is actually in the table — chasing a
+        // bad-hash row with a "broken chain" verdict on the next row would
+        // be redundant noise.
+        last_row_hash = stored_hash;
+    }
+
+    Ok(results)
+}
+
+fn row_get_string(row: &crate::db::Row, col: &str) -> String {
+    match row.get(col) {
+        Some(crate::value::Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+fn row_get_optional_string(row: &crate::db::Row, col: &str) -> Option<String> {
+    match row.get(col) {
+        Some(crate::value::Value::String(s)) => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -902,6 +1423,7 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
 ) -> Result<u64, DbError> {
     let (insert_sql, insert_params) = builder.build();
     let audit_table = M::audit_table_name();
+    let parent_table = M::table_name();
     let col_names: Vec<&'static str> = M::writable_column_names().to_vec();
     let actor = ctx.actor.clone();
     // Clone the secret into a ZeroOnDrop *immediately* so every copy is
@@ -909,6 +1431,7 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
     // between here and the closure body.
     let secret_guard = ctx.hmac_secret.clone();
     let dialect = ctx.dialect;
+    let sink = ctx.sink.clone();
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
@@ -917,6 +1440,7 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
         // Move the ZeroOnDrop-wrapped secret into the future; its Drop
         // impl zeroizes on completion or panic.
         let secret_guard = secret_guard.clone();
+        let sink = sink.clone();
         Box::pin(async move {
             use crate::db::DynDatabase;
 
@@ -934,13 +1458,23 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
             //    row and recompute the hash over an empty timestamp.
             let changed_at = current_changed_at();
 
-            // 4. Compute HMAC over the bound changed_at value.
+            // 4. Read the chain tip inside the transaction (locked when the
+            //    dialect supports it) and chain the new row's HMAC to it.
+            let prev_hash = if secret_guard.is_some() {
+                read_chain_tip(tx, audit_table, dialect).await?
+            } else {
+                None
+            };
+
+            // 5. Compute HMAC over the bound changed_at value, optionally
+            //    chained to the previous row's hash.
             let row_hash = if let Some(ref secret) = secret_guard {
                 let actor_str = actor.as_hmac_str();
-                let message = build_hmac_message(
+                let message = build_hmac_message_chained(
                     AuditOperation::Insert.as_str(),
                     &actor_str,
                     &changed_at,
+                    prev_hash.as_deref(),
                     &row_data,
                 );
                 Some(hex_encode(&hmac_sha256(&secret.0, &message)))
@@ -948,17 +1482,38 @@ pub async fn audited_insert<M: Auditable + crate::db::FromRow>(
                 None
             };
 
-            // 5. Insert audit row with explicit changed_at parameter.
+            // 6. Insert audit row with explicit changed_at parameter.
             let (audit_sql, audit_params) = build_audit_insert(
                 audit_table,
                 AuditOperation::Insert.as_str(),
                 actor.to_value(),
                 &changed_at,
-                row_data,
-                row_hash,
+                row_data.clone(),
+                row_hash.clone(),
+                prev_hash.clone(),
                 dialect,
             );
             DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
+
+            // 7. Mirror to the external sink if one is configured.
+            //    A sink failure is bubbled as `DbError::Other` which causes
+            //    the whole transaction to roll back — the DML and the audit
+            //    row both go away, preserving the "never DB without sink"
+            //    invariant.
+            if let Some(sink) = sink.as_ref() {
+                let event = AuditEvent {
+                    table: parent_table,
+                    operation: AuditOperation::Insert,
+                    actor: &actor,
+                    changed_at: &changed_at,
+                    row_data: &row_data,
+                    row_hash: row_hash.as_deref(),
+                    prev_hash: prev_hash.as_deref(),
+                };
+                sink.write(&event)
+                    .await
+                    .map_err(|e| DbError::Other(format!("audit sink rejected event: {e}")))?;
+            }
             Ok(())
         })
     }))
@@ -991,6 +1546,7 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
 
     let (update_sql, update_params) = builder.build();
     let audit_table = M::audit_table_name();
+    let parent_table = M::table_name();
     let col_names: Vec<&'static str> = M::column_names().to_vec();
     let actor = ctx.actor.clone();
     // Clone the secret into a ZeroOnDrop *immediately* so every copy is
@@ -998,6 +1554,7 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
     // between here and the closure body.
     let secret_guard = ctx.hmac_secret.clone();
     let dialect = ctx.dialect;
+    let sink = ctx.sink.clone();
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
@@ -1006,6 +1563,7 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
         // Move the ZeroOnDrop-wrapped secret into the future; its Drop
         // impl zeroizes on completion or panic.
         let secret_guard = secret_guard.clone();
+        let sink = sink.clone();
         Box::pin(async move {
             use crate::db::DynDatabase;
 
@@ -1030,10 +1588,18 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
             // 4. Read after-images for the same rows.
             let after_rows = DynDatabase::query(tx, &select_sql_base, &select_params).await?;
 
-            // 5. Build combined row_data {"before":{...},"after":{...}} and compute HMACs.
-            //    changed_at is generated app-side so it is covered by the signature.
-            let mut entries: Vec<(String, String, Option<String>)> =
-                Vec::with_capacity(before_images.len());
+            // 5. Read the chain tip inside the transaction. The walking
+            //    `prev_hash` is updated after each row so that N audit rows
+            //    written by a multi-row UPDATE form a contiguous chain.
+            let mut prev_hash = if secret_guard.is_some() {
+                read_chain_tip(tx, audit_table, dialect).await?
+            } else {
+                None
+            };
+
+            // 6. For each (before, after) pair: build the combined row_data,
+            //    compute the chained HMAC, insert the audit row, then
+            //    advance `prev_hash` to the row we just signed.
             for (before, after_row) in before_images.iter().zip(after_rows.iter()) {
                 let after_vals: Vec<crate::value::Value> = col_names
                     .iter()
@@ -1050,31 +1616,52 @@ pub async fn audited_update<M: Auditable + crate::db::FromRow>(
 
                 let row_hash = if let Some(ref secret) = secret_guard {
                     let actor_str = actor.as_hmac_str();
-                    let message = build_hmac_message(
+                    let message = build_hmac_message_chained(
                         AuditOperation::Update.as_str(),
                         &actor_str,
                         &changed_at,
+                        prev_hash.as_deref(),
                         &row_data,
                     );
                     Some(hex_encode(&hmac_sha256(&secret.0, &message)))
                 } else {
                     None
                 };
-                entries.push((changed_at, row_data, row_hash));
-            }
 
-            // 6. Insert one audit row per before+after pair.
-            for (changed_at, row_data, row_hash) in entries {
                 let (audit_sql, audit_params) = build_audit_insert(
                     audit_table,
                     AuditOperation::Update.as_str(),
                     actor.to_value(),
                     &changed_at,
-                    row_data,
-                    row_hash,
+                    row_data.clone(),
+                    row_hash.clone(),
+                    prev_hash.clone(),
                     dialect,
                 );
                 DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
+
+                // Mirror to the external sink, propagating failures so
+                // the transaction rolls back if the sink rejects.
+                if let Some(sink) = sink.as_ref() {
+                    let event = AuditEvent {
+                        table: parent_table,
+                        operation: AuditOperation::Update,
+                        actor: &actor,
+                        changed_at: &changed_at,
+                        row_data: &row_data,
+                        row_hash: row_hash.as_deref(),
+                        prev_hash: prev_hash.as_deref(),
+                    };
+                    sink.write(&event)
+                        .await
+                        .map_err(|e| DbError::Other(format!("audit sink rejected event: {e}")))?;
+                }
+
+                // Advance the chain tip so the next iteration links to the
+                // row we just inserted, not the original tip.
+                if row_hash.is_some() {
+                    prev_hash = row_hash;
+                }
             }
             Ok(())
         })
@@ -1103,6 +1690,7 @@ pub async fn audited_delete<M: Auditable + FromRow>(
     let select_sql = format!("{select_sql_base} FOR UPDATE");
     let (delete_sql, delete_params) = builder.build();
     let audit_table = M::audit_table_name();
+    let parent_table = M::table_name();
     let col_names: Vec<&'static str> = M::column_names().to_vec();
     let actor = ctx.actor.clone();
     // Clone the secret into a ZeroOnDrop *immediately* so every copy is
@@ -1110,6 +1698,7 @@ pub async fn audited_delete<M: Auditable + FromRow>(
     // between here and the closure body.
     let secret_guard = ctx.hmac_secret.clone();
     let dialect = ctx.dialect;
+    let sink = ctx.sink.clone();
 
     let affected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let affected_clone = affected.clone();
@@ -1118,16 +1707,24 @@ pub async fn audited_delete<M: Auditable + FromRow>(
         // Move the ZeroOnDrop-wrapped secret into the future; its Drop
         // impl zeroizes on completion or panic.
         let secret_guard = secret_guard.clone();
+        let sink = sink.clone();
         Box::pin(async move {
             use crate::db::DynDatabase;
 
             // 1. Read matching rows inside the transaction (locked FOR UPDATE).
             let old_rows = DynDatabase::query(tx, &select_sql, &select_params).await?;
 
-            // 2. Serialize rows and compute HMACs. changed_at is generated
-            //    app-side so it is covered by the signature.
+            // 2. Serialise rows and compute chained HMACs. The walking
+            //    `prev_hash` starts at the audit-table chain tip (read in
+            //    the same transaction) and advances after each iteration so
+            //    multi-row deletes produce a contiguous chain segment.
             let col_refs: Vec<&str> = col_names.to_vec();
-            let mut entries: Vec<(String, String, Option<String>)> =
+            let mut prev_hash = if secret_guard.is_some() {
+                read_chain_tip(tx, audit_table, dialect).await?
+            } else {
+                None
+            };
+            let mut entries: Vec<(String, String, Option<String>, Option<String>)> =
                 Vec::with_capacity(old_rows.len());
             for row in &old_rows {
                 let vals: Vec<crate::value::Value> = col_names
@@ -1138,35 +1735,56 @@ pub async fn audited_delete<M: Auditable + FromRow>(
                 let changed_at = current_changed_at();
                 let row_hash = if let Some(ref secret) = secret_guard {
                     let actor_str = actor.as_hmac_str();
-                    let message = build_hmac_message(
+                    let message = build_hmac_message_chained(
                         AuditOperation::Delete.as_str(),
                         &actor_str,
                         &changed_at,
+                        prev_hash.as_deref(),
                         &row_data,
                     );
                     Some(hex_encode(&hmac_sha256(&secret.0, &message)))
                 } else {
                     None
                 };
-                entries.push((changed_at, row_data, row_hash));
+                let prev_for_row = prev_hash.clone();
+                if row_hash.is_some() {
+                    prev_hash = row_hash.clone();
+                }
+                entries.push((changed_at, row_data, row_hash, prev_for_row));
             }
 
             // 3. Delete the rows.
             let n = DynDatabase::execute(tx, &delete_sql, &delete_params).await?;
             affected_clone.store(n, std::sync::atomic::Ordering::Relaxed);
 
-            // 4. Insert audit rows.
-            for (changed_at, row_data, row_hash) in entries {
+            // 4. Insert audit rows + mirror to sink.
+            for (changed_at, row_data, row_hash, prev_for_row) in entries {
                 let (audit_sql, audit_params) = build_audit_insert(
                     audit_table,
                     AuditOperation::Delete.as_str(),
                     actor.to_value(),
                     &changed_at,
-                    row_data,
-                    row_hash,
+                    row_data.clone(),
+                    row_hash.clone(),
+                    prev_for_row.clone(),
                     dialect,
                 );
                 DynDatabase::execute(tx, &audit_sql, &audit_params).await?;
+
+                if let Some(sink) = sink.as_ref() {
+                    let event = AuditEvent {
+                        table: parent_table,
+                        operation: AuditOperation::Delete,
+                        actor: &actor,
+                        changed_at: &changed_at,
+                        row_data: &row_data,
+                        row_hash: row_hash.as_deref(),
+                        prev_hash: prev_for_row.as_deref(),
+                    };
+                    sink.write(&event)
+                        .await
+                        .map_err(|e| DbError::Other(format!("audit sink rejected event: {e}")))?;
+                }
             }
             Ok(())
         })
@@ -1178,6 +1796,50 @@ pub async fn audited_delete<M: Auditable + FromRow>(
 
 // ── Internal helpers ─────────────────────────────────────────────────
 
+/// Read the most recent `row_hash` from the audit table — the "tip" of the
+/// hash chain — locking it when the dialect supports `FOR UPDATE` so that
+/// two concurrent transactions cannot both produce rows that point at the
+/// same predecessor.
+///
+/// Returns `Ok(None)` when the audit table is empty or the latest row has
+/// `row_hash = NULL` (integrity was not configured for that row). The
+/// caller treats both cases identically: the next row is the start of a
+/// fresh chain segment.
+async fn read_chain_tip(
+    tx: &dyn crate::db::DynDatabase,
+    audit_table: &str,
+    dialect: crate::query::Dialect,
+) -> Result<Option<String>, DbError> {
+    use crate::db::DynDatabase;
+
+    // SQLite does not support row-level `FOR UPDATE`; its WAL+IMMEDIATE
+    // locking already serialises writes per database.
+    let lock = matches!(
+        dialect,
+        crate::query::Dialect::Postgres | crate::query::Dialect::Mysql
+    );
+    let sql = if lock {
+        format!(
+            "SELECT \"row_hash\" FROM {} ORDER BY \"audit_id\" DESC LIMIT 1 FOR UPDATE",
+            qi(audit_table)
+        )
+    } else {
+        format!(
+            "SELECT \"row_hash\" FROM {} ORDER BY \"audit_id\" DESC LIMIT 1",
+            qi(audit_table)
+        )
+    };
+    let rows = DynDatabase::query(tx, &sql, &[]).await?;
+    if let Some(row) = rows.into_iter().next() {
+        match row.get("row_hash") {
+            Some(crate::value::Value::String(s)) => Ok(Some(s.clone())),
+            _ => Ok(None),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 /// Build the audit INSERT SQL and parameter list.
 ///
 /// When `row_hash` is `Some`, includes the `row_hash` column; otherwise omits
@@ -1185,6 +1847,7 @@ pub async fn audited_delete<M: Auditable + FromRow>(
 ///
 /// The `dialect` parameter controls placeholder style: `?` for Generic/MySQL,
 /// `$1, $2, …` for PostgreSQL.
+#[allow(clippy::too_many_arguments)]
 fn build_audit_insert(
     audit_table: &str,
     operation: &str,
@@ -1192,37 +1855,65 @@ fn build_audit_insert(
     changed_at: &str,
     row_data: String,
     row_hash: Option<String>,
+    prev_hash: Option<String>,
     dialect: crate::query::Dialect,
 ) -> (String, Vec<crate::value::Value>) {
     // `changed_at` is bound by the caller (RFC 3339 UTC) so it is covered
     // by the HMAC signature at INSERT time. This closes the antedating
     // window where the DB-side `NOW()` was only known post-INSERT and
     // therefore not signed.
-    let (sql, params) = if let Some(hash) = row_hash {
-        let sql = format!(
-            "INSERT INTO {} (\"operation\", \"actor_id\", \"changed_at\", \"row_data\", \"row_hash\") VALUES (?, ?, ?, ?, ?)",
-            qi(audit_table)
-        );
-        let params = vec![
-            crate::value::Value::String(operation.into()),
-            actor_val,
-            crate::value::Value::String(changed_at.to_owned()),
-            crate::value::Value::String(row_data),
-            crate::value::Value::String(hash),
-        ];
-        (sql, params)
-    } else {
-        let sql = format!(
-            "INSERT INTO {} (\"operation\", \"actor_id\", \"changed_at\", \"row_data\") VALUES (?, ?, ?, ?)",
-            qi(audit_table)
-        );
-        let params = vec![
-            crate::value::Value::String(operation.into()),
-            actor_val,
-            crate::value::Value::String(changed_at.to_owned()),
-            crate::value::Value::String(row_data),
-        ];
-        (sql, params)
+    //
+    // The INSERT shape varies with whether a `row_hash` and `prev_hash` are
+    // present, so the audit table can be queried by adapters that only know
+    // about the legacy schema. Concretely:
+    //   * row_hash = None              → 4-column legacy INSERT
+    //   * row_hash = Some, prev = None → 5-column INSERT (no chain link)
+    //   * both Some                    → 6-column chained INSERT
+    let (sql, params) = match (row_hash, prev_hash) {
+        (Some(hash), Some(prev)) => {
+            let sql = format!(
+                "INSERT INTO {} (\"operation\", \"actor_id\", \"changed_at\", \"row_data\", \"row_hash\", \"prev_hash\") VALUES (?, ?, ?, ?, ?, ?)",
+                qi(audit_table)
+            );
+            let params = vec![
+                crate::value::Value::String(operation.into()),
+                actor_val,
+                crate::value::Value::String(changed_at.to_owned()),
+                crate::value::Value::String(row_data),
+                crate::value::Value::String(hash),
+                crate::value::Value::String(prev),
+            ];
+            (sql, params)
+        }
+        (Some(hash), None) => {
+            let sql = format!(
+                "INSERT INTO {} (\"operation\", \"actor_id\", \"changed_at\", \"row_data\", \"row_hash\") VALUES (?, ?, ?, ?, ?)",
+                qi(audit_table)
+            );
+            let params = vec![
+                crate::value::Value::String(operation.into()),
+                actor_val,
+                crate::value::Value::String(changed_at.to_owned()),
+                crate::value::Value::String(row_data),
+                crate::value::Value::String(hash),
+            ];
+            (sql, params)
+        }
+        (None, _) => {
+            // No HMAC — chain is irrelevant without integrity, so prev_hash
+            // is dropped silently.
+            let sql = format!(
+                "INSERT INTO {} (\"operation\", \"actor_id\", \"changed_at\", \"row_data\") VALUES (?, ?, ?, ?)",
+                qi(audit_table)
+            );
+            let params = vec![
+                crate::value::Value::String(operation.into()),
+                actor_val,
+                crate::value::Value::String(changed_at.to_owned()),
+                crate::value::Value::String(row_data),
+            ];
+            (sql, params)
+        }
     };
     // Rewrite ? placeholders to $N for PostgreSQL.
     if dialect == crate::query::Dialect::Postgres {
@@ -1317,13 +2008,14 @@ mod tests {
     #[test]
     fn test_audit_column_defs_count() {
         let defs = audit_column_defs_for("users");
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7);
         assert_eq!(defs[0].name, "audit_id");
         assert_eq!(defs[1].name, "operation");
         assert_eq!(defs[2].name, "actor_id");
         assert_eq!(defs[3].name, "changed_at");
         assert_eq!(defs[4].name, "row_data");
         assert_eq!(defs[5].name, "row_hash");
+        assert_eq!(defs[6].name, "prev_hash");
     }
 
     #[test]
@@ -1340,7 +2032,7 @@ mod tests {
         assert_eq!(defs[3].sql_type, SqlType::Timestamptz);
         assert_eq!(
             defs[3].default,
-            Some(crate::schema::DefaultValue::Expr("NOW()"))
+            Some(crate::schema::DefaultValue::Expr("CURRENT_TIMESTAMP"))
         );
         assert_eq!(defs[4].sql_type, SqlType::Jsonb);
         assert_eq!(defs[5].sql_type, SqlType::Text);
@@ -1872,5 +2564,489 @@ mod tests {
             json,
             r#"{"newline":"hello\nworld","tab":"a\tb","null_byte":"x\u0000y"}"#
         );
+    }
+
+    // ── Hash chaining ────────────────────────────────────────────────
+
+    #[test]
+    fn audit_column_defs_includes_prev_hash() {
+        let defs = audit_column_defs_for("anything");
+        assert_eq!(
+            defs.len(),
+            7,
+            "expected 7 audit columns including prev_hash"
+        );
+        let prev = defs
+            .iter()
+            .find(|d| d.name == "prev_hash")
+            .expect("prev_hash column missing");
+        assert!(prev.nullable, "prev_hash must be nullable");
+        assert_eq!(prev.sql_type, crate::schema::SqlType::Text);
+    }
+
+    #[test]
+    fn build_hmac_message_chained_without_prev_matches_legacy() {
+        let legacy = build_hmac_message("insert", "actor", "ts", "data");
+        let chained = build_hmac_message_chained("insert", "actor", "ts", None, "data");
+        assert_eq!(legacy, chained);
+    }
+
+    #[test]
+    fn build_hmac_message_chained_with_prev_differs_from_none() {
+        let none = build_hmac_message_chained("insert", "actor", "ts", None, "data");
+        let some = build_hmac_message_chained("insert", "actor", "ts", Some("abc"), "data");
+        assert_ne!(none, some, "prev_hash must influence the signed message");
+    }
+
+    #[test]
+    fn build_hmac_message_chained_sensitive_to_prev_value() {
+        let a = build_hmac_message_chained("insert", "x", "t", Some("aaa"), "d");
+        let b = build_hmac_message_chained("insert", "x", "t", Some("bbb"), "d");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_hash_chained_matches_compute_hash_when_no_prev() {
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"key").unwrap();
+        let h1 = ctx.compute_hash("insert", "ts", "data").unwrap();
+        let h2 = ctx
+            .compute_hash_chained("insert", "ts", "data", None)
+            .unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hash_chained_changes_with_prev() {
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"key").unwrap();
+        let h1 = ctx
+            .compute_hash_chained("insert", "ts", "data", None)
+            .unwrap();
+        let h2 = ctx
+            .compute_hash_chained("insert", "ts", "data", Some("aaa"))
+            .unwrap();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn verify_audit_row_chained_round_trip() {
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
+        let h = ctx
+            .compute_hash_chained(
+                "delete",
+                "2024-01-15T10:30:00Z",
+                r#"{"id":1}"#,
+                Some("prev"),
+            )
+            .unwrap();
+        assert_eq!(
+            verify_audit_row_chained(
+                b"secret",
+                "delete",
+                "7",
+                "2024-01-15T10:30:00Z",
+                Some("prev"),
+                r#"{"id":1}"#,
+                Some(&h),
+                false,
+            ),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn verify_audit_row_chained_detects_prev_hash_tampering() {
+        let ctx = AuditContext::with_integrity(ActorId::Int(7), b"secret").unwrap();
+        let h = ctx
+            .compute_hash_chained("delete", "ts", "data", Some("prev"))
+            .unwrap();
+        assert_eq!(
+            verify_audit_row_chained(
+                b"secret",
+                "delete",
+                "7",
+                "ts",
+                Some("forged_prev"),
+                "data",
+                Some(&h),
+                false,
+            ),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn verify_audit_row_legacy_still_verifies_unchained_rows() {
+        let ctx = AuditContext::with_integrity(ActorId::Int(1), b"k").unwrap();
+        let legacy_hash = ctx.compute_hash("insert", "ts", "row").unwrap();
+        assert_eq!(
+            verify_audit_row(b"k", "insert", "1", "ts", "row", Some(&legacy_hash), false),
+            Some(true),
+        );
+    }
+
+    // ── verify_audit_chain ───────────────────────────────────────────
+
+    struct MockChainDb {
+        rows: Vec<crate::db::Row>,
+    }
+
+    impl crate::db::Database for MockChainDb {
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<u64, DbError> {
+            Ok(0)
+        }
+        async fn query(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<Vec<crate::db::Row>, DbError> {
+            Ok(self.rows.clone())
+        }
+        async fn query_one(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<crate::db::Row, DbError> {
+            Err(DbError::RecordNotFound)
+        }
+        async fn transaction<'a>(
+            &'a self,
+            _f: crate::db::TransactionFn<'a>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    fn make_audit_row(
+        id: i64,
+        operation: &str,
+        actor: &str,
+        changed_at: &str,
+        row_data: &str,
+        row_hash: Option<&str>,
+        prev_hash: Option<&str>,
+    ) -> crate::db::Row {
+        let columns = vec![
+            "audit_id".to_string(),
+            "operation".to_string(),
+            "actor_id".to_string(),
+            "changed_at".to_string(),
+            "row_data".to_string(),
+            "row_hash".to_string(),
+            "prev_hash".to_string(),
+        ];
+        let values = vec![
+            Value::I64(id),
+            Value::String(operation.into()),
+            Value::String(actor.into()),
+            Value::String(changed_at.into()),
+            Value::String(row_data.into()),
+            row_hash
+                .map(|s| Value::String(s.into()))
+                .unwrap_or(Value::Null),
+            prev_hash
+                .map(|s| Value::String(s.into()))
+                .unwrap_or(Value::Null),
+        ];
+        crate::db::Row::new(columns, values)
+    }
+
+    fn build_chain(secret: &[u8], actor: &str, entries: &[(&str, &str)]) -> Vec<crate::db::Row> {
+        let mut rows = Vec::with_capacity(entries.len());
+        let mut prev: Option<String> = None;
+        for (i, (op, data)) in entries.iter().enumerate() {
+            let ts = format!("2024-01-15T10:30:0{i}Z");
+            let msg = build_hmac_message_chained(op, actor, &ts, prev.as_deref(), data);
+            let hash = hex_encode(&hmac_sha256(secret, &msg));
+            rows.push(make_audit_row(
+                (i + 1) as i64,
+                op,
+                actor,
+                &ts,
+                data,
+                Some(&hash),
+                prev.as_deref(),
+            ));
+            prev = Some(hash);
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn verify_audit_chain_accepts_well_formed_chain() {
+        let rows = build_chain(
+            b"secret",
+            "1",
+            &[
+                ("insert", r#"{"id":1}"#),
+                ("update", r#"{"id":1,"v":2}"#),
+                ("delete", r#"{"id":1,"v":2}"#),
+            ],
+        );
+        let db = MockChainDb { rows };
+        let results = verify_audit_chain(&db, "users_audit", b"secret", true)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert_eq!(r.check, AuditChainCheck::Ok, "row {} failed", r.audit_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_audit_chain_detects_deleted_middle_row() {
+        let mut rows = build_chain(
+            b"k",
+            "1",
+            &[("insert", "a"), ("update", "b"), ("delete", "c")],
+        );
+        rows.remove(1);
+        let db = MockChainDb { rows };
+        let results = verify_audit_chain(&db, "x_audit", b"k", true)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].check, AuditChainCheck::Ok);
+        match &results[1].check {
+            AuditChainCheck::BrokenChain { .. } => {}
+            other => panic!("expected BrokenChain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_audit_chain_detects_tampered_row_data() {
+        let rows = build_chain(b"k", "1", &[("insert", "a"), ("update", "b")]);
+        // Replace row 2 with a tampered version: same row_hash, different
+        // row_data — verifies that the per-row HMAC catches data forgery.
+        let original_hash = match rows[1].get("row_hash") {
+            Some(Value::String(s)) => s.clone(),
+            _ => unreachable!(),
+        };
+        let original_prev = match rows[1].get("prev_hash") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let mut tampered = rows;
+        tampered[1] = make_audit_row(
+            2,
+            "update",
+            "1",
+            "2024-01-15T10:30:01Z",
+            "forged",
+            Some(&original_hash),
+            original_prev.as_deref(),
+        );
+        let db = MockChainDb { rows: tampered };
+        let results = verify_audit_chain(&db, "x_audit", b"k", true)
+            .await
+            .unwrap();
+        assert_eq!(results[0].check, AuditChainCheck::Ok);
+        assert_eq!(results[1].check, AuditChainCheck::BadHash);
+    }
+
+    #[tokio::test]
+    async fn verify_audit_chain_flags_missing_hash_when_integrity_expected() {
+        let rows = vec![make_audit_row(1, "insert", "1", "ts", "data", None, None)];
+        let db = MockChainDb { rows };
+        let results = verify_audit_chain(&db, "x_audit", b"k", true)
+            .await
+            .unwrap();
+        assert_eq!(results[0].check, AuditChainCheck::MissingHash);
+    }
+
+    #[tokio::test]
+    async fn verify_audit_chain_handles_empty_table() {
+        let db = MockChainDb { rows: vec![] };
+        let results = verify_audit_chain(&db, "x_audit", b"k", true)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── AuditSink ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn noop_audit_sink_accepts_every_event() {
+        let sink = NoopAuditSink;
+        let actor = ActorId::Int(1);
+        let event = AuditEvent {
+            table: "users",
+            operation: AuditOperation::Insert,
+            actor: &actor,
+            changed_at: "2026-05-07T10:00:00Z",
+            row_data: r#"{"id":1}"#,
+            row_hash: None,
+            prev_hash: None,
+        };
+        sink.write(&event).await.unwrap();
+    }
+
+    #[cfg(feature = "audit-file")]
+    #[test]
+    fn audit_event_to_jsonl_minimal_shape() {
+        let actor = ActorId::Int(42);
+        let event = AuditEvent {
+            table: "users",
+            operation: AuditOperation::Insert,
+            actor: &actor,
+            changed_at: "2026-05-07T10:00:00Z",
+            row_data: r#"{"id":1}"#,
+            row_hash: None,
+            prev_hash: None,
+        };
+        let line = audit_event_to_jsonl(&event);
+        assert_eq!(
+            line,
+            r#"{"table":"users","operation":"insert","actor":42,"changed_at":"2026-05-07T10:00:00Z","row_data":{"id":1}}"#
+        );
+    }
+
+    #[cfg(feature = "audit-file")]
+    #[test]
+    fn audit_event_to_jsonl_includes_hashes_when_present() {
+        let actor = ActorId::None;
+        let event = AuditEvent {
+            table: "users",
+            operation: AuditOperation::Update,
+            actor: &actor,
+            changed_at: "2026-05-07T10:00:00Z",
+            row_data: r#"{"id":1}"#,
+            row_hash: Some("abc"),
+            prev_hash: Some("xyz"),
+        };
+        let line = audit_event_to_jsonl(&event);
+        assert!(line.contains(r#""actor":null"#));
+        assert!(line.contains(r#""row_hash":"abc""#));
+        assert!(line.contains(r#""prev_hash":"xyz""#));
+        // Single-line: JSON has no embedded newlines.
+        assert!(!line.contains('\n'));
+    }
+
+    #[cfg(feature = "audit-file")]
+    #[test]
+    fn audit_event_to_jsonl_escapes_string_actor() {
+        let actor = ActorId::String("alice\"quoted".into());
+        let event = AuditEvent {
+            table: "x",
+            operation: AuditOperation::Delete,
+            actor: &actor,
+            changed_at: "ts",
+            row_data: "{}",
+            row_hash: None,
+            prev_hash: None,
+        };
+        let line = audit_event_to_jsonl(&event);
+        assert!(
+            line.contains(r#""actor":"alice\"quoted""#),
+            "expected escaped quote, got: {line}"
+        );
+    }
+
+    #[cfg(feature = "audit-file")]
+    #[tokio::test]
+    async fn file_audit_sink_appends_one_line_per_event() {
+        // Use a deterministic temp path under the system tmp dir to avoid
+        // pulling `tempfile` as a dev-dependency just for one test.
+        let path = std::env::temp_dir().join(format!(
+            "reify_audit_sink_test_{}.ndjson",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let sink = FileAuditSink::open(&path).await.unwrap();
+
+        let actor = ActorId::Int(1);
+        let event1 = AuditEvent {
+            table: "users",
+            operation: AuditOperation::Insert,
+            actor: &actor,
+            changed_at: "2026-05-07T10:00:00Z",
+            row_data: r#"{"id":1}"#,
+            row_hash: None,
+            prev_hash: None,
+        };
+        let event2 = AuditEvent {
+            table: "users",
+            operation: AuditOperation::Update,
+            actor: &actor,
+            changed_at: "2026-05-07T10:00:01Z",
+            row_data: r#"{"id":1,"v":2}"#,
+            row_hash: Some("aaa"),
+            prev_hash: None,
+        };
+        sink.write(&event1).await.unwrap();
+        sink.write(&event2).await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains(r#""operation":"insert""#));
+        assert!(lines[1].contains(r#""operation":"update""#));
+        assert!(lines[1].contains(r#""row_hash":"aaa""#));
+
+        // Each line is itself parsable JSON (no embedded newlines).
+        // Manual sanity check: balanced braces.
+        for line in &lines {
+            assert!(line.starts_with('{'));
+            assert!(line.ends_with('}'));
+        }
+
+        // Reopen + append a 3rd event; previous content must be preserved.
+        let sink2 = FileAuditSink::open(&path).await.unwrap();
+        sink2.write(&event1).await.unwrap();
+        let contents2 = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents2.lines().count(), 3);
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "audit-file")]
+    #[tokio::test]
+    async fn file_audit_sink_serialises_concurrent_writes_atomically() {
+        // 8 concurrent tasks each writing one event. The internal mutex
+        // must ensure no line is interleaved with another. Verified by
+        // reading back the file and checking each line is a complete
+        // JSON object with balanced braces.
+        let path = std::env::temp_dir().join(format!(
+            "reify_audit_sink_concurrency_{}.ndjson",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let sink = std::sync::Arc::new(FileAuditSink::open(&path).await.unwrap());
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let s = sink.clone();
+            handles.push(tokio::spawn(async move {
+                let actor = ActorId::Int(i);
+                let row = format!(r#"{{"id":{i}}}"#);
+                let event = AuditEvent {
+                    table: "users",
+                    operation: AuditOperation::Insert,
+                    actor: &actor,
+                    changed_at: "2026-05-07T10:00:00Z",
+                    row_data: &row,
+                    row_hash: None,
+                    prev_hash: None,
+                };
+                s.write(&event).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        drop(sink); // release any held file handles before reading
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 8, "8 events, 8 lines");
+        for line in &lines {
+            // Brace balance proves no interleaving.
+            let opens = line.matches('{').count();
+            let closes = line.matches('}').count();
+            assert_eq!(opens, closes, "unbalanced line: {line}");
+            assert!(line.starts_with('{') && line.ends_with('}'));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

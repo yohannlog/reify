@@ -24,6 +24,55 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+  # Supply-chain audit: advisories, license policy, banned crates, source
+  # allow-list. Rules live in `deny.toml`; CI runs them so a vulnerable
+  # transitive dependency or an unexpected license is caught before merge.
+  deny:
+    name: Supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        # `check` runs all sections from deny.toml: advisories, bans,
+        # licenses, sources. Failure on any section fails the job.
+        run: cargo deny --all-features check
+
+  # MSRV gate: build the workspace with the exact toolchain declared in
+  # `rust-version` (1.90 today). Catches accidental use of features from
+  # a newer stable release that would silently break downstream users
+  # pinned to the MSRV.
+  msrv:
+    name: MSRV (Cargo.toml rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          MSRV=$(awk -F\" '/^rust-version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
+          if [[ -z "$MSRV" ]]; then
+              echo "::error::rust-version not found in Cargo.toml"
+              exit 1
+          fi
+          echo "msrv=$MSRV" >> "$GITHUB_OUTPUT"
+          echo "Detected MSRV: $MSRV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.msrv }}
+      - name: cargo build (MSRV)
+        # Build only — running the test suite under MSRV is unnecessary
+        # extra cost. The compile gate is what catches accidental usage
+        # of post-MSRV features.
+        run: cargo build --workspace --all-features
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

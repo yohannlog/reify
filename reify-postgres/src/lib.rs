@@ -769,15 +769,10 @@ pub(crate) async fn get_conn(
     pool: &Pool,
     acquire_timeout: std::time::Duration,
 ) -> Result<deadpool_postgres::Object, DbError> {
-    match tokio::time::timeout(acquire_timeout, pool.get()).await {
-        Ok(Ok(conn)) => Ok(conn),
-        Ok(Err(e)) => Err(DbError::Connection(e.to_string())),
-        Err(_) => Err(DbError::Connection(format!(
-            "pool acquisition timed out after {}ms; check for streams or \
-             transactions holding connections",
-            acquire_timeout.as_millis()
-        ))),
-    }
+    // Shared timeout + error mapping lives in `reify_core::adapter` so
+    // it stays in sync with the MySQL adapter; see that helper for the
+    // rationale (avoid identical 10-line duplicates per adapter).
+    reify_core::adapter::acquire_with_timeout(acquire_timeout, pool.get()).await
 }
 
 /// Rewrite `?` placeholders to PostgreSQL-style `$1, $2, …` positional params.

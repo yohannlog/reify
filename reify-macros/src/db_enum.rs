@@ -81,19 +81,21 @@ pub(crate) fn impl_db_enum(input: &DeriveInput) -> syn::Result<proc_macro2::Toke
         }
 
         impl reify_core::value::FromValue for #enum_name {
-            fn from_value(val: reify_core::Value) -> Result<Self, String> {
+            fn from_value(val: reify_core::Value) -> Result<Self, reify_core::value::FromValueError> {
                 match &val {
                     reify_core::Value::String(s) => {
                         <#enum_name as reify_core::DbEnum>::from_str(s).ok_or_else(|| {
-                            format!(
+                            reify_core::value::FromValueError::Conversion(format!(
                                 "unknown enum variant '{}', expected one of {:?}",
                                 s,
                                 <#enum_name as reify_core::DbEnum>::variants()
-                            )
+                            ))
                         })
                     }
-                    reify_core::Value::Null => Err("expected enum value, got NULL".to_string()),
-                    other => Err(format!("expected string for enum, got {:?}", other)),
+                    reify_core::Value::Null => Err(
+                        reify_core::value::FromValueError::Null { expected: "enum string" },
+                    ),
+                    _ => Err(reify_core::value::type_mismatch("enum string", &val)),
                 }
             }
         }

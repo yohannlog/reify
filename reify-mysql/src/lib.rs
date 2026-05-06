@@ -112,15 +112,9 @@ impl MysqlDb {
     /// pool surfaces as `DbError::Connection` after the deadline instead of
     /// blocking the caller indefinitely.
     async fn get_conn(&self) -> Result<mysql_async::Conn, DbError> {
-        match tokio::time::timeout(self.acquire_timeout, self.pool.get_conn()).await {
-            Ok(Ok(conn)) => Ok(conn),
-            Ok(Err(e)) => Err(DbError::Connection(e.to_string())),
-            Err(_) => Err(DbError::Connection(format!(
-                "pool acquisition timed out after {}ms; check for streams or \
-                 transactions holding connections",
-                self.acquire_timeout.as_millis()
-            ))),
-        }
+        // Shared timeout + error mapping lives in `reify_core::adapter`
+        // so it stays in sync with the PostgreSQL adapter.
+        reify_core::adapter::acquire_with_timeout(self.acquire_timeout, self.pool.get_conn()).await
     }
 
     /// Like [`Database::query_stream`] but every `next().await` is bounded

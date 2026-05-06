@@ -1,7 +1,7 @@
 use super::MigrationRunner;
 use crate::db::Database;
 use crate::migration::context::MigrationContext;
-use crate::migration::ddl::{add_column_sql, create_index_sql};
+use crate::migration::ddl::{create_index_sql, try_add_column_sql};
 use crate::migration::error::MigrationError;
 use crate::migration::plan::{MigrationPlan, compute_checksum};
 use crate::query::Dialect;
@@ -41,13 +41,19 @@ impl MigrationRunner {
                         let cols_key = new_cols.join(",");
                         let add_version = format!("auto__{}_add_{}", entry.table_name, cols_key);
                         if !applied.contains(&add_version) {
+                            // `try_add_column_sql` rejects NOT NULL columns
+                            // without a synthesisable default. Surface that
+                            // as `MigrationError::Other` instead of panicking
+                            // — the runner can then abort cleanly before
+                            // touching the database.
                             let stmts: Vec<String> = new_cols
                                 .iter()
                                 .map(|col| {
                                     let def = entry.column_defs.iter().find(|d| d.name == *col);
-                                    add_column_sql(entry.table_name, col, def, dialect)
+                                    try_add_column_sql(entry.table_name, col, def, dialect)
+                                        .map_err(|e| MigrationError::Other(e.to_string()))
                                 })
-                                .collect();
+                                .collect::<Result<_, _>>()?;
                             let checksum = compute_checksum(&stmts);
                             plans.push(MigrationPlan {
                                 version: add_version,
@@ -105,7 +111,11 @@ impl MigrationRunner {
                     for col in entry.column_names {
                         if !existing_col_names.contains(col) {
                             let def = entry.column_defs.iter().find(|d| d.name == *col);
-                            stmts.push(add_column_sql(entry.table_name, col, def, dialect));
+                            // Fallible — bubble up the MissingDefault error so
+                            // the runner can abort cleanly without panicking.
+                            let sql = try_add_column_sql(entry.table_name, col, def, dialect)
+                                .map_err(|e| MigrationError::Other(e.to_string()))?;
+                            stmts.push(sql);
                         }
                     }
 

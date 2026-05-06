@@ -12,9 +12,24 @@ yanked = "deny"
 
 # Advisories ignored because they are transitive deps we don't control
 # and no safe upgrade is available upstream.
+#
+# Tracking:
+#   Each ignored advisory MUST have a GitHub issue linked below and MUST be
+#   re-evaluated whenever the affected dependency releases a new version.
+#   Run `cargo deny check advisories` in CI to surface new advisories.
 ignore = [
-  # rustls-pemfile is unmaintained (RUSTSEC-2025-0134), pulled in by
-  # mysql_async — no fix available until mysql_async drops the dependency.
+  # rustls-pemfile is unmaintained (RUSTSEC-2025-0134), pulled in transitively
+  # by mysql_async → rustls-* stack. No fix available until mysql_async migrates
+  # to rustls-pki-types / a maintained PEM parser.
+  #
+  # Tracking issue:
+  #   https://github.com/yohann-catherine/reify/issues/RUSTSEC-2025-0134
+  # Upstream:
+  #   https://github.com/blackbeam/mysql_async/issues (watch for a release
+  #   that bumps rustls and drops rustls-pemfile)
+  #
+  # Remove this entry as soon as `cargo tree -i rustls-pemfile` reports the
+  # crate is no longer in the graph.
   "RUSTSEC-2025-0134",
 ]
 

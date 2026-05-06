@@ -324,3 +324,147 @@ impl<M: Table> DeleteBuilder<M> {
         crate::db::delete_returning_old(db, self).await
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::condition::Condition;
+
+    /// Plain table with no soft-delete column — exercises the hard-delete path.
+    struct Hard;
+    impl Table for Hard {
+        fn table_name() -> &'static str {
+            "hard"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "name"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+
+    /// Table with a soft-delete column — exercises the auto-promotion path.
+    struct Soft;
+    impl Table for Soft {
+        fn table_name() -> &'static str {
+            "soft"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "deleted_at"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+        fn soft_delete_column() -> Option<&'static str> {
+            Some("deleted_at")
+        }
+    }
+
+    fn id_eq(v: i64) -> Condition {
+        Condition::Eq("id", Value::I64(v))
+    }
+
+    #[test]
+    fn build_with_filter_emits_delete_from_with_where() {
+        let (sql, params) = DeleteBuilder::<Hard>::new().filter(id_eq(7)).build();
+        assert!(sql.starts_with("DELETE FROM \"hard\""), "sql: {sql}");
+        assert!(sql.contains(" WHERE "), "sql: {sql}");
+        assert_eq!(params, vec![Value::I64(7)]);
+    }
+
+    #[test]
+    fn unfiltered_emits_delete_without_where() {
+        let (sql, params) = DeleteBuilder::<Hard>::new().unfiltered().build();
+        assert!(sql.starts_with("DELETE FROM \"hard\""));
+        assert!(!sql.contains("WHERE"), "must have no WHERE: {sql}");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "DELETE without WHERE is forbidden")]
+    fn build_without_filter_or_unfiltered_panics() {
+        let _ = DeleteBuilder::<Hard>::new().build();
+    }
+
+    #[test]
+    fn try_build_without_filter_returns_missing_filter() {
+        let err = DeleteBuilder::<Hard>::new().try_build().unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::MissingFilter {
+                operation: "DELETE"
+            }
+        ));
+    }
+
+    #[test]
+    fn soft_delete_auto_promotes_to_update() {
+        let b = DeleteBuilder::<Soft>::new().filter(id_eq(1));
+        assert!(b.is_soft_delete());
+        let (sql, _) = b.build();
+        assert!(sql.starts_with("UPDATE \"soft\""), "sql: {sql}");
+        assert!(
+            sql.contains("\"deleted_at\" = CURRENT_TIMESTAMP"),
+            "sql: {sql}"
+        );
+        assert!(sql.contains(" WHERE "));
+    }
+
+    #[test]
+    fn force_disables_soft_delete() {
+        let b = DeleteBuilder::<Soft>::new().filter(id_eq(1)).force();
+        assert!(!b.is_soft_delete());
+        let (sql, _) = b.build();
+        assert!(sql.starts_with("DELETE FROM \"soft\""), "sql: {sql}");
+    }
+
+    #[test]
+    fn is_soft_delete_false_on_table_without_soft_delete_column() {
+        let b = DeleteBuilder::<Hard>::new().filter(id_eq(1));
+        assert!(!b.is_soft_delete());
+    }
+
+    #[test]
+    fn to_select_carries_filters() {
+        let del = DeleteBuilder::<Hard>::new().filter(id_eq(42));
+        let sel = del.to_select();
+        let (sql, params) = sel.build();
+        assert!(sql.contains("FROM \"hard\""));
+        assert!(sql.contains(" WHERE "));
+        assert_eq!(params, vec![Value::I64(42)]);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn returning_appends_clause_for_hard_delete() {
+        let (sql, _) = DeleteBuilder::<Hard>::new()
+            .filter(id_eq(1))
+            .returning(&["id", "name"])
+            .build();
+        assert!(sql.contains("RETURNING \"id\", \"name\""), "sql: {sql}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn returning_skipped_for_soft_delete() {
+        // Soft delete emits an UPDATE; RETURNING is intentionally suppressed
+        // because the meaningful "old row" semantics are different.
+        let (sql, _) = DeleteBuilder::<Soft>::new()
+            .filter(id_eq(1))
+            .returning(&["id"])
+            .build();
+        assert!(!sql.contains("RETURNING"), "sql: {sql}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn build_pg_rewrites_placeholders() {
+        let bq = DeleteBuilder::<Hard>::new().filter(id_eq(9)).build_pg();
+        let (sql, _) = bq.into_parts();
+        assert!(sql.contains("$1"), "sql: {sql}");
+        assert!(!sql.contains('?'));
+    }
+}

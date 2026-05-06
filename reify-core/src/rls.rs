@@ -603,6 +603,131 @@ mod tests {
         );
     }
 
+    // ── Context lookup error paths ──────────────────────────────────
+
+    #[test]
+    fn require_missing_key_returns_missing_error() {
+        let ctx = RlsContext::new();
+        let err = ctx.require::<i64>("absent").unwrap_err();
+        assert!(matches!(err, RlsError::Missing { key: "absent" }));
+    }
+
+    #[test]
+    fn require_wrong_type_returns_type_mismatch() {
+        let ctx = RlsContext::new().set("tenant_id", 42i64);
+        let err = ctx.require::<String>("tenant_id").unwrap_err();
+        match err {
+            RlsError::TypeMismatch {
+                key,
+                expected,
+                found,
+            } => {
+                assert_eq!(key, "tenant_id");
+                assert!(expected.contains("String"), "expected: {expected}");
+                assert!(found.contains("i64"), "found: {found}");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_returns_none_on_type_mismatch_silently() {
+        // get() is the silent variant — used when the caller knows the type
+        // is best-effort. Unlike require(), it cannot distinguish missing
+        // from mismatched.
+        let ctx = RlsContext::new().set("k", 1i32);
+        assert!(ctx.get::<i64>("k").is_none());
+        assert_eq!(ctx.get::<i32>("k"), Some(&1i32));
+    }
+
+    // ── Policy decision paths ───────────────────────────────────────
+
+    /// Policy that returns `Unrestricted` — admin bypass shape.
+    struct AdminBypass;
+    impl crate::table::Table for AdminBypass {
+        fn table_name() -> &'static str {
+            "posts"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+    impl Policy for AdminBypass {
+        fn policy(_ctx: &RlsContext) -> Result<PolicyDecision, RlsError> {
+            Ok(PolicyDecision::Unrestricted)
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_policy_emits_no_extra_filter() {
+        let (db, log) = RecordingDb::new();
+        let scoped = Scoped::new(&db, RlsContext::new());
+
+        let builder = crate::query::SelectBuilder::<AdminBypass>::new();
+        let _ = scoped_fetch_all::<AdminBypass>(&scoped, builder).await;
+
+        let queries = log.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        // Unrestricted: no policy condition appended.
+        assert!(
+            !queries[0].contains("WHERE"),
+            "Unrestricted must not inject WHERE, got: {}",
+            queries[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_by_default_blocks_query_on_policy_error() {
+        // TenantPost requires `tenant_id` in the context. Omitting it makes
+        // the policy return `Err(Missing)` — which must be denied.
+        let (db, log) = RecordingDb::new();
+        let scoped = Scoped::new(&db, RlsContext::new());
+
+        let builder = crate::query::SelectBuilder::<TenantPost>::new();
+        let result = scoped_fetch_all::<TenantPost>(&scoped, builder).await;
+
+        assert!(result.is_err(), "deny-by-default must reject");
+        // No query must have hit the database.
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "no SQL must be issued when the policy denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_on_policy_error_still_blocks_but_with_softer_message() {
+        // Even with `allow_on_policy_error`, the helper still propagates
+        // the error — the flag only changes the message wording, never
+        // turns the failure into "unrestricted access".
+        let (db, log) = RecordingDb::new();
+        let scoped = Scoped::new(&db, RlsContext::new()).allow_on_policy_error();
+
+        let builder = crate::query::SelectBuilder::<TenantPost>::new();
+        let result = scoped_fetch_all::<TenantPost>(&scoped, builder).await;
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            !msg.contains("deny-by-default"),
+            "allow_on_policy_error must drop the deny-by-default suffix, got: {msg}"
+        );
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    // ── Multi-key context ───────────────────────────────────────────
+
+    #[test]
+    fn multi_key_context_preserves_all_entries() {
+        let ctx = RlsContext::new()
+            .set("tenant_id", 1i64)
+            .set("user_id", 2i64);
+        assert_eq!(ctx.require::<i64>("tenant_id").unwrap(), &1i64);
+        assert_eq!(ctx.require::<i64>("user_id").unwrap(), &2i64);
+    }
+
     #[tokio::test]
     async fn scoped_transaction_preserves_rls_context() {
         let (db, log) = RecordingDb::new();

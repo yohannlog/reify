@@ -384,3 +384,161 @@ impl<M: Table> UpdateBuilder<M> {
         crate::db::update_returning_old_new(db, self).await
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::condition::Condition;
+
+    struct Row;
+    impl Table for Row {
+        fn table_name() -> &'static str {
+            "rows"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "a", "b", "tags"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+
+    const ID: Column<Row, i64> = Column::new("id");
+    const A: Column<Row, i32> = Column::new("a");
+    const B: Column<Row, i32> = Column::new("b");
+    #[cfg(feature = "postgres")]
+    const TAGS: Column<Row, Vec<String>> = Column::new("tags");
+
+    fn id_eq(v: i64) -> Condition {
+        ID.eq(v)
+    }
+
+    #[test]
+    fn build_with_set_and_filter_emits_expected_sql() {
+        let (sql, params) = UpdateBuilder::<Row>::new()
+            .set(A, 1i32)
+            .set(B, 2i32)
+            .filter(id_eq(7))
+            .build();
+        assert!(sql.starts_with("UPDATE \"rows\" SET "), "sql: {sql}");
+        assert!(sql.contains("\"a\" = ?"));
+        assert!(sql.contains("\"b\" = ?"));
+        assert!(sql.contains(" WHERE "));
+        // Order: SET params first (a, b), then WHERE param (id).
+        assert_eq!(params, vec![Value::I32(1), Value::I32(2), Value::I64(7)]);
+    }
+
+    #[test]
+    fn unfiltered_emits_update_without_where() {
+        let (sql, params) = UpdateBuilder::<Row>::new()
+            .set(A, 5i32)
+            .unfiltered()
+            .build();
+        assert!(sql.starts_with("UPDATE \"rows\" SET \"a\" = ?"));
+        assert!(!sql.contains("WHERE"), "must have no WHERE: {sql}");
+        assert_eq!(params, vec![Value::I32(5)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "UPDATE without WHERE is forbidden")]
+    fn build_without_filter_or_unfiltered_panics() {
+        let _ = UpdateBuilder::<Row>::new().set(A, 1i32).build();
+    }
+
+    #[test]
+    fn try_build_without_filter_returns_missing_filter() {
+        let err = UpdateBuilder::<Row>::new()
+            .set(A, 1i32)
+            .try_build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::MissingFilter {
+                operation: "UPDATE"
+            }
+        ));
+    }
+
+    #[test]
+    fn to_select_carries_filters() {
+        let upd = UpdateBuilder::<Row>::new().set(A, 1i32).filter(id_eq(42));
+        let sel = upd.to_select();
+        let (sql, params) = sel.build();
+        assert!(sql.contains("FROM \"rows\""));
+        assert!(sql.contains(" WHERE "));
+        assert_eq!(params, vec![Value::I64(42)]);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn set_array_append_emits_concat_rhs() {
+        let (sql, params) = UpdateBuilder::<Row>::new()
+            .set_array_append(TAGS, "rust".to_string())
+            .filter(id_eq(1))
+            .build();
+        assert!(sql.contains("\"tags\" = \"tags\" || ?"), "sql: {sql}");
+        // First param is the appended value, then the filter id.
+        assert_eq!(params, vec![Value::String("rust".into()), Value::I64(1)]);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn set_array_prepend_emits_concat_lhs() {
+        let (sql, _) = UpdateBuilder::<Row>::new()
+            .set_array_prepend(TAGS, "first".to_string())
+            .filter(id_eq(1))
+            .build();
+        assert!(sql.contains("\"tags\" = ? || \"tags\""), "sql: {sql}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn returning_appends_clause() {
+        let (sql, _) = UpdateBuilder::<Row>::new()
+            .set(A, 1i32)
+            .filter(id_eq(1))
+            .returning(&["id", "a"])
+            .build();
+        assert!(sql.contains("RETURNING \"id\", \"a\""), "sql: {sql}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn returning_cols_appends_clause() {
+        let (sql, _) = UpdateBuilder::<Row>::new()
+            .set(A, 1i32)
+            .filter(id_eq(1))
+            .returning_cols(&[A, B])
+            .build();
+        assert!(sql.contains("RETURNING \"a\", \"b\""), "sql: {sql}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn build_pg_rewrites_placeholders() {
+        let bq = UpdateBuilder::<Row>::new()
+            .set(A, 1i32)
+            .filter(id_eq(2))
+            .build_pg();
+        let (sql, _) = bq.into_parts();
+        assert!(sql.contains("$1") && sql.contains("$2"), "sql: {sql}");
+        assert!(!sql.contains('?'));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn try_build_pg_propagates_missing_filter() {
+        let err = UpdateBuilder::<Row>::new()
+            .set(A, 1i32)
+            .try_build_pg()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::MissingFilter {
+                operation: "UPDATE"
+            }
+        ));
+    }
+}

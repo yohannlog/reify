@@ -345,9 +345,13 @@ impl<M: Table> InsertManyBuilder<M> {
     /// the statement automatically.
     #[allow(unused_mut)]
     #[must_use]
+    #[track_caller]
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        // `#[track_caller]` makes the panic location point at the user's
+        // call site instead of the library internals — far more useful
+        // when this trips in a real application.
         self.try_build_with_dialect(dialect)
-            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("InsertManyBuilder::build_with_dialect: {e}"))
     }
 
     /// Build SQL for a specific [`Dialect`], returning [`crate::ParamLimitExceeded`]

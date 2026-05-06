@@ -60,15 +60,13 @@ pub fn create_table_sql<T: Table>(
                 parts.push("UNIQUE".into());
             }
 
-            // DB-source timestamps: emit dialect-appropriate DEFAULT
+            // DB-source timestamps: emit `CURRENT_TIMESTAMP` (SQL standard,
+            // accepted on PG, MySQL and SQLite). MySQL keeps the
+            // `ON UPDATE CURRENT_TIMESTAMP` extension for update-timestamp
+            // columns since no equivalent exists on the others.
             if ts_source == TimestampSource::Db && ts_kind.is_some() {
-                let default_now = match dialect {
-                    crate::query::Dialect::Mysql => "DEFAULT CURRENT_TIMESTAMP",
-                    _ => "DEFAULT NOW()",
-                };
-                parts.push(default_now.into());
+                parts.push("DEFAULT CURRENT_TIMESTAMP".into());
 
-                // MySQL: update_timestamp with Db source gets ON UPDATE CURRENT_TIMESTAMP
                 if ts_kind == Some(TimestampKind::Update) && dialect == crate::query::Dialect::Mysql
                 {
                     parts.push("ON UPDATE CURRENT_TIMESTAMP".into());
@@ -185,11 +183,12 @@ pub(crate) fn create_table_sql_named_with_checks(
             parts.push("UNIQUE".into());
         }
         if def.timestamp_source == TimestampSource::Db {
-            let default_now = match dialect {
-                crate::query::Dialect::Mysql => "DEFAULT CURRENT_TIMESTAMP",
-                _ => "DEFAULT NOW()",
-            };
-            parts.push(default_now.into());
+            // `CURRENT_TIMESTAMP` is the SQL standard and works on
+            // PostgreSQL, MySQL and SQLite alike. PG and MySQL also
+            // accept the `NOW()` synonym, but SQLite does not — using
+            // `CURRENT_TIMESTAMP` keeps a single DDL emission path
+            // across every supported backend.
+            parts.push("DEFAULT CURRENT_TIMESTAMP".into());
         } else if let Some(ref dv) = def.default {
             parts.push(format!("DEFAULT {}", dv.as_sql()));
         }
@@ -241,13 +240,21 @@ impl std::error::Error for MissingDefaultError {}
 /// Panics if the column is NOT NULL and no default can be synthesised. Use
 /// [`try_add_column_sql`] for a recoverable variant — the CLI calls it so
 /// the error surfaces before anything is written.
+#[track_caller]
 pub fn add_column_sql(
     table: &str,
     column: &str,
     def: Option<&crate::schema::ColumnDef>,
     dialect: crate::query::Dialect,
 ) -> String {
-    try_add_column_sql(table, column, def, dialect).unwrap_or_else(|e| panic!("{e}"))
+    // `#[track_caller]` so the panic location points at the user's
+    // call site. Internal callers in the migration runner go through
+    // `try_add_column_sql` and propagate the error as
+    // `MigrationError::Other`; this entry point is kept for backward
+    // compatibility with hand-written migrations that prefer the
+    // panicking ergonomics.
+    try_add_column_sql(table, column, def, dialect)
+        .unwrap_or_else(|e| panic!("add_column_sql: {e}"))
 }
 
 /// Fallible variant of [`add_column_sql`]. Returns [`MissingDefaultError`]

@@ -192,12 +192,15 @@ fn update_builder_skips_if_already_set() {
 // ── DDL generation ──────────────────────────────────────────────────
 
 #[test]
-fn ddl_db_source_postgres_default_now() {
+fn ddl_db_source_postgres_default_current_timestamp() {
+    // DDL emission was changed from `NOW()` to `CURRENT_TIMESTAMP` so the
+    // same DDL works on SQLite too. PG accepts `CURRENT_TIMESTAMP`
+    // identically (it's a SQL-standard alias).
     let defs = Event::column_defs();
     let sql = reify::create_table_sql::<Event>(&defs, reify::Dialect::Postgres);
     assert!(
-        sql.contains("DEFAULT NOW()"),
-        "DDL should contain DEFAULT NOW(): {sql}"
+        sql.contains("DEFAULT CURRENT_TIMESTAMP"),
+        "DDL should contain DEFAULT CURRENT_TIMESTAMP: {sql}"
     );
 }
 

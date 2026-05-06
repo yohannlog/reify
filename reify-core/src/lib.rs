@@ -96,10 +96,14 @@ pub use rls::{
 };
 
 pub use audit::{
-    ActorId, AuditContext, AuditOperation, Auditable, HMAC_MIN_KEY_BYTES, SecretError,
-    audit_column_defs_for, audited_delete, audited_insert, audited_update, values_to_json_string,
-    verify_audit_row,
+    ActorId, AuditChainCheck, AuditChainRowResult, AuditContext, AuditEvent, AuditOperation,
+    AuditSink, AuditSinkError, AuditSinkFuture, Auditable, HMAC_MIN_KEY_BYTES, NoopAuditSink,
+    SecretError, audit_column_defs_for, audited_delete, audited_insert, audited_update,
+    values_to_json_string, verify_audit_chain, verify_audit_row, verify_audit_row_chained,
 };
+
+#[cfg(feature = "audit-file")]
+pub use audit::{FileAuditSink, audit_event_to_jsonl};
 
 pub use enumeration::{DbEnum, enum_from_value};
 

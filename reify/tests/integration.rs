@@ -63,6 +63,10 @@ mod sqlite_timestamps;
 #[path = "integration/sqlite_sql_injection.rs"]
 mod sqlite_sql_injection;
 
+#[cfg(feature = "sqlite-integration-tests")]
+#[path = "integration/sqlite_audit_chain.rs"]
+mod sqlite_audit_chain;
+
 // ── PostgreSQL ───────────────────────────────────────────────────────
 
 #[cfg(feature = "pg-integration-tests")]
@@ -97,6 +101,10 @@ mod pg_sql_injection;
 #[path = "integration/pg_soft_delete.rs"]
 mod pg_soft_delete;
 
+#[cfg(feature = "pg-integration-tests")]
+#[path = "integration/pg_audit_chain.rs"]
+mod pg_audit_chain;
+
 // ── MySQL ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "mysql-integration-tests")]
@@ -118,3 +126,7 @@ mod mysql_errors;
 #[cfg(feature = "mysql-integration-tests")]
 #[path = "integration/mysql_sql_injection.rs"]
 mod mysql_sql_injection;
+
+#[cfg(feature = "mysql-integration-tests")]
+#[path = "integration/mysql_audit_chain.rs"]
+mod mysql_audit_chain;

@@ -21,6 +21,9 @@ sqlite = ["dep:reify-sqlite"]
 dto = ["reify-macros/dto"]
 dto-validation = ["reify-macros/dto-validation", "dto", "dep:validator"]
 metrics = ["reify-core/metrics"]
+# Audit sink backends — append-only external destinations for audit
+# events. See `reify_core::audit::AuditSink`.
+audit-file = ["reify-core/audit-file"]
 # Per-adapter integration-test sub-features. Each one only compiles
 # the corresponding adapter + its integration tests, so a contributor
 # with only one DB installed does not need the others.

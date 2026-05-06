@@ -474,3 +474,222 @@ impl<M: Table> SelectBuilder<M> {
         WithBuilder { parent: self, rel }
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::column::Column;
+    use crate::query::Order;
+    use crate::relation::{Relation, RelationType};
+
+    /// Standard table without soft-delete.
+    struct User;
+    impl Table for User {
+        fn table_name() -> &'static str {
+            "users"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "name", "age"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+
+    /// Child table for join/with tests.
+    struct Post;
+    impl Table for Post {
+        fn table_name() -> &'static str {
+            "posts"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "user_id", "title"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+
+    /// Table with a soft-delete column.
+    struct Doc;
+    impl Table for Doc {
+        fn table_name() -> &'static str {
+            "docs"
+        }
+        fn column_names() -> &'static [&'static str] {
+            &["id", "deleted_at"]
+        }
+        fn as_values(&self) -> Vec<Value> {
+            vec![]
+        }
+        fn soft_delete_column() -> Option<&'static str> {
+            Some("deleted_at")
+        }
+    }
+
+    const ID: Column<User, i64> = Column::new("id");
+    const AGE: Column<User, i32> = Column::new("age");
+
+    fn posts_relation() -> Relation<User, Post> {
+        Relation::new("posts", RelationType::HasMany, "id", "user_id")
+    }
+
+    #[test]
+    fn empty_select_emits_select_star() {
+        let (sql, params) = SelectBuilder::<User>::new().build();
+        assert!(sql.contains("FROM \"users\""), "sql: {sql}");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn distinct_emits_distinct_keyword() {
+        let (sql, _) = SelectBuilder::<User>::new().distinct().build();
+        assert!(sql.contains("SELECT DISTINCT"), "sql: {sql}");
+    }
+
+    #[test]
+    fn select_cols_restricts_column_list() {
+        // `select_cols` is generic over a single column type — pass a slice
+        // of homogeneous columns (here: just the i64 PK).
+        let (sql, _) = SelectBuilder::<User>::new().select_cols(&[ID]).build();
+        assert!(sql.contains("\"id\""), "sql: {sql}");
+        assert!(!sql.contains("\"name\""), "sql: {sql}");
+        assert!(!sql.contains("\"age\""), "sql: {sql}");
+    }
+
+    #[test]
+    fn select_string_cols_restricts_column_list() {
+        let (sql, _) = SelectBuilder::<User>::new().select(&["id", "name"]).build();
+        assert!(sql.contains("\"id\"") && sql.contains("\"name\""));
+    }
+
+    #[test]
+    fn filter_accumulates_with_and() {
+        let (sql, params) = SelectBuilder::<User>::new()
+            .filter(ID.eq(1i64))
+            .filter(AGE.gt(18i32))
+            .build();
+        assert!(sql.contains(" WHERE "), "sql: {sql}");
+        assert!(sql.contains(" AND "), "sql: {sql}");
+        assert_eq!(params, vec![Value::I64(1), Value::I32(18)]);
+    }
+
+    #[test]
+    fn order_by_preserves_call_order() {
+        let (sql, _) = SelectBuilder::<User>::new()
+            .order_by(Order::Asc("a"))
+            .order_by(Order::Desc("b"))
+            .build();
+        assert!(sql.contains("ORDER BY"), "sql: {sql}");
+        let asc = sql.find("\"a\" ASC").expect("a ASC");
+        let desc = sql.find("\"b\" DESC").expect("b DESC");
+        assert!(asc < desc, "ascending key must come first: {sql}");
+    }
+
+    #[test]
+    fn limit_and_offset_appear_in_sql() {
+        let (sql, _) = SelectBuilder::<User>::new().limit(10).offset(20).build();
+        assert!(sql.contains("LIMIT 10"), "sql: {sql}");
+        assert!(sql.contains("OFFSET 20"), "sql: {sql}");
+    }
+
+    #[test]
+    fn group_by_and_having() {
+        let (sql, _) = SelectBuilder::<User>::new()
+            .group_by(&["age"])
+            .having(AGE.gt(0i32))
+            .build();
+        assert!(sql.contains("GROUP BY \"age\""), "sql: {sql}");
+        assert!(sql.contains("HAVING"), "sql: {sql}");
+    }
+
+    #[test]
+    fn group_by_cols_typed_variant() {
+        let (sql, _) = SelectBuilder::<User>::new().group_by_cols(&[AGE]).build();
+        assert!(sql.contains("GROUP BY \"age\""), "sql: {sql}");
+    }
+
+    #[test]
+    fn join_emits_inner_join() {
+        let (sql, _) = SelectBuilder::<User>::new().join(posts_relation()).build();
+        assert!(sql.contains("INNER JOIN \"posts\""), "sql: {sql}");
+        assert!(sql.contains("ON"), "sql: {sql}");
+    }
+
+    #[test]
+    fn left_join_emits_left_join() {
+        let (sql, _) = SelectBuilder::<User>::new()
+            .left_join(posts_relation())
+            .build();
+        assert!(sql.contains("LEFT JOIN \"posts\""), "sql: {sql}");
+    }
+
+    #[test]
+    fn right_join_emits_right_join() {
+        let (sql, _) = SelectBuilder::<User>::new()
+            .right_join(posts_relation())
+            .build();
+        assert!(sql.contains("RIGHT JOIN \"posts\""), "sql: {sql}");
+    }
+
+    #[test]
+    fn join_qualifies_columns_per_table() {
+        let (sql, _) = SelectBuilder::<User>::new().join(posts_relation()).build();
+        assert!(sql.contains("\"users\".*"), "sql: {sql}");
+        assert!(sql.contains("\"posts\".*"), "sql: {sql}");
+    }
+
+    // ── Soft-delete behaviour ───────────────────────────────────────
+
+    #[test]
+    fn soft_delete_default_filters_is_null() {
+        let (sql, _) = SelectBuilder::<Doc>::new().build();
+        assert!(
+            sql.contains("\"deleted_at\" IS NULL"),
+            "expected soft-delete filter, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn with_deleted_drops_filter() {
+        let (sql, _) = SelectBuilder::<Doc>::new().with_deleted().build();
+        assert!(
+            !sql.contains("\"deleted_at\""),
+            "with_deleted must omit filter: {sql}"
+        );
+    }
+
+    #[test]
+    fn only_deleted_emits_is_not_null() {
+        let (sql, _) = SelectBuilder::<Doc>::new().only_deleted().build();
+        assert!(sql.contains("\"deleted_at\" IS NOT NULL"), "sql: {sql}");
+    }
+
+    #[test]
+    fn soft_delete_filter_skipped_for_table_without_column() {
+        let (sql, _) = SelectBuilder::<User>::new().build();
+        assert!(!sql.contains("deleted_at"), "sql: {sql}");
+    }
+
+    // ── with() returns a WithBuilder bridging to with.rs tests ──────
+
+    #[test]
+    fn with_returns_builder_referencing_relation() {
+        let wb = SelectBuilder::<User>::new().with(posts_relation());
+        assert_eq!(wb.relation().name, "posts");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn build_pg_rewrites_placeholders() {
+        let bq = SelectBuilder::<User>::new()
+            .filter(ID.eq(1i64))
+            .filter(AGE.gt(0i32))
+            .build_pg();
+        let (sql, _) = bq.into_parts();
+        assert!(sql.contains("$1") && sql.contains("$2"), "sql: {sql}");
+        assert!(!sql.contains('?'));
+    }
+}

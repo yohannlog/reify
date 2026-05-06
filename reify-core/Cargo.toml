@@ -24,6 +24,8 @@ mariadb11 = ["mariadb10"]
 # MariaDB 12+ (latest) — adds uuidv7() support
 mariadb = ["mariadb11"]
 metrics = ["dep:metrics"]
+# AuditSink backend: append-only newline-delimited JSON to a local file.
+audit-file = ["tokio/fs", "tokio/io-util", "tokio/sync"]
 
 [dependencies]
 tracing = "0.1"
